@@ -85,7 +85,7 @@ impl Memory {
     /// Creates a new RAM of size bytes at the physical address base.
     pub fn new(base: u64, size: u64) -> Memory {
         assert!(
-            size % PAGE_SIZE == 0,
+            size.is_multiple_of(PAGE_SIZE),
             "memory size is not multiple of page size"
         );
         let buf = vec![0u8; size as usize].into_boxed_slice();
@@ -246,6 +246,7 @@ impl Memory {
     /// ensure that the guest has handed the range over to the caller
     /// (for example through a VirtIO descriptor) so that no other
     /// Rust reference to the same bytes is used concurrently.
+    #[allow(clippy::mut_from_ref)]
     pub unsafe fn guest_slice_mut(&self, paddr: u64, len: u64) -> Option<&mut [u8]> {
         if !self.contains_range(paddr, len) {
             return None;

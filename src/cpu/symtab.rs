@@ -86,7 +86,7 @@ impl SystemMap {
         if (0x8000_0000..0x8020_0000).contains(&pc) {
             return None;
         }
-        if pc >= 0x8020_0000 && pc < 0x1_0000_0000 {
+        if (0x8020_0000..0x1_0000_0000).contains(&pc) {
             return Some(pc - 0x20_0000 + 0xffff_ffff_0000_0000);
         }
         Some(pc)

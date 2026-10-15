@@ -45,17 +45,17 @@ impl Vpu {
     /// register file.
     #[inline]
     fn elt(&self, sew: Sew, vreg: u64, n: u64) -> Option<usize> {
-        let elts_per_reg = (self.vlen / 8) / sew.len();
+        let elts_per_reg = (self.vlen / 8) / sew.bytes();
         let reg = vreg + n / elts_per_reg;
         if reg >= 32 {
             return None;
         }
-        Some((reg * (self.vlen / 8) + (n % elts_per_reg) * sew.len()) as usize)
+        Some((reg * (self.vlen / 8) + (n % elts_per_reg) * sew.bytes()) as usize)
     }
 
     fn get(&self, sew: Sew, vreg: u64, n: u64) -> Option<u64> {
         let o = self.elt(sew, vreg, n)?;
-        let b = &self.vregs[o..o + sew.len() as usize];
+        let b = &self.vregs[o..o + sew.bytes() as usize];
         let mut v = 0u64;
         for (i, x) in b.iter().enumerate() {
             v |= (*x as u64) << (8 * i);
@@ -65,7 +65,7 @@ impl Vpu {
 
     fn set(&mut self, sew: Sew, vreg: u64, n: u64, v: u64) -> Option<()> {
         let o = self.elt(sew, vreg, n)?;
-        let len = sew.len() as usize;
+        let len = sew.bytes() as usize;
         for i in 0..len {
             self.vregs[o + i] = (v >> (8 * i)) as u8;
         }
@@ -125,7 +125,7 @@ impl Cpu {
         if self.vpu.vtype != new_type {
             let vlmul = new_type.vlmul();
             let vsew_max = (vlmul.min(1.0) * ELEN as f32) as u32;
-            let max_vl = ((vlen / new_type.vsew().len() / 8) as f32 * vlmul) as u64;
+            let max_vl = ((vlen / new_type.vsew().bytes() / 8) as f32 * vlmul) as u64;
 
             let vill = !(0.125..=8.0).contains(&vlmul)
                 || new_type.vsew().0 > vsew_max
@@ -141,7 +141,7 @@ impl Cpu {
             }
         } else {
             let vlmul = new_type.vlmul();
-            vl = ((vlen / new_type.vsew().len() / 8) as f32 * vlmul) as u64;
+            vl = ((vlen / new_type.vsew().bytes() / 8) as f32 * vlmul) as u64;
         }
 
         if vl == 0 {
@@ -257,7 +257,7 @@ impl Cpu {
                     Vse32V => (Sew::E32, false),
                     _ => (Sew::E64, false),
                 };
-                let elt_size = eew.len();
+                let elt_size = eew.bytes();
                 let vemul = eew.0 as f32 / self.vpu.vtype.vsew().0 as f32 * self.vpu.vtype.vlmul();
                 let emul = if vemul > 1.0 { vemul as u64 } else { 1 };
 

@@ -26,7 +26,7 @@ impl Fdt {
 
     fn put_data(&mut self, data: &[u8]) {
         self.structure.extend_from_slice(data);
-        while self.structure.len() % 4 != 0 {
+        while !self.structure.len().is_multiple_of(4) {
             self.structure.push(0);
         }
     }

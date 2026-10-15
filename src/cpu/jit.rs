@@ -207,7 +207,7 @@ impl Hasher for FxHasher {
     }
 
     fn write_u64(&mut self, v: u64) {
-        self.0 = (self.0.rotate_left(5) ^ v).wrapping_mul(0x51_7cc1_b727_220a_95);
+        self.0 = (self.0.rotate_left(5) ^ v).wrapping_mul(0x517c_c1b7_2722_0a95);
     }
 
     fn finish(&self) -> u64 {

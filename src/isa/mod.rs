@@ -217,7 +217,7 @@ impl Sew {
     pub const E64: Sew = Sew(64);
 
     /// Element length in bytes.
-    pub fn len(self) -> u64 {
+    pub fn bytes(self) -> u64 {
         self.0 as u64 / 8
     }
 }

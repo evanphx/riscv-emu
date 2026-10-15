@@ -329,18 +329,24 @@ pub fn disassemble(mut pc: u64, mut data: &[u8], out: &mut String) -> Result<(),
                 return Err("truncated .text".to_string());
             }
             let raw = u32::from_le_bytes(data[..4].try_into().unwrap());
-            (decode(raw)?, 4usize, raw)
+            (decode(raw), 4usize, raw)
         } else {
             if data.len() < 2 {
                 return Err("truncated .text".to_string());
             }
             let raw = u16::from_le_bytes([data[0], data[1]]) as u32;
-            (decode_c(raw as u16)?, 2usize, raw)
+            (decode_c(raw as u16), 2usize, raw)
         };
+        // Undecodable instructions are shown as raw data.
+        let text = match &instr {
+            Ok(i) => i.to_string(),
+            Err(_) => format!("{:<10} 0x{:x}", ".insn", raw),
+        };
+        let instr = instr.unwrap_or_default();
         let mut line = if size == 4 {
-            format!("{:8x}:  {:08x}   {}", pc, raw, instr)
+            format!("{:8x}:  {:08x}   {}", pc, raw, text)
         } else {
-            format!("{:8x}:  {:04x}       {}", pc, raw, instr)
+            format!("{:8x}:  {:04x}       {}", pc, raw, text)
         };
         let desc = instr.op.desc();
         if !desc.is_empty() && instr.op != last_desc {

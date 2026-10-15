@@ -190,7 +190,7 @@ pub fn csr_name(csr: u16) -> String {
         0xc03..=0xc1f => format!("hpmcounter{}", csr - 0xc00),
         0xb03..=0xb1f => format!("mhpmcounter{}", csr - 0xb00),
         0x323..=0x33f => format!("mhpmevent{}", csr - 0x320),
-        0x3a0..=0x3af if csr % 2 == 0 => format!("pmpcfg{}", csr - 0x3a0),
+        0x3a0..=0x3af if csr.is_multiple_of(2) => format!("pmpcfg{}", csr - 0x3a0),
         0x3b0..=0x3ef => format!("pmpaddr{}", csr - 0x3b0),
         _ => format!("{:03x}", csr),
     }

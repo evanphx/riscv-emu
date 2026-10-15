@@ -447,6 +447,7 @@ pub fn sqrt(fmt: Fmt, a: u64, rm: u32, flags: &mut u32) -> u64 {
 
 /// a * b + c with a single rounding. The neg_prod and neg_c flags
 /// negate the product and the addend.
+#[allow(clippy::too_many_arguments)]
 pub fn fma(fmt: Fmt, a: u64, b: u64, c: u64, neg_prod: bool, neg_c: bool, rm: u32, flags: &mut u32) -> u64 {
     let (ua, ub, uc) = (unpack(fmt, a), unpack(fmt, b), unpack(fmt, c));
     if matches!(ua, Val::Nan) || matches!(ub, Val::Nan) {

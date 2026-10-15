@@ -191,6 +191,7 @@ impl GuestMem {
     /// # Safety
     ///
     /// The buffer must belong to a descriptor owned by the device.
+    #[allow(clippy::mut_from_ref)]
     pub unsafe fn slice_mut(&self, addr: u64, len: u64) -> Result<&mut [u8], String> {
         self.mem
             .guest_slice_mut(addr, len)
