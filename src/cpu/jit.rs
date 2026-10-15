@@ -277,8 +277,8 @@ pub struct Jit {
     /// Trampoline arena and entry.
     _enter_arena: CodeArena,
     enter: EnterFn,
-    /// Helper stubs: load, store, exec.
-    stubs: [u64; 3],
+    /// Helper stubs: load, store, exec, probe.
+    stubs: [u64; 4],
     jcache: Box<[JEntry]>,
     /// Hashed bitmap of the pages with jump cache entries.
     jcache_pages: [u64; 64],
@@ -660,6 +660,26 @@ unsafe extern "C" fn jit_exec(cpu: *mut Cpu, packed: u64, raw: u64) {
     }
 }
 
+/// Returns the size and whether it is a store of an integer or
+/// floating point memory access compiled to native code.
+fn mem_access(op: Op) -> Option<(i64, bool)> {
+    use Op::*;
+    Some(match op {
+        Lb | Lbu => (1, false),
+        Lh | Lhu => (2, false),
+        Lw | Lwu | Flw => (4, false),
+        Ld | Fld => (8, false),
+        Sb => (1, true),
+        Sh => (2, true),
+        Sw | Fsw => (4, true),
+        Sd | Fsd => (8, true),
+        _ => return None,
+    })
+}
+
+/// Guest register of the stack pointer.
+const SP: u8 = 2;
+
 fn is_terminator(op: Op) -> bool {
     use Op::*;
     matches!(op, Beq | Bne | Blt | Bge | Bltu | Bgeu | Jal | Jalr)
@@ -700,6 +720,16 @@ unsafe extern "C" fn jit_store(cpu: *mut Cpu, addr: u64, size: u64, v: u64) {
             cpu.jit_fault = 1;
         }
     }
+}
+
+/// Checks for the generated code that the data accesses to the range
+/// [lo, hi] are on one page that the JIT TLB allows for loads, or for
+/// stores if write is set, filling the TLB entry if needed. Returns 1
+/// if they are, otherwise 0; the accesses then run in the interpreter,
+/// which raises any exception precisely.
+unsafe extern "C" fn jit_probe(cpu: *mut Cpu, lo: u64, hi: u64, write: u64) -> u64 {
+    let cpu = &mut *cpu;
+    cpu.jit_probe_range(lo, hi, write != 0) as u64
 }
 
 /// Opens the perf map file /tmp/perf-PID.map that names the compiled
@@ -1233,7 +1263,7 @@ fn compile_enter(arena: &mut CodeArena) -> Result<EnterFn, String> {
 }
 
 /// Number of parameters of the helper functions: load, store, exec.
-const HELPER_PARAMS: [usize; 3] = [3, 4, 3];
+const HELPER_PARAMS: [usize; 4] = [3, 4, 3, 4];
 
 /// Returns the signature of the helper stubs called by the blocks.
 /// The stubs preserve all registers, so that the rarely taken helper
@@ -1249,26 +1279,27 @@ fn stub_signature(helper: usize) -> Signature {
 /// Compiles the stubs that call the helper functions jit_load,
 /// jit_store, and jit_exec with the system calling convention. The
 /// load stub stores the loaded value in Cpu::jit_value.
-fn compile_stubs(arena: &mut CodeArena) -> Result<[u64; 3], String> {
+fn compile_stubs(arena: &mut CodeArena) -> Result<[u64; 4], String> {
     let helpers = [
         jit_load as *const () as i64,
         jit_store as *const () as i64,
         jit_exec as *const () as i64,
+        jit_probe as *const () as i64,
     ];
-    let mut out = [0; 3];
+    let mut out = [0; 4];
     for (h, addr) in helpers.into_iter().enumerate() {
         let code = compile_glue(arena, stub_signature(h), |b, p| {
             let mut sig = Signature::new(CallConv::SystemV);
             for _ in 0..HELPER_PARAMS[h] {
                 sig.params.push(AbiParam::new(types::I64));
             }
-            if h == 0 {
+            if h == 0 || h == 3 {
                 sig.returns.push(AbiParam::new(types::I64));
             }
             let sigref = b.import_signature(sig);
             let callee = b.ins().iconst(types::I64, addr);
             let call = b.ins().call_indirect(sigref, callee, p);
-            if h == 0 {
+            if h == 0 || h == 3 {
                 let v = b.inst_results(call)[0];
                 b.ins().store(MemFlagsData::trusted(), v, p[0], OFS_VALUE);
             }
@@ -1398,9 +1429,10 @@ enum Sym {
     Store,
     Exec,
     JCache,
+    Probe,
 }
 
-pub(super) const NUM_SYMS: usize = 5;
+pub(super) const NUM_SYMS: usize = 6;
 
 /// Values of the symbols, indexed by Sym.
 const OFS_X: i32 = offset_of!(Cpu, x) as i32;
@@ -1460,6 +1492,25 @@ struct Translator<'a, 'b> {
     load_sig: Option<SigRef>,
     store_sig: Option<SigRef>,
     exec_sig: Option<SigRef>,
+    probe_sig: Option<SigRef>,
+    /// Groups of stack accesses that share one TLB check: the group and
+    /// the offset from the group base of the accesses by guest PC.
+    group_of: HashMap<u64, (usize, i64)>,
+    groups: Vec<AccessGroup>,
+}
+
+/// Accesses through the same base register value within a basic block,
+/// whose page is checked once at the first access. The range is
+/// [base + lo, base + hi].
+struct AccessGroup {
+    first_pc: u64,
+    lo: i64,
+    hi: i64,
+    write: bool,
+    /// Host address of the base value after the check.
+    host_base: Option<Value>,
+    /// A store of the group has cleared the LR reservation.
+    resv_cleared: bool,
 }
 
 impl<'a, 'b> Translator<'a, 'b> {
@@ -1490,6 +1541,9 @@ impl<'a, 'b> Translator<'a, 'b> {
             load_sig: None,
             store_sig: None,
             exec_sig: None,
+            probe_sig: None,
+            group_of: HashMap::new(),
+            groups: Vec::new(),
         }
     }
 
@@ -1697,6 +1751,121 @@ impl<'a, 'b> Translator<'a, 'b> {
         self.exit_with(pcv, total, EXIT_OK);
     }
 
+    /// Plans the groups of stack accesses that share a TLB check. A
+    /// group is a run of accesses through SP within a basic block while
+    /// SP does not change. Groups need two accesses and must fit in a
+    /// page.
+    fn plan_groups(&mut self, instrs: &[BlockInstr]) {
+        // Open group: first PC, members (pc, offset), lo, hi, write.
+        let mut cur: Option<(u64, Vec<(u64, i64)>, i64, i64, bool)> = None;
+        let close = |t: &mut Self, cur: &mut Option<(u64, Vec<(u64, i64)>, i64, i64, bool)>| {
+            if let Some((first_pc, members, lo, hi, write)) = cur.take() {
+                if members.len() >= 2 && hi - lo < PAGE_SIZE as i64 {
+                    let id = t.groups.len();
+                    t.groups.push(AccessGroup {
+                        first_pc,
+                        lo,
+                        hi,
+                        write,
+                        host_base: None,
+                        resv_cleared: false,
+                    });
+                    for (pc, off) in members {
+                        t.group_of.insert(pc, (id, off));
+                    }
+                }
+            }
+        };
+        let mut prev_next = None;
+        for bi in instrs {
+            let i = &bi.instr;
+            // A new basic block starts at leaders and after gaps.
+            if self.leaders.contains_key(&bi.pc) || prev_next != Some(bi.pc) {
+                close(self, &mut cur);
+            }
+            prev_next = Some(bi.pc.wrapping_add(bi.size));
+            if let Some((size, store)) = mem_access(i.op) {
+                if i.rs1 == SP && (!store || self.env.inline_stores) {
+                    let off = i.imm as i64;
+                    match cur.as_mut() {
+                        Some((_, members, lo, hi, write)) => {
+                            members.push((bi.pc, off));
+                            *lo = (*lo).min(off);
+                            *hi = (*hi).max(off + size - 1);
+                            *write |= store;
+                        }
+                        None => cur = Some((bi.pc, vec![(bi.pc, off)], off, off + size - 1, store)),
+                    }
+                }
+            }
+            // Any write to the integer or floating point register with
+            // the number of SP ends the group, conservatively.
+            if i.rd == SP && mem_access(i.op).is_none_or(|(_, st)| !st) {
+                close(self, &mut cur);
+            }
+            if is_terminator(i.op) || helper_op(i.op) {
+                close(self, &mut cur);
+            }
+        }
+        close(self, &mut cur);
+    }
+
+    /// Returns the host address of the access of the instruction at pc
+    /// with the guest address base + off if the access is in a checked
+    /// group. At the first access of a group, emits the check of the
+    /// group's range, which exits to the interpreter at the access if
+    /// the range is not accessible directly.
+    fn group_host(&mut self, k: u64, pc: u64, base: Value) -> Option<Value> {
+        let &(id, off) = self.group_of.get(&pc)?;
+        if self.groups[id].first_pc == pc {
+            let (lo, hi, write) = (self.groups[id].lo, self.groups[id].hi, self.groups[id].write);
+            let lo_v = self.b.ins().iadd_imm_s(base, lo);
+            let hi_v = self.b.ins().iadd_imm_s(base, hi);
+            let slow = self.b.create_block();
+            self.b.set_cold_block(slow);
+            let cont = self.b.create_block();
+            self.b.append_block_param(cont, types::I64);
+            let host_lo = self.tlb_fast_range(lo_v, hi_v, write, slow);
+            let hb = self.b.ins().iadd_imm_s(host_lo, -lo);
+            self.b.ins().jump(cont, &[hb.into()]);
+
+            // Fill the TLB entry and check again; run the accesses in
+            // the interpreter if that does not help.
+            self.b.switch_to_block(slow);
+            let sigref = self.helper_sig(3);
+            let callee = self.sym(Sym::Probe);
+            let w = self.iconst(write as i64);
+            self.b
+                .ins()
+                .call_indirect(sigref, callee, &[self.cpu, lo_v, hi_v, w]);
+            let ok = self
+                .b
+                .ins()
+                .load(types::I64, Self::flags(), self.cpu, OFS_VALUE);
+            let refill = self.b.create_block();
+            let out = self.b.create_block();
+            self.b.ins().brif(ok, refill, &[], out, &[]);
+            self.b.switch_to_block(out);
+            let pcv = self.pc_value(pc);
+            self.jump_exit(pcv, k, EXIT_OK);
+            self.b.switch_to_block(refill);
+            let idx = self.b.ins().ushr_imm_s(lo_v, 12 - JTLB_SHIFT);
+            let idx = self.b.ins().band_imm_s(idx, 0xfff << JTLB_SHIFT);
+            let ent = self.b.ins().iadd(self.cpu, idx);
+            let delta = self
+                .b
+                .ins()
+                .load(types::I64, Self::flags(), ent, OFS_JTLB + JTLB_DELTA);
+            let hb = self.b.ins().iadd(base, delta);
+            self.b.ins().jump(cont, &[hb.into()]);
+
+            self.b.switch_to_block(cont);
+            self.groups[id].host_base = Some(self.b.block_params(cont)[0]);
+        }
+        let hb = self.groups[id].host_base?;
+        Some(self.b.ins().iadd_imm_s(hb, off))
+    }
+
     /// Translates a region from decode_region. The instructions are
     /// in address order and each basic block starts at a leader.
     fn translate_region(&mut self, instrs: &[BlockInstr]) {
@@ -1720,6 +1889,7 @@ impl<'a, 'b> Translator<'a, 'b> {
                 }
             }
         }
+        self.plan_groups(instrs);
         self.b.ins().jump(self.header, &[]);
         // Instructions of the current basic block, or None if the
         // previous instruction ended it.
@@ -1758,6 +1928,9 @@ impl<'a, 'b> Translator<'a, 'b> {
 
     fn translate(&mut self, instrs: &[BlockInstr]) {
         self.load_regs(instrs);
+        if !self.env.optimize {
+            self.plan_groups(instrs);
+        }
         if self.env.optimize {
             self.translate_region(instrs);
             return;
@@ -1804,6 +1977,22 @@ impl<'a, 'b> Translator<'a, 'b> {
         write: bool,
         slow: cranelift_codegen::ir::Block,
     ) -> Value {
+        let last = if size > 1 {
+            self.b.ins().iadd_imm_s(addr, size - 1)
+        } else {
+            addr
+        };
+        self.tlb_fast_range(addr, last, write, slow)
+    }
+
+    /// Emits the inline TLB lookup of the accesses to [addr, last].
+    fn tlb_fast_range(
+        &mut self,
+        addr: Value,
+        last: Value,
+        write: bool,
+        slow: cranelift_codegen::ir::Block,
+    ) -> Value {
         let f = Self::flags();
         // The JIT TLB is in the CPU state: the entry of the page is at
         // cpu + OFS_JTLB + ((addr >> 12) & 0xfff) << JTLB_SHIFT.
@@ -1816,11 +2005,6 @@ impl<'a, 'b> Translator<'a, 'b> {
         // crosses a page boundary never matches. The data key is loaded
         // at each access rather than kept in a register: it folds into
         // the or as a memory operand.
-        let last = if size > 1 {
-            self.b.ins().iadd_imm_s(addr, size - 1)
-        } else {
-            addr
-        };
         let tag = self.b.ins().band_imm_s(last, !0xfff);
         let key = self
             .b
@@ -1847,7 +2031,8 @@ impl<'a, 'b> Translator<'a, 'b> {
         let slot = match which {
             0 => &self.load_sig,
             1 => &self.store_sig,
-            _ => &self.exec_sig,
+            2 => &self.exec_sig,
+            _ => &self.probe_sig,
         };
         if let Some(s) = *slot {
             return s;
@@ -1856,13 +2041,26 @@ impl<'a, 'b> Translator<'a, 'b> {
         match which {
             0 => self.load_sig = Some(s),
             1 => self.store_sig = Some(s),
-            _ => self.exec_sig = Some(s),
+            2 => self.exec_sig = Some(s),
+            _ => self.probe_sig = Some(s),
         }
         s
     }
 
     /// Emits a guest load. Faults exit the block at the instruction.
     fn load(&mut self, k: u64, pc: u64, addr: Value, size: i64, signed: bool) -> Value {
+        if let Some(host) = self.group_access(k, pc) {
+            let f = MemFlagsData::new();
+            return match (size, signed) {
+                (1, false) => self.b.ins().uload8(types::I64, f, host, 0),
+                (1, true) => self.b.ins().sload8(types::I64, f, host, 0),
+                (2, false) => self.b.ins().uload16(types::I64, f, host, 0),
+                (2, true) => self.b.ins().sload16(types::I64, f, host, 0),
+                (4, false) => self.b.ins().uload32(f, host, 0),
+                (4, true) => self.b.ins().sload32(f, host, 0),
+                _ => self.b.ins().load(types::I64, f, host, 0),
+            };
+        }
         let slow = self.b.create_block();
         let done = self.b.create_block();
         self.b.append_block_param(done, types::I64);
@@ -1914,6 +2112,24 @@ impl<'a, 'b> Translator<'a, 'b> {
 
     /// Emits a guest store.
     fn store(&mut self, k: u64, pc: u64, addr: Value, size: i64, v: Value) {
+        if let Some(host) = self.group_access(k, pc) {
+            let f = MemFlagsData::new();
+            match size {
+                1 => self.b.ins().istore8(f, v, host, 0),
+                2 => self.b.ins().istore16(f, v, host, 0),
+                4 => self.b.ins().istore32(f, v, host, 0),
+                _ => self.b.ins().store(f, v, host, 0),
+            };
+            // The stores of a group run together, so the first one
+            // clears the reservation for all.
+            let id = self.group_of[&pc].0;
+            if !self.groups[id].resv_cleared {
+                self.groups[id].resv_cleared = true;
+                let zero = self.b.ins().iconst(types::I8, 0);
+                self.b.ins().store(Self::flags(), zero, self.cpu, OFS_RESV);
+            }
+            return;
+        }
         let done = self.b.create_block();
         let slow = self.b.create_block();
         self.b.set_cold_block(slow);
@@ -1954,6 +2170,16 @@ impl<'a, 'b> Translator<'a, 'b> {
         self.check_fault(k, pc, done, &[]);
 
         self.b.switch_to_block(done);
+    }
+
+    /// Returns the host address of the access at pc if it is in a
+    /// checked group of stack accesses.
+    fn group_access(&mut self, k: u64, pc: u64) -> Option<Value> {
+        if !self.group_of.contains_key(&pc) {
+            return None;
+        }
+        let base = self.get(SP);
+        self.group_host(k, pc, base)
     }
 
     /// Exits the block with a fault if the last helper call faulted;
@@ -2598,7 +2824,8 @@ impl Cpu {
     fn jit_addresses(&self) -> [u64; NUM_SYMS] {
         let mut syms = [0; NUM_SYMS];
         syms[Sym::Tlb as usize] = self.tlb.as_ptr() as u64;
-        let stubs = self.jit.as_ref().map_or([0; 3], |j| j.stubs);
+        let stubs = self.jit.as_ref().map_or([0; 4], |j| j.stubs);
+        syms[Sym::Probe as usize] = stubs[3];
         syms[Sym::Load as usize] = stubs[0];
         syms[Sym::Store as usize] = stubs[1];
         syms[Sym::Exec as usize] = stubs[2];

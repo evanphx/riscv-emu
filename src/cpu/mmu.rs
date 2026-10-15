@@ -151,6 +151,34 @@ impl Cpu {
         Ok(paddr)
     }
 
+    /// Makes the JIT TLB entry of the page of lo allow the accesses to
+    /// [lo, hi]. Returns false if the range crosses a page or the
+    /// accesses would not run directly on RAM, for example because of a
+    /// page fault. Never raises an exception.
+    #[cfg(feature = "jit")]
+    pub(super) fn jit_probe_range(&mut self, lo: u64, hi: u64, write: bool) -> bool {
+        if lo >> 12 != hi >> 12 {
+            return false;
+        }
+        if self.jtlb_host(lo, hi - lo + 1, write).is_some() {
+            return true;
+        }
+        let access = if write { ACCESS_WRITE } else { ACCESS_READ };
+        if self.translate(lo, access).is_err() {
+            return false;
+        }
+        if self.data_mode == Mode::M || self.satp.mode() == SATP_MODE_BARE {
+            self.jit_fill_bare(lo);
+        } else {
+            let e = self.tlb[((lo >> 12) & 0xfff) as usize];
+            if e.tag != TlbEntry::tag(lo, self.data_key) {
+                return false;
+            }
+            self.jit_tlb_fill(lo, self.data_key, e.page, e.flags);
+        }
+        self.jtlb_host(lo, hi - lo + 1, write).is_some()
+    }
+
     /// Fills the compiled code TLB entry of the data address vaddr if
     /// data accesses are not translated, so that compiled code accesses
     /// the page directly from then on.
