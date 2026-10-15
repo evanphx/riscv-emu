@@ -19,32 +19,162 @@ struct FlagSpec {
 }
 
 const FLAGS: &[FlagSpec] = &[
-    FlagSpec { name: "cpuprofile", boolean: false, multi: false, usage: "write cpu profile to `file` (unsupported)" },
-    FlagSpec { name: "v", boolean: true, multi: false, usage: "verbose output" },
-    FlagSpec { name: "ktrace", boolean: true, multi: false, usage: "kernel trace" },
-    FlagSpec { name: "cputrace", boolean: true, multi: false, usage: "CPU trace" },
-    FlagSpec { name: "color", boolean: true, multi: false, usage: "turn on color output" },
-    FlagSpec { name: "fsroot", boolean: false, multi: false, usage: "filesystem root" },
-    FlagSpec { name: "D", boolean: true, multi: false, usage: "disassemble" },
-    FlagSpec { name: "bios", boolean: false, multi: false, usage: "the firmware; enables system emulation" },
-    FlagSpec { name: "kernel", boolean: false, multi: false, usage: "the kernel; enables system emulation" },
-    FlagSpec { name: "initrd", boolean: false, multi: false, usage: "the init filesystem" },
-    FlagSpec { name: "append", boolean: false, multi: false, usage: "kernel boot args" },
-    FlagSpec { name: "symbols", boolean: false, multi: false, usage: "kernel System.map" },
-    FlagSpec { name: "log", boolean: false, multi: false, usage: "logger output file" },
-    FlagSpec { name: "cooked", boolean: true, multi: false, usage: "don't enable raw terminal mode" },
-    FlagSpec { name: "csr802", boolean: false, multi: false, usage: "CSR802 CPU profiling filename" },
-    FlagSpec { name: "gpu", boolean: false, multi: false, usage: "graphics device" },
-    FlagSpec { name: "htif", boolean: true, multi: false, usage: "enable host target interface" },
-    FlagSpec { name: "dumpdtb", boolean: false, multi: false, usage: "dump DTB to `file`" },
-    FlagSpec { name: "m", boolean: false, multi: false, usage: "guest RAM size" },
-    FlagSpec { name: "nographic", boolean: true, multi: false, usage: "disable graphical output" },
-    FlagSpec { name: "jit", boolean: true, multi: false, usage: "enable the Cranelift JIT compiler" },
-    FlagSpec { name: "jit-threshold", boolean: false, multi: false, usage: "executions before a block is JIT compiled (default 3000)" },
-    FlagSpec { name: "jit-sync", boolean: true, multi: false, usage: "compile blocks synchronously (deterministic runs)" },
-    FlagSpec { name: "drive", boolean: false, multi: true, usage: "configure drive" },
-    FlagSpec { name: "device", boolean: false, multi: true, usage: "configure device" },
-    FlagSpec { name: "netdev", boolean: false, multi: true, usage: "configure network device" },
+    FlagSpec {
+        name: "cpuprofile",
+        boolean: false,
+        multi: false,
+        usage: "write cpu profile to `file` (unsupported)",
+    },
+    FlagSpec {
+        name: "v",
+        boolean: true,
+        multi: false,
+        usage: "verbose output",
+    },
+    FlagSpec {
+        name: "ktrace",
+        boolean: true,
+        multi: false,
+        usage: "kernel trace",
+    },
+    FlagSpec {
+        name: "cputrace",
+        boolean: true,
+        multi: false,
+        usage: "CPU trace",
+    },
+    FlagSpec {
+        name: "color",
+        boolean: true,
+        multi: false,
+        usage: "turn on color output",
+    },
+    FlagSpec {
+        name: "fsroot",
+        boolean: false,
+        multi: false,
+        usage: "filesystem root",
+    },
+    FlagSpec {
+        name: "D",
+        boolean: true,
+        multi: false,
+        usage: "disassemble",
+    },
+    FlagSpec {
+        name: "bios",
+        boolean: false,
+        multi: false,
+        usage: "the firmware; enables system emulation",
+    },
+    FlagSpec {
+        name: "kernel",
+        boolean: false,
+        multi: false,
+        usage: "the kernel; enables system emulation",
+    },
+    FlagSpec {
+        name: "initrd",
+        boolean: false,
+        multi: false,
+        usage: "the init filesystem",
+    },
+    FlagSpec {
+        name: "append",
+        boolean: false,
+        multi: false,
+        usage: "kernel boot args",
+    },
+    FlagSpec {
+        name: "symbols",
+        boolean: false,
+        multi: false,
+        usage: "kernel System.map",
+    },
+    FlagSpec {
+        name: "log",
+        boolean: false,
+        multi: false,
+        usage: "logger output file",
+    },
+    FlagSpec {
+        name: "cooked",
+        boolean: true,
+        multi: false,
+        usage: "don't enable raw terminal mode",
+    },
+    FlagSpec {
+        name: "csr802",
+        boolean: false,
+        multi: false,
+        usage: "CSR802 CPU profiling filename",
+    },
+    FlagSpec {
+        name: "gpu",
+        boolean: false,
+        multi: false,
+        usage: "graphics device",
+    },
+    FlagSpec {
+        name: "htif",
+        boolean: true,
+        multi: false,
+        usage: "enable host target interface",
+    },
+    FlagSpec {
+        name: "dumpdtb",
+        boolean: false,
+        multi: false,
+        usage: "dump DTB to `file`",
+    },
+    FlagSpec {
+        name: "m",
+        boolean: false,
+        multi: false,
+        usage: "guest RAM size",
+    },
+    FlagSpec {
+        name: "nographic",
+        boolean: true,
+        multi: false,
+        usage: "disable graphical output",
+    },
+    FlagSpec {
+        name: "jit",
+        boolean: true,
+        multi: false,
+        usage: "enable the Cranelift JIT compiler",
+    },
+    FlagSpec {
+        name: "jit-threshold",
+        boolean: false,
+        multi: false,
+        usage: "executions before a block is JIT compiled (default 3000)",
+    },
+    FlagSpec {
+        name: "jit-sync",
+        boolean: true,
+        multi: false,
+        usage: "compile blocks synchronously (deterministic runs)",
+    },
+    FlagSpec {
+        name: "drive",
+        boolean: false,
+        multi: true,
+        usage: "configure drive",
+    },
+    FlagSpec {
+        name: "device",
+        boolean: false,
+        multi: true,
+        usage: "configure device",
+    },
+    FlagSpec {
+        name: "netdev",
+        boolean: false,
+        multi: true,
+        usage: "configure network device",
+    },
 ];
 
 fn usage() -> ! {
@@ -122,7 +252,10 @@ impl Flags {
     }
 
     fn bool(&self, name: &str) -> bool {
-        matches!(self.string(name).as_str(), "true" | "1" | "t" | "T" | "TRUE" | "True")
+        matches!(
+            self.string(name).as_str(),
+            "true" | "1" | "t" | "T" | "TRUE" | "True"
+        )
     }
 
     fn list(&self, name: &str) -> Vec<String> {
@@ -253,7 +386,9 @@ fn main() {
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
-    let envp: Vec<String> = std::env::vars().map(|(k, v)| format!("{}={}", k, v)).collect();
+    let envp: Vec<String> = std::env::vars()
+        .map(|(k, v)| format!("{}={}", k, v))
+        .collect();
     if flags.args.is_empty() {
         usage();
     }

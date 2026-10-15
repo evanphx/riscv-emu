@@ -141,12 +141,13 @@ pub fn system_emulation(
     let mut virtio_irq = VIRTIO_IRQ_BASE;
     let mut shm_base = SHM_BASE;
 
-    let mut add_virtio = |bus: &mut Bus, vio: VirtioMmio, virtio_ram: &mut u64, virtio_irq: &mut u32| {
-        *virtio_ram = vio.end;
-        *virtio_irq += 1;
-        bus.add(vio.clone());
-        virtio_devices.push(vio);
-    };
+    let mut add_virtio =
+        |bus: &mut Bus, vio: VirtioMmio, virtio_ram: &mut u64, virtio_irq: &mut u32| {
+            *virtio_ram = vio.end;
+            *virtio_irq += 1;
+            bus.add(vio.clone());
+            virtio_devices.push(vio);
+        };
 
     // Entropy source.
     let rng = virtio::Rng::create(virtio_ram, plic.clone(), virtio_irq, mem.clone())?;
@@ -272,8 +273,7 @@ pub fn system_emulation(
 
     let mut entrypoint = 0;
     if !cfg.bios.is_empty() {
-        let data =
-            std::fs::read(&cfg.bios).map_err(|e| format!("failed to read BIOS: {}", e))?;
+        let data = std::fs::read(&cfg.bios).map_err(|e| format!("failed to read BIOS: {}", e))?;
         load_ram(&mem, OFS_BIOS, &data)?;
         entrypoint = OFS_BIOS;
     }

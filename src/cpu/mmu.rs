@@ -125,7 +125,12 @@ impl Cpu {
     /// Walks the Sv39 page table. Returns the physical (super)page
     /// base address, the effective permission flags for the TLB, and
     /// the page level.
-    fn walk_sv39(&mut self, vaddr: u64, access: u8, mode: Mode) -> Result<(u64, u8, u32), Exception> {
+    fn walk_sv39(
+        &mut self,
+        vaddr: u64,
+        access: u8,
+        mode: Mode,
+    ) -> Result<(u64, u8, u32), Exception> {
         if self.satp.mode() != SATP_MODE_SV39 {
             return Err(Exception::fatal(format!(
                 "unsupported satp mode {}",

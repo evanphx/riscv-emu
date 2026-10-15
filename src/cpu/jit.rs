@@ -24,17 +24,17 @@ use super::Cpu;
 use crate::isa::{self, Exception, Instr, Op};
 use crate::memory::PAGE_SIZE;
 use crate::mmu::{TlbEntry, PTE_D, PTE_R, PTE_W};
+use cranelift_codegen::control::ControlPlane;
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{types, AbiParam, InstBuilder, MemFlagsData, Signature, Type, Value};
-use cranelift_codegen::control::ControlPlane;
 use cranelift_codegen::isa::OwnedTargetIsa;
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_codegen::Context;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use std::collections::{HashMap, HashSet};
-use std::sync::mpsc;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::mem::offset_of;
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 /// Compiled block entry point. Returns the number of executed
@@ -232,17 +232,111 @@ pub(super) fn jitable(op: Op) -> bool {
     native_fp(op)
         || helper_op(op)
         || matches!(
-        op,
-        Add | Sub | Sll | Slt | Sltu | Xor | Srl | Sra | Or | And | Addi | Slti | Sltiu | Xori
-            | Ori | Andi | Slli | Srli | Srai | Addw | Subw | Sllw | Srlw | Sraw | Addiw | Slliw
-            | SlliUw | Srliw | Sraiw | Mul | Mulh | Mulhsu | Mulhu | Div | Divu | Rem | Remu
-            | Mulw | Divw | Divuw | Remw | Remuw | Lb | Lh | Lw | Ld | Lbu | Lhu | Lwu | Sb | Sh
-            | Sw | Sd | Beq | Bne | Blt | Bge | Bltu | Bgeu | Jal | Jalr | Lui | Auipc | Fence
-            | CzeroEqz | CzeroNez | Bclr | Bclri | Bext | Bexti | Binv | Binvi | Bset | Bseti
-            | AddUw | Sh1add | Sh2add | Sh3add | Sh1addUw | Sh2addUw | Sh3addUw | Andn | Orn
-            | Xnor | Clz | Clzw | Ctz | Ctzw | Cpop | Cpopw | Max | Maxu | Min | Minu | SextB
-            | SextH | ZextH | Rol | Rolw | Ror | Rorw | Rori | Roriw | Rev8
-    )
+            op,
+            Add | Sub
+                | Sll
+                | Slt
+                | Sltu
+                | Xor
+                | Srl
+                | Sra
+                | Or
+                | And
+                | Addi
+                | Slti
+                | Sltiu
+                | Xori
+                | Ori
+                | Andi
+                | Slli
+                | Srli
+                | Srai
+                | Addw
+                | Subw
+                | Sllw
+                | Srlw
+                | Sraw
+                | Addiw
+                | Slliw
+                | SlliUw
+                | Srliw
+                | Sraiw
+                | Mul
+                | Mulh
+                | Mulhsu
+                | Mulhu
+                | Div
+                | Divu
+                | Rem
+                | Remu
+                | Mulw
+                | Divw
+                | Divuw
+                | Remw
+                | Remuw
+                | Lb
+                | Lh
+                | Lw
+                | Ld
+                | Lbu
+                | Lhu
+                | Lwu
+                | Sb
+                | Sh
+                | Sw
+                | Sd
+                | Beq
+                | Bne
+                | Blt
+                | Bge
+                | Bltu
+                | Bgeu
+                | Jal
+                | Jalr
+                | Lui
+                | Auipc
+                | Fence
+                | CzeroEqz
+                | CzeroNez
+                | Bclr
+                | Bclri
+                | Bext
+                | Bexti
+                | Binv
+                | Binvi
+                | Bset
+                | Bseti
+                | AddUw
+                | Sh1add
+                | Sh2add
+                | Sh3add
+                | Sh1addUw
+                | Sh2addUw
+                | Sh3addUw
+                | Andn
+                | Orn
+                | Xnor
+                | Clz
+                | Clzw
+                | Ctz
+                | Ctzw
+                | Cpop
+                | Cpopw
+                | Max
+                | Maxu
+                | Min
+                | Minu
+                | SextB
+                | SextH
+                | ZextH
+                | Rol
+                | Rolw
+                | Ror
+                | Rorw
+                | Rori
+                | Roriw
+                | Rev8
+        )
 }
 
 /// Floating point loads, stores, and moves compiled to native code.
@@ -258,19 +352,113 @@ fn helper_op(op: Op) -> bool {
     use Op::*;
     matches!(
         op,
-        LrW | ScW | AmoaddW | AmoswapW | AmoxorW | AmoandW | AmoorW | AmominW | AmomaxW
-            | AmominuW | AmomaxuW | LrD | ScD | AmoaddD | AmoswapD | AmoxorD | AmoandD
-            | AmoorD | AmominD | AmomaxD | AmominuD | AmomaxuD | FaddS | FaddD | FsubS
-            | FsubD | FmulS | FmulD | FdivS | FdivD | FsqrtS | FsqrtD | FmaddS | FmaddD
-            | FmsubS | FmsubD | FnmsubS | FnmsubD | FnmaddS | FnmaddD | FsgnjS | FsgnjnS
-            | FsgnjxS | FsgnjD | FsgnjnD | FsgnjxD | FminS | FmaxS | FminD | FmaxD | FeqS
-            | FltS | FleS | FeqD | FltD | FleD | FcvtWS | FcvtWuS | FcvtLS | FcvtLuS | FcvtWD
-            | FcvtWuD | FcvtLD | FcvtLuD | FcvtSW | FcvtSWu | FcvtSL | FcvtSLu | FcvtDW
-            | FcvtDWu | FcvtDL | FcvtDLu | FcvtSD | FcvtDS | FclassS | FclassD | Vsetvli
-            | Vsetivli | Vsetvl | VandVX | VxorVV | VmsneVV | VidV | VmvVX | VmvVV | VmvVI
-            | Vle8V | Vle16V | Vle32V | Vle64V | Vse8V | Vse16V | Vse32V | Vse64V | VaddVI
-            | VmseqVI | VsllVI | VsraVI | Clmul | Clmulh | Clmulr | Pack | Packh | Packw
-            | Brev8 | Xperm4 | Xperm8 | OrcB
+        LrW | ScW
+            | AmoaddW
+            | AmoswapW
+            | AmoxorW
+            | AmoandW
+            | AmoorW
+            | AmominW
+            | AmomaxW
+            | AmominuW
+            | AmomaxuW
+            | LrD
+            | ScD
+            | AmoaddD
+            | AmoswapD
+            | AmoxorD
+            | AmoandD
+            | AmoorD
+            | AmominD
+            | AmomaxD
+            | AmominuD
+            | AmomaxuD
+            | FaddS
+            | FaddD
+            | FsubS
+            | FsubD
+            | FmulS
+            | FmulD
+            | FdivS
+            | FdivD
+            | FsqrtS
+            | FsqrtD
+            | FmaddS
+            | FmaddD
+            | FmsubS
+            | FmsubD
+            | FnmsubS
+            | FnmsubD
+            | FnmaddS
+            | FnmaddD
+            | FsgnjS
+            | FsgnjnS
+            | FsgnjxS
+            | FsgnjD
+            | FsgnjnD
+            | FsgnjxD
+            | FminS
+            | FmaxS
+            | FminD
+            | FmaxD
+            | FeqS
+            | FltS
+            | FleS
+            | FeqD
+            | FltD
+            | FleD
+            | FcvtWS
+            | FcvtWuS
+            | FcvtLS
+            | FcvtLuS
+            | FcvtWD
+            | FcvtWuD
+            | FcvtLD
+            | FcvtLuD
+            | FcvtSW
+            | FcvtSWu
+            | FcvtSL
+            | FcvtSLu
+            | FcvtDW
+            | FcvtDWu
+            | FcvtDL
+            | FcvtDLu
+            | FcvtSD
+            | FcvtDS
+            | FclassS
+            | FclassD
+            | Vsetvli
+            | Vsetivli
+            | Vsetvl
+            | VandVX
+            | VxorVV
+            | VmsneVV
+            | VidV
+            | VmvVX
+            | VmvVV
+            | VmvVI
+            | Vle8V
+            | Vle16V
+            | Vle32V
+            | Vle64V
+            | Vse8V
+            | Vse16V
+            | Vse32V
+            | Vse64V
+            | VaddVI
+            | VmseqVI
+            | VsllVI
+            | VsraVI
+            | Clmul
+            | Clmulh
+            | Clmulr
+            | Pack
+            | Packh
+            | Packw
+            | Brev8
+            | Xperm4
+            | Xperm8
+            | OrcB
     )
 }
 
@@ -811,9 +999,7 @@ impl<'a, 'b> Translator<'a, 'b> {
     /// Exits the block: writes PC and returns the instruction count
     /// and status.
     fn exit_with(&mut self, pc: Value, count: Value, status: u64) {
-        self.b
-            .ins()
-            .store(Self::flags(), pc, self.cpu, OFS_PC);
+        self.b.ins().store(Self::flags(), pc, self.cpu, OFS_PC);
         let ret = if status == 0 {
             count
         } else {
@@ -1086,9 +1272,7 @@ impl<'a, 'b> Translator<'a, 'b> {
             .b
             .ins()
             .bor_imm_s(ms, (3 << isa::ms::FS) | (1i64 << isa::ms::SD));
-        self.b
-            .ins()
-            .store(Self::flags(), ms, self.cpu, OFS_MSTATUS);
+        self.b.ins().store(Self::flags(), ms, self.cpu, OFS_MSTATUS);
     }
 
     fn load_f(&mut self, r: u8) -> Value {
@@ -1122,12 +1306,10 @@ impl<'a, 'b> Translator<'a, 'b> {
         let rd = bi.instr.rd;
         if rd != 0 {
             if let Some(var) = self.vars[rd as usize] {
-                let v = self.b.ins().load(
-                    types::I64,
-                    Self::flags(),
-                    self.cpu,
-                    OFS_X + 8 * rd as i32,
-                );
+                let v =
+                    self.b
+                        .ins()
+                        .load(types::I64, Self::flags(), self.cpu, OFS_X + 8 * rd as i32);
                 self.b.def_var(var, v);
             }
         }

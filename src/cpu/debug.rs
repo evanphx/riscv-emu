@@ -146,7 +146,12 @@ impl Cpu {
         };
         for i in 0..32 {
             if self.x[i] != rt.x[i] {
-                eprintln!("{}{}={:016x}", TRACE_PREFIX, isa::reg_name(i as u8), self.x[i]);
+                eprintln!(
+                    "{}{}={:016x}",
+                    TRACE_PREFIX,
+                    isa::reg_name(i as u8),
+                    self.x[i]
+                );
                 rt.x[i] = self.x[i];
             }
         }
@@ -180,7 +185,8 @@ impl Cpu {
             if a < 0x1_0000_0000 {
                 a
             } else {
-                a.wrapping_sub(0xffff_ffff_0000_0000).wrapping_add(0x20_0000)
+                a.wrapping_sub(0xffff_ffff_0000_0000)
+                    .wrapping_add(0x20_0000)
             }
         };
         let start = to_phys(entry.start);

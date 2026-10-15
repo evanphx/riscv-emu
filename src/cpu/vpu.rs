@@ -176,15 +176,19 @@ impl Cpu {
                 self.set_vl(i.rd, i.rs1, self.x[i.rs1 as usize], t);
             }
             Vsetvli => {
-                self.set_vl(i.rd, i.rs1, self.x[i.rs1 as usize], VType(i.imm as u32 as u64));
+                self.set_vl(
+                    i.rd,
+                    i.rs1,
+                    self.x[i.rs1 as usize],
+                    VType(i.imm as u32 as u64),
+                );
             }
             Vsetivli => {
                 // rs1 = 0xff marks the immediate AVL form.
                 self.set_vl(i.rd, 0xff, i.rs1 as u64, VType(i.imm as u32 as u64));
             }
 
-            VmvVV | VmvVX | VmvVI | VandVX | VxorVV | VidV | VaddVI | VsllVI | VsraVI
-            | VmsneVV => {
+            VmvVV | VmvVX | VmvVI | VandVX | VxorVV | VidV | VaddVI | VsllVI | VsraVI | VmsneVV => {
                 let vlmul = self.vpu.vtype.vlmul();
                 if vlmul > 1.0 {
                     self.require_align(raw, vd, vlmul as u64)?;

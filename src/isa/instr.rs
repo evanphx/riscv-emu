@@ -500,11 +500,11 @@ impl fmt::Display for Instr {
             Invalid => write!(f, "invalid"),
 
             Add | Sub | Sll | Slt | Sltu | Xor | Srl | Sra | Or | And | Addw | Subw | Sllw
-            | Srlw | Sraw | Mul | Mulh | Mulhsu | Mulhu | Div | Divu | Rem | Remu | Mulw
-            | Divw | Divuw | Remw | Remuw | CzeroEqz | CzeroNez | Bclr | Bext | Binv | Bset
-            | AddUw | Sh1add | Sh2add | Sh3add | Sh1addUw | Sh2addUw | Sh3addUw | Andn | Orn
-            | Xnor | Max | Maxu | Min | Minu | Rol | Rolw | Ror | Rorw | Clmul | Clmulh
-            | Clmulr | Pack | Packh | Packw | Xperm4 | Xperm8 => {
+            | Srlw | Sraw | Mul | Mulh | Mulhsu | Mulhu | Div | Divu | Rem | Remu | Mulw | Divw
+            | Divuw | Remw | Remuw | CzeroEqz | CzeroNez | Bclr | Bext | Binv | Bset | AddUw
+            | Sh1add | Sh2add | Sh3add | Sh1addUw | Sh2addUw | Sh3addUw | Andn | Orn | Xnor
+            | Max | Maxu | Min | Minu | Rol | Rolw | Ror | Rorw | Clmul | Clmulh | Clmulr
+            | Pack | Packh | Packw | Xperm4 | Xperm8 => {
                 write!(f, "{} {},{},{}", name, rd, rs1, rs2)
             }
 
@@ -531,14 +531,9 @@ impl fmt::Display for Instr {
             CboInval | CboClean | CboFlush | CboZero => write!(f, "{} ({})", name, rs1),
             PrefetchI | PrefetchR | PrefetchW => write!(f, "{} {}({})", name, imm, rs1),
 
-            Csrrw | Csrrs | Csrrc => write!(
-                f,
-                "{} {},{},{}",
-                name,
-                rd,
-                super::csr_name(imm as u16),
-                rs1
-            ),
+            Csrrw | Csrrs | Csrrc => {
+                write!(f, "{} {},{},{}", name, rd, super::csr_name(imm as u16), rs1)
+            }
             Csrrwi | Csrrsi | Csrrci => write!(
                 f,
                 "{} {},{},{}",
@@ -550,8 +545,8 @@ impl fmt::Display for Instr {
 
             LrW | LrD => write!(f, "{} {},({})", name, rd, rs1),
             ScW | ScD | AmoaddW | AmoswapW | AmoxorW | AmoandW | AmoorW | AmominW | AmomaxW
-            | AmominuW | AmomaxuW | AmoaddD | AmoswapD | AmoxorD | AmoandD | AmoorD
-            | AmominD | AmomaxD | AmominuD | AmomaxuD => {
+            | AmominuW | AmomaxuW | AmoaddD | AmoswapD | AmoxorD | AmoandD | AmoorD | AmominD
+            | AmomaxD | AmominuD | AmomaxuD => {
                 write!(f, "{} {},{},({})", name, rd, rs2, rs1)
             }
 

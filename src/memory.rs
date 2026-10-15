@@ -216,11 +216,7 @@ impl Memory {
     pub fn read_bytes(&self, ofs: u64, buf: &mut [u8]) {
         self.check(ofs, buf.len() as u64);
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                self.ptr.add(ofs as usize),
-                buf.as_mut_ptr(),
-                buf.len(),
-            )
+            std::ptr::copy_nonoverlapping(self.ptr.add(ofs as usize), buf.as_mut_ptr(), buf.len())
         }
     }
 

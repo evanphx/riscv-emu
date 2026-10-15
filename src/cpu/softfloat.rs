@@ -86,7 +86,8 @@ impl Fmt {
     }
 
     pub fn is_nan(self, v: u64) -> bool {
-        (v >> self.frac_bits) & self.emax_biased() == self.emax_biased() && v & self.frac_mask() != 0
+        (v >> self.frac_bits) & self.emax_biased() == self.emax_biased()
+            && v & self.frac_mask() != 0
     }
 
     pub fn is_snan(self, v: u64) -> bool {
@@ -170,7 +171,11 @@ fn shift_round(sig: u128, shift: i32, sticky: bool) -> (u128, Rem) {
     let (q, r, half) = if shift == 128 {
         (0u128, sig, 1u128 << 127)
     } else {
-        (sig >> shift, sig & ((1u128 << shift) - 1), 1u128 << (shift - 1))
+        (
+            sig >> shift,
+            sig & ((1u128 << shift) - 1),
+            1u128 << (shift - 1),
+        )
     };
     let rem = if r == 0 {
         if sticky {
@@ -198,7 +203,15 @@ fn msb(v: u128) -> i32 {
 }
 
 /// Rounds and packs the value (-1)^sign * (sig + sticky) * 2^exp.
-fn round_pack(fmt: Fmt, sign: bool, exp: i32, sig: u128, sticky: bool, rm: u32, flags: &mut u32) -> u64 {
+fn round_pack(
+    fmt: Fmt,
+    sign: bool,
+    exp: i32,
+    sig: u128,
+    sticky: bool,
+    rm: u32,
+    flags: &mut u32,
+) -> u64 {
     if sig == 0 {
         debug_assert!(!sticky);
         return fmt.zero(sign);
@@ -208,7 +221,11 @@ fn round_pack(fmt: Fmt, sign: bool, exp: i32, sig: u128, sticky: bool, rm: u32, 
     let e = exp + msb(sig); // value in [2^e, 2^(e+1))
     let emin = fmt.emin();
 
-    let lsb_exp = if e >= emin { e - (p - 1) } else { emin - (p - 1) };
+    let lsb_exp = if e >= emin {
+        e - (p - 1)
+    } else {
+        emin - (p - 1)
+    };
     let (mut q, rem) = shift_round(sig, lsb_exp - exp, sticky);
     let inexact = rem != Rem::Zero;
     if round_up(rm, sign, q & 1 == 1, rem) {
@@ -448,7 +465,16 @@ pub fn sqrt(fmt: Fmt, a: u64, rm: u32, flags: &mut u32) -> u64 {
 /// a * b + c with a single rounding. The neg_prod and neg_c flags
 /// negate the product and the addend.
 #[allow(clippy::too_many_arguments)]
-pub fn fma(fmt: Fmt, a: u64, b: u64, c: u64, neg_prod: bool, neg_c: bool, rm: u32, flags: &mut u32) -> u64 {
+pub fn fma(
+    fmt: Fmt,
+    a: u64,
+    b: u64,
+    c: u64,
+    neg_prod: bool,
+    neg_c: bool,
+    rm: u32,
+    flags: &mut u32,
+) -> u64 {
     let (ua, ub, uc) = (unpack(fmt, a), unpack(fmt, b), unpack(fmt, c));
     if matches!(ua, Val::Nan) || matches!(ub, Val::Nan) {
         return nan_result(fmt, &[a, b, c], flags);
@@ -675,16 +701,44 @@ mod tests {
     #[test]
     fn basic_ops_match_host() {
         let vals = [
-            0.0, -0.0, 1.0, -1.5, 3.25, 1e300, -1e-300, 2.2250738585072014e-308, 5e-324,
-            123456.789, 0.1, 1.0 / 3.0,
+            0.0,
+            -0.0,
+            1.0,
+            -1.5,
+            3.25,
+            1e300,
+            -1e-300,
+            2.2250738585072014e-308,
+            5e-324,
+            123456.789,
+            0.1,
+            1.0 / 3.0,
         ];
         for &a in &vals {
             for &b in &vals {
                 let mut fl = 0;
-                assert_eq!(add(F64, f64b(a), f64b(b), RNE, &mut fl), f64b(a + b), "{}+{}", a, b);
-                assert_eq!(mul(F64, f64b(a), f64b(b), RNE, &mut fl), f64b(a * b), "{}*{}", a, b);
+                assert_eq!(
+                    add(F64, f64b(a), f64b(b), RNE, &mut fl),
+                    f64b(a + b),
+                    "{}+{}",
+                    a,
+                    b
+                );
+                assert_eq!(
+                    mul(F64, f64b(a), f64b(b), RNE, &mut fl),
+                    f64b(a * b),
+                    "{}*{}",
+                    a,
+                    b
+                );
                 if b != 0.0 {
-                    assert_eq!(div(F64, f64b(a), f64b(b), RNE, &mut fl), f64b(a / b), "{}/{}", a, b);
+                    assert_eq!(
+                        div(F64, f64b(a), f64b(b), RNE, &mut fl),
+                        f64b(a / b),
+                        "{}/{}",
+                        a,
+                        b
+                    );
                 }
                 let c = 0.75;
                 assert_eq!(
@@ -707,8 +761,14 @@ mod tests {
         let mut fl = 0;
         let a = 1.1f32.to_bits() as u64;
         let b = 2.2f32.to_bits() as u64;
-        assert_eq!(add(F32, a, b, RNE, &mut fl), (1.1f32 + 2.2f32).to_bits() as u64);
-        assert_eq!(div(F32, a, b, RNE, &mut fl), (1.1f32 / 2.2f32).to_bits() as u64);
+        assert_eq!(
+            add(F32, a, b, RNE, &mut fl),
+            (1.1f32 + 2.2f32).to_bits() as u64
+        );
+        assert_eq!(
+            div(F32, a, b, RNE, &mut fl),
+            (1.1f32 / 2.2f32).to_bits() as u64
+        );
         assert_eq!(sqrt(F32, b, RNE, &mut fl), 2.2f32.sqrt().to_bits() as u64);
     }
 
@@ -724,7 +784,14 @@ mod tests {
         mul(F64, f64b(1e300), f64b(1e300), RNE, &mut fl);
         assert_eq!(fl, OF | NX);
         fl = 0;
-        let r = to_int(F64, f64b(-1.5), i32::MIN as i128, i32::MAX as i128, RNE, &mut fl);
+        let r = to_int(
+            F64,
+            f64b(-1.5),
+            i32::MIN as i128,
+            i32::MAX as i128,
+            RNE,
+            &mut fl,
+        );
         assert_eq!(r, -2);
         assert_eq!(fl, NX);
         fl = 0;

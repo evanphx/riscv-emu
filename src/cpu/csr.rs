@@ -139,7 +139,8 @@ impl Cpu {
                 self.set_fs_dirty();
             }
             isa::CSR_MSTATUS => {
-                let mut ms = Mstatus((self.mstatus.0 & !MSTATUS_WRITE_MASK) | (v & MSTATUS_WRITE_MASK));
+                let mut ms =
+                    Mstatus((self.mstatus.0 & !MSTATUS_WRITE_MASK) | (v & MSTATUS_WRITE_MASK));
                 // MPP cannot hold the reserved H mode.
                 if ms.mpp() == Mode::H {
                     ms.set_mpp(Mode::U);

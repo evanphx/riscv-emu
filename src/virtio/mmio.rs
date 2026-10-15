@@ -346,7 +346,8 @@ impl VirtioState {
         let elem = vq.used_phys + 4 + (used_idx as u32 % vq.num) as u64 * 8;
         self.guest.write_u32(elem, desc as u32)?;
         self.guest.write_u32(elem + 4, tx)?;
-        self.guest.write_u16(used_idx_addr, used_idx.wrapping_add(1))
+        self.guest
+            .write_u16(used_idx_addr, used_idx.wrapping_add(1))
     }
 
     /// Selected shared memory region.
@@ -459,8 +460,7 @@ impl VirtioDevice {
         crate::log_debug!(st.log, "ProcessQueue({})", idx);
         let q = idx as usize;
         if q >= st.queues.len() {
-            st.log
-                .error(format_args!("invalid queue index {}", idx));
+            st.log.error(format_args!("invalid queue index {}", idx));
             return;
         }
         let mut processed = false;

@@ -560,10 +560,7 @@ pub fn decode(raw: u32) -> Result<Instr, String> {
                             0x105 => Op::Wfi,
                             0x302 => Op::Mret,
                             _ => {
-                                return Err(format!(
-                                    "invalid SYSTEM trap/return: raw={:08x}",
-                                    raw
-                                ))
+                                return Err(format!("invalid SYSTEM trap/return: raw={:08x}", raw))
                             }
                         };
                     }

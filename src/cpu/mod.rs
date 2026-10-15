@@ -818,12 +818,8 @@ impl Cpu {
 
             Beq => return Ok(self.branch(self.rs1(&i) == self.rs2(&i), i.imm)),
             Bne => return Ok(self.branch(self.rs1(&i) != self.rs2(&i), i.imm)),
-            Blt => {
-                return Ok(self.branch((self.rs1(&i) as i64) < (self.rs2(&i) as i64), i.imm))
-            }
-            Bge => {
-                return Ok(self.branch((self.rs1(&i) as i64) >= (self.rs2(&i) as i64), i.imm))
-            }
+            Blt => return Ok(self.branch((self.rs1(&i) as i64) < (self.rs2(&i) as i64), i.imm)),
+            Bge => return Ok(self.branch((self.rs1(&i) as i64) >= (self.rs2(&i) as i64), i.imm)),
             Bltu => return Ok(self.branch(self.rs1(&i) < self.rs2(&i), i.imm)),
             Bgeu => return Ok(self.branch(self.rs1(&i) >= self.rs2(&i), i.imm)),
 
@@ -969,8 +965,8 @@ impl Cpu {
             Csrrw | Csrrs | Csrrc | Csrrwi | Csrrsi | Csrrci => self.exec_csr(i, raw)?,
 
             LrW | ScW | AmoaddW | AmoswapW | AmoxorW | AmoandW | AmoorW | AmominW | AmomaxW
-            | AmominuW | AmomaxuW | LrD | ScD | AmoaddD | AmoswapD | AmoxorD | AmoandD
-            | AmoorD | AmominD | AmomaxD | AmominuD | AmomaxuD => self.exec_amo(i)?,
+            | AmominuW | AmomaxuW | LrD | ScD | AmoaddD | AmoswapD | AmoxorD | AmoandD | AmoorD
+            | AmominD | AmomaxD | AmominuD | AmomaxuD => self.exec_amo(i)?,
 
             Flw | Fld | Fsw | Fsd | FaddS | FaddD | FsubS | FsubD | FmulS | FmulD | FdivS
             | FdivD | FsqrtS | FsqrtD | FmaddS | FmaddD | FmsubS | FmsubD | FnmsubS | FnmsubD
@@ -1032,15 +1028,9 @@ impl Cpu {
             Ctzw => self.set_x(rd, (self.rs1(&i) as u32).trailing_zeros() as u64),
             Cpop => self.set_x(rd, self.rs1(&i).count_ones() as u64),
             Cpopw => self.set_x(rd, (self.rs1(&i) as u32).count_ones() as u64),
-            Max => self.set_x(
-                rd,
-                (self.rs1(&i) as i64).max(self.rs2(&i) as i64) as u64,
-            ),
+            Max => self.set_x(rd, (self.rs1(&i) as i64).max(self.rs2(&i) as i64) as u64),
             Maxu => self.set_x(rd, self.rs1(&i).max(self.rs2(&i))),
-            Min => self.set_x(
-                rd,
-                (self.rs1(&i) as i64).min(self.rs2(&i) as i64) as u64,
-            ),
+            Min => self.set_x(rd, (self.rs1(&i) as i64).min(self.rs2(&i) as i64) as u64),
             Minu => self.set_x(rd, self.rs1(&i).min(self.rs2(&i))),
             SextB => self.set_x(rd, self.rs1(&i) as i8 as i64 as u64),
             SextH => self.set_x(rd, self.rs1(&i) as i16 as i64 as u64),
@@ -1054,8 +1044,7 @@ impl Cpu {
             ),
             Rorw => self.set_x(
                 rd,
-                (self.rs1(&i) as u32).rotate_right((self.rs2(&i) & 31) as u32) as i32 as i64
-                    as u64,
+                (self.rs1(&i) as u32).rotate_right((self.rs2(&i) & 31) as u32) as i32 as i64 as u64,
             ),
             Roriw => self.set_x(
                 rd,
@@ -1185,8 +1174,16 @@ impl Cpu {
         let rs2 = self.rs2(&i);
         let word = matches!(
             i.op,
-            LrW | ScW | AmoaddW | AmoswapW | AmoxorW | AmoandW | AmoorW | AmominW | AmomaxW
-                | AmominuW | AmomaxuW
+            LrW | ScW
+                | AmoaddW
+                | AmoswapW
+                | AmoxorW
+                | AmoandW
+                | AmoorW
+                | AmominW
+                | AmomaxW
+                | AmominuW
+                | AmomaxuW
         );
         let align = if word { 3 } else { 7 };
         if addr & align != 0 {
@@ -1344,7 +1341,11 @@ impl Cpu {
         );
         let mut line = Vec::new();
         for r in 3..32 {
-            line.push(format!("{:>3}: {:016x}", isa::reg_name(r), self.x[r as usize]));
+            line.push(format!(
+                "{:>3}: {:016x}",
+                isa::reg_name(r),
+                self.x[r as usize]
+            ));
             if line.len() == 3 {
                 let _ = write!(s, "{}\r\n", line.join(" "));
                 line.clear();

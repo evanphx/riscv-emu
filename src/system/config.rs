@@ -292,7 +292,8 @@ mod tests {
             append: "root=/dev/vda".into(),
             ..Default::default()
         };
-        args.devices.push(parse_device("virtio-blk-device,drive=hd1").unwrap());
+        args.devices
+            .push(parse_device("virtio-blk-device,drive=hd1").unwrap());
         cfg.merge(args);
         assert_eq!(cfg.append, "root=/dev/vda");
         assert_eq!(cfg.kernel, "linux/Image");

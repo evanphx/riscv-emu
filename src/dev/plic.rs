@@ -172,7 +172,11 @@ impl Mmio for Plic {
 
     fn load(&mut self, _now: u64, paddr: u64, size: u64) -> Result<u64, Exception> {
         if size != 4 {
-            return Err(Exception::fatal(format!("PLIC: Load{}(0x{:x})", size * 8, paddr)));
+            return Err(Exception::fatal(format!(
+                "PLIC: Load{}(0x{:x})",
+                size * 8,
+                paddr
+            )));
         }
         let mut s = self.state.lock().unwrap();
         let offset = paddr - self.start;

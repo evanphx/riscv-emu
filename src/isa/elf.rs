@@ -455,12 +455,7 @@ pub fn decode_elf(path: &str) -> Result<String, String> {
     let _ = writeln!(out, "{:016x} <_start>:", f.entry);
 
     let data = f.section_data(text);
-    let _ = writeln!(
-        out,
-        ".text at 0x{:x}, size {} bytes",
-        text.addr,
-        data.len()
-    );
+    let _ = writeln!(out, ".text at 0x{:x}, size {} bytes", text.addr, data.len());
     disassemble(text.addr, data, &mut out)?;
     Ok(out)
 }

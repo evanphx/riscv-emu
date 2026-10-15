@@ -18,7 +18,12 @@ pub struct Rng {
 
 impl Rng {
     /// Creates a new RNG device and returns its bus segment.
-    pub fn create(start: u64, plic: Plic, irq: u32, mem: Arc<Memory>) -> Result<VirtioMmio, String> {
+    pub fn create(
+        start: u64,
+        plic: Plic,
+        irq: u32,
+        mem: Arc<Memory>,
+    ) -> Result<VirtioMmio, String> {
         plic.register_irq(irq, "rng");
         let state = VirtioState::new(
             "virtio-rng",

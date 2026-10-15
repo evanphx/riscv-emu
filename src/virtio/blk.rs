@@ -305,7 +305,7 @@ impl Handler for Blk {
         match offset {
             0x100 => Some(self.size_sectors & 0xffff_ffff),
             0x104 => Some(self.size_sectors >> 32),
-            0x108 => Some(4096),                         // size_max
+            0x108 => Some(4096),                       // size_max
             0x10c => Some((QUEUE_NUM_MAX - 2) as u64), // seg_max
             _ => None,
         }
