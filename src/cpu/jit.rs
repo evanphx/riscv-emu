@@ -361,6 +361,10 @@ impl Jit {
     /// are compiled on a separate thread while the interpreter
     /// continues; otherwise they are compiled immediately.
     pub fn new(hot_threshold: u16, background: bool) -> Result<Jit, String> {
+        // The code arena relies on coherent instruction caches.
+        if !cfg!(target_arch = "x86_64") {
+            return Err("the JIT supports x86-64 hosts only".to_string());
+        }
         let (compiler, worker) = if background {
             (None, Some(Worker::start()?))
         } else {

@@ -49,7 +49,7 @@ directory:
 $ git clone https://github.com/markkurossi/riscv
 $ cd riscv/cmd/goemu
 $ /path/to/rsemu -jit /path/to/riscv-rs/configs/buildroot.goemu
-OpenSBI v1.8.1
+OpenSBI v1.8.1-126-ga8be5e94
 ...
 Welcome to GoEMU RISC-V Linux
 
@@ -58,9 +58,9 @@ goemu login: root
 Linux goemu 7.0.11 #9 SMP PREEMPT Wed Jun  3 08:23:43 UTC 2026 riscv64 GNU/Linux
 # poweroff
 ...
-[   23.229217] reboot: Power down
-CPU: instret: 1506748185, runtime: 39.9s, MIPS: 37.72
-JIT: 3461 blocks (81976 instructions) compiled in 3.1s, ...
+[   27.320208] reboot: Power down
+CPU: instret: 1502759037, runtime: 18.642273947s, MIPS: 80.61
+JIT: 2199 blocks (57826 instructions) compiled in 2.205362368s, 125726884 block runs, 1349007312 instructions executed, 0 invalidated
 virtio-rng: read    : 576 B
 virtio-blk: read    : 3 MB
 virtio-blk: wrote   : 0 B
@@ -102,6 +102,34 @@ Main flags:
 
 Additional arguments that are not `.goemu` files are attached as
 VirtIO block devices.
+
+## Networking
+
+A `virtio-net-device` connects the guest to a host TUN interface. The
+emulator answers the guest's ARP and DHCP requests itself and forwards
+the other traffic to the TUN interface, whose address is the
+netdev's gateway. Creating the interface needs root:
+
+```shell
+$ sudo rsemu -netdev id=eth0,ip=192.168.42.4,gw=192.168.42.254 \
+             -device virtio-net-device,netdev=eth0 buildroot.goemu
+# udhcpc -i eth0
+# ping 192.168.42.254
+```
+
+To reach other networks, enable IP forwarding and NAT for the guest
+subnet on the host.
+
+## Graphics
+
+`-gpu` (or a `gpus` entry and a `virtio-gpu-device` in the
+configuration) adds a VirtIO GPU with a keyboard and a pointer device
+and opens a window (winit + softbuffer, the default `gui` cargo
+feature). The guest kernel needs the virtio-gpu DRM driver and
+`console=tty0` for a framebuffer console; the buildroot kernel image in
+the upstream repository is built without it. Click the window to grab
+the mouse and press Alt+Esc to release it. Without a display, the GPU
+still works and the emulator logs `virtio-gpu: no display`.
 
 ## Linux userspace emulation
 
@@ -148,7 +176,10 @@ thread while the interpreter keeps running:
   current guest code before they run again.
 
 The machine code is generated with `cranelift-codegen` and copied into
-the emulator's own executable code arena.
+the emulator's own executable code arena. The JIT supports x86-64
+hosts. `-jit-sync` compiles blocks before running them instead of in
+the background, which makes runs deterministic and is useful for
+debugging.
 
 ### Performance
 
