@@ -205,7 +205,9 @@ optimization passes, which do not speed up this code but slow down
 compiling) and copied into the emulator's own executable code arena. The JIT supports x86-64
 hosts. `-jit-sync` compiles blocks before running them instead of in
 the background, which makes runs deterministic and is useful for
-debugging.
+debugging. With the environment variable `RSEMU_PERF_MAP` set, the JIT
+writes `/tmp/perf-PID.map`, so that `perf report` shows compiled code
+by guest PC (`rv:ffffffff8012dccc`) instead of as anonymous memory.
 
 ### Saving compiled code
 
@@ -245,12 +247,12 @@ shell loop, and sort benchmarks run inside the booted buildroot guest.
 
 | Workload | Go original | Rust interpreter | Rust JIT | JIT, warm `-jit-cache` |
 |----------|------------:|-----------------:|---------:|-----------------------:|
-| Linux boot to login prompt | 9.6 s | 9.7 s | 3.2 s | 2.5–2.9 s |
+| Linux boot to login prompt | 9.6 s | 9.7 s | 2.6 s | 2.0 s |
 | `fibo(35)` (userspace mode) | 3.48 s | 4.24 s | 0.49 s | |
 | `fibo(40)` (userspace mode) | 34.4 s | 38.5 s | 6.0 s | |
-| md5sum of 8 MB in the guest | – | 1.78 s | 0.51 s | 0.51 s |
-| shell loop, 20000 iterations | – | 4.40 s | 0.86 s | 0.76 s |
-| `seq 1 30000 \| sort -r` | – | 2.05 s | 0.51 s | 0.37 s |
+| md5sum of 8 MB in the guest | – | 1.78 s | 0.40 s | 0.38 s |
+| shell loop, 20000 iterations | – | 4.40 s | 0.53 s | 0.46 s |
+| `seq 1 30000 \| sort -r` | – | 2.05 s | 0.36 s | 0.30 s |
 
 The JIT times are medians of three runs; the machine is shared, so
 individual runs vary by about 10%.

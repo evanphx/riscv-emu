@@ -271,6 +271,8 @@ pub struct Jit {
     /// Counter for polling the background compiler.
     poll: u32,
     arena: CodeArena,
+    /// Linux perf map of the blocks, enabled with RSEMU_PERF_MAP.
+    perf_map: Option<std::fs::File>,
     /// Trampoline arena and entry.
     _enter_arena: CodeArena,
     enter: EnterFn,
@@ -697,6 +699,18 @@ unsafe extern "C" fn jit_store(cpu: *mut Cpu, addr: u64, size: u64, v: u64) {
     }
 }
 
+/// Opens the perf map file /tmp/perf-PID.map that names the compiled
+/// code for Linux perf, if the environment variable RSEMU_PERF_MAP is
+/// set. Blocks are named by their guest PC.
+fn open_perf_map(glue: &CodeArena) -> Option<std::fs::File> {
+    use std::io::Write;
+    std::env::var_os("RSEMU_PERF_MAP")?;
+    let path = format!("/tmp/perf-{}.map", std::process::id());
+    let mut f = std::fs::File::create(path).ok()?;
+    let _ = writeln!(f, "{:x} {:x} jit-glue", glue.ptr as usize, glue.pos);
+    Some(f)
+}
+
 /// A decoded instruction of the block.
 struct BlockInstr {
     pc: u64,
@@ -724,6 +738,7 @@ impl Jit {
         let mut enter_arena = CodeArena::new(PAGE_SIZE as usize)?;
         let enter = compile_enter(&mut enter_arena)?;
         let stubs = compile_stubs(&mut enter_arena)?;
+        let perf_map = open_perf_map(&enter_arena);
         Ok(Jit {
             compiler,
             worker,
@@ -735,6 +750,7 @@ impl Jit {
             pending: HashSet::default(),
             poll: 0,
             arena: CodeArena::new(CODE_ARENA_SIZE)?,
+            perf_map,
             cache: vec![CacheEntry::default(); CACHE_SIZE].into_boxed_slice(),
             blocks: Vec::new(),
             index: HashMap::default(),
@@ -974,6 +990,10 @@ impl Jit {
         block.func = func;
         block.size = machine_code.len() as u32;
         let (vpc, start) = (block.vpc, block.start);
+        if let Some(f) = self.perf_map.as_mut() {
+            use std::io::Write;
+            let _ = writeln!(f, "{:x} {:x} rv:{vpc:x}", entry as usize, block.size);
+        }
         let idx = self.blocks.len() as u32;
         self.blocks.push(block);
         self.index.insert((vpc, start), idx);
@@ -2854,11 +2874,14 @@ impl Jit {
     /// Waits for the background compiler to finish the pending
     /// blocks.
     fn drain_pending(&mut self, code_pages: &mut CodePages, syms: &Syms) -> Result<(), String> {
+        // Do not delay the exit much for a long queue.
+        let deadline = Instant::now() + Duration::from_secs(2);
         while !self.pending.is_empty() {
             let Some(worker) = self.worker.as_ref() else {
                 break;
             };
-            let Ok(r) = worker.rx.recv_timeout(Duration::from_secs(5)) else {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let Ok(r) = worker.rx.recv_timeout(left) else {
                 break;
             };
             let r = r?;
