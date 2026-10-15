@@ -108,7 +108,11 @@ pub fn configure_jit(cpu: &mut Cpu, params: &crate::Params) -> Result<(), String
         } else {
             params.jit_threshold
         };
-        cpu.enable_jit(threshold, !params.jit_sync)
+        cpu.enable_jit(threshold, !params.jit_sync)?;
+        if !params.jit_cache.is_empty() {
+            cpu.set_jit_cache(&params.jit_cache);
+        }
+        Ok(())
     }
     #[cfg(not(feature = "jit"))]
     {
@@ -339,7 +343,14 @@ impl Cpu {
     pub fn jit_summary(&self) -> Option<String> {
         #[cfg(feature = "jit")]
         {
-            self.jit_stats().map(|s| s.to_string())
+            self.jit_stats().map(|s| {
+                let mut out = s.to_string();
+                for n in self.jit_cache_notes() {
+                    out.push('\n');
+                    out.push_str(&n);
+                }
+                out
+            })
         }
         #[cfg(not(feature = "jit"))]
         {
@@ -372,6 +383,8 @@ impl Cpu {
 
     /// Runs the CPU until shutdown.
     pub fn run(&mut self) -> Result<(), String> {
+        #[cfg(feature = "jit")]
+        self.jit_cache_load();
         let start = Instant::now();
         self.start_time = Some(start);
 
@@ -393,6 +406,8 @@ impl Cpu {
             }
         };
         self.runtime = start.elapsed();
+        #[cfg(feature = "jit")]
+        self.jit_cache_save();
 
         // Halt all memory-mapped devices.
         if let Some(bus) = self.bus.as_mut() {

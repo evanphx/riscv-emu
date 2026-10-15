@@ -93,6 +93,7 @@ Main flags:
 | `-jit` | enable the JIT compiler |
 | `-jit-threshold n` | executions before a block is compiled (default 3000) |
 | `-jit-sync` | compile blocks synchronously, for deterministic runs |
+| `-jit-cache file` | load and save JIT compiled code in `file` (implies `-jit`) |
 | `-cooked` | don't put the terminal into raw mode |
 | `-htif` | enable the HTIF tohost/fromhost device for ELF kernels |
 | `-symbols file` | kernel System.map for traces |
@@ -161,6 +162,12 @@ thread while the interpreter keeps running:
 - Traces are keyed by the virtual PC and the physical location of the
   code. Guest registers are held in SSA values and written through to
   the CPU state.
+- The generated code computes guest PC values relative to the trace
+  start, so it depends only on the code bytes and their page offset.
+  When the same code shows up at another address (a shared library
+  mapped at a different address in each process because of the guest's
+  ASLR, or code loaded into another physical page), the existing
+  machine code is reused instead of being compiled again.
 - Loads and stores inline the TLB lookup and access guest RAM directly
   on a hit; misses, MMIO, and faults call back into the CPU, so the
   memory model and exceptions are identical to the interpreter.
@@ -180,6 +187,37 @@ the emulator's own executable code arena. The JIT supports x86-64
 hosts. `-jit-sync` compiles blocks before running them instead of in
 the background, which makes runs deterministic and is useful for
 debugging.
+
+### Saving compiled code
+
+`-jit-cache file` saves the compiled code when the emulator exits and
+loads it at the next start, so the kernel and the programs of the
+previous runs run as native code from their first instruction instead
+of being interpreted until they become hot:
+
+```
+$ rsemu -jit-cache linux.jit configs/buildroot.goemu   # first run compiles and saves
+$ rsemu -jit-cache linux.jit configs/buildroot.goemu   # later runs load the code
+```
+
+To precompile everything that a run executes, not just the hot code,
+make one training run with `-jit-sync -jit-threshold 2`; later runs can
+use the default settings.
+
+- The code refers to host addresses (guest RAM, the TLB, helper
+  functions) through relocations, which are patched when the code is
+  loaded.
+- Loaded code is checked against the guest code before it first runs,
+  just like code from an older `fence.i` epoch, so a cache from another
+  kernel or disk image is safe to use; blocks that do not match are
+  compiled again.
+- The cache is tied to the emulator binary and the host CPU features.
+  A cache from another build is ignored and replaced at exit. A file
+  that is not a code cache is never overwritten.
+- The file keeps the code that ran in the last runs; code that has not
+  been used in 4 runs is dropped.
+- The cache is written when the CPU stops (guest poweroff or program
+  exit).
 
 ### Performance
 

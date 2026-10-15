@@ -7,7 +7,7 @@ use riscv::dev::Htif;
 use riscv::isa::{self, elf, Mode};
 use riscv::memory::{Memory, RAM_BASE};
 use std::path::Path;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// Tests that are not run: hypervisor tests, and extensions that are
@@ -39,12 +39,26 @@ const SKIP: &[&str] = &[
     "rv64uzfh-p-recoding",
 ];
 
+/// Number of JIT code cache blocks that ran.
+static CACHE_HITS: AtomicU64 = AtomicU64::new(0);
+
 /// Maximum number of instructions a test may execute.
 const MAX_INSTRUCTIONS: u64 = 50_000_000;
 
+/// How tests are executed.
+#[derive(Clone, Copy)]
+enum Exec<'a> {
+    Interp,
+    /// JIT compile every block on first use.
+    Jit,
+    /// JIT with the code cache file.
+    #[allow(dead_code)]
+    JitCache(&'a Path),
+}
+
 /// Runs the test ELF file. Returns Ok(None) on success, and
 /// Ok(Some(n)) if test case n failed.
-fn run_test(file: &Path, jit: bool) -> Result<Option<u64>, String> {
+fn run_test(file: &Path, exec: Exec) -> Result<Option<u64>, String> {
     let mem = Arc::new(Memory::new(RAM_BASE, 0x200_0000));
     let mut cpu = Cpu::new(mem.clone());
     cpu.set_mode(Mode::M);
@@ -86,10 +100,14 @@ fn run_test(file: &Path, jit: bool) -> Result<Option<u64>, String> {
     cpu.overlay = Some(Box::new(htif));
     cpu.pc = f.entry;
 
-    if jit {
-        enable_jit(&mut cpu)?;
+    if let Exec::Jit | Exec::JitCache(_) = exec {
+        enable_jit(&mut cpu, exec)?;
         cpu.instret_limit = MAX_INSTRUCTIONS;
         cpu.run()?;
+        #[cfg(feature = "jit")]
+        if let Some(stats) = cpu.jit_stats() {
+            CACHE_HITS.fetch_add(stats.cache_hits, Ordering::Relaxed);
+        }
     } else {
         while !cpu.signals.is_shutdown() {
             if cpu.instret > MAX_INSTRUCTIONS {
@@ -108,16 +126,20 @@ fn run_test(file: &Path, jit: bool) -> Result<Option<u64>, String> {
 
 /// Enables the JIT so that every block is compiled on first use.
 #[cfg(feature = "jit")]
-fn enable_jit(cpu: &mut Cpu) -> Result<(), String> {
-    cpu.enable_jit(1, false)
-}
-
-#[cfg(not(feature = "jit"))]
-fn enable_jit(_cpu: &mut Cpu) -> Result<(), String> {
+fn enable_jit(cpu: &mut Cpu, exec: Exec) -> Result<(), String> {
+    cpu.enable_jit(1, false)?;
+    if let Exec::JitCache(path) = exec {
+        cpu.set_jit_cache(path);
+    }
     Ok(())
 }
 
-fn test_suite(dir: &str, jit: bool) -> (usize, Vec<String>) {
+#[cfg(not(feature = "jit"))]
+fn enable_jit(_cpu: &mut Cpu, _exec: Exec) -> Result<(), String> {
+    Ok(())
+}
+
+fn test_suite(dir: &str, exec: Exec, filter: impl Fn(&str) -> bool) -> (usize, Vec<String>) {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(dir);
     let mut entries: Vec<_> = std::fs::read_dir(&dir)
         .unwrap_or_else(|e| panic!("read_dir {:?}: {}", dir, e))
@@ -129,14 +151,18 @@ fn test_suite(dir: &str, jit: bool) -> (usize, Vec<String>) {
     let mut failures = Vec::new();
     for path in entries {
         let name = path.file_name().unwrap().to_str().unwrap().to_string();
-        if name.ends_with(".dump") || path.is_dir() || SKIP.contains(&name.as_str()) {
+        if name.ends_with(".dump")
+            || path.is_dir()
+            || SKIP.contains(&name.as_str())
+            || !filter(&name)
+        {
             continue;
         }
         count += 1;
         if std::env::var("RSEMU_TEST_VERBOSE").is_ok() {
             eprintln!("{}", name);
         }
-        match run_test(&path, jit) {
+        match run_test(&path, exec) {
             Ok(None) => {}
             Ok(Some(n)) => failures.push(format!("{}: assertion {}", name, n)),
             Err(e) => failures.push(format!("{}: {}", name, e)),
@@ -145,16 +171,20 @@ fn test_suite(dir: &str, jit: bool) -> (usize, Vec<String>) {
     (count, failures)
 }
 
-fn report(dir: &str, jit: bool) {
+fn report(dir: &str, exec: Exec, filter: impl Fn(&str) -> bool) {
     isa::init_decode_tables();
-    let (count, failures) = test_suite(dir, jit);
+    let (count, failures) = test_suite(dir, exec, filter);
     for f in &failures {
         eprintln!("FAIL {}", f);
     }
     eprintln!(
         "{}{}: {} tests, {} success, {} fail",
         dir,
-        if jit { " (JIT)" } else { "" },
+        match exec {
+            Exec::Interp => "",
+            Exec::Jit => " (JIT)",
+            Exec::JitCache(_) => " (JIT cache)",
+        },
         count,
         count - failures.len(),
         failures.len()
@@ -162,24 +192,47 @@ fn report(dir: &str, jit: bool) {
     assert!(failures.is_empty(), "{} tests failed", failures.len());
 }
 
+fn all(_: &str) -> bool {
+    true
+}
+
 #[test]
 fn isa_tests() {
-    report("testdata/isa", false);
+    report("testdata/isa", Exec::Interp, all);
 }
 
 #[test]
 fn vpu_tests() {
-    report("testdata/vpu", false);
+    report("testdata/vpu", Exec::Interp, all);
 }
 
 #[cfg(feature = "jit")]
 #[test]
 fn isa_tests_jit() {
-    report("testdata/isa", true);
+    report("testdata/isa", Exec::Jit, all);
 }
 
 #[cfg(feature = "jit")]
 #[test]
 fn vpu_tests_jit() {
-    report("testdata/vpu", true);
+    report("testdata/vpu", Exec::Jit, all);
+}
+
+/// Runs tests twice with a shared JIT code cache. All tests load their
+/// code at the same addresses, so the cached blocks of one test must
+/// be checked against the code of the others before they run.
+#[cfg(feature = "jit")]
+#[test]
+fn isa_tests_jit_cache() {
+    let dir = std::env::temp_dir().join(format!("rsemu-jit-cache-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("isa.jit");
+    let filter = |name: &str| name.starts_with("rv64ui-p-") || name.starts_with("rv64ud-p-");
+    report("testdata/isa", Exec::JitCache(&path), filter);
+    let hits = CACHE_HITS.swap(0, Ordering::Relaxed);
+    report("testdata/isa", Exec::JitCache(&path), filter);
+    let hits2 = CACHE_HITS.load(Ordering::Relaxed);
+    // In the second pass each test finds its own blocks in the cache.
+    assert!(hits2 > hits, "cache hits: {} then {}", hits, hits2);
+    std::fs::remove_dir_all(&dir).unwrap();
 }

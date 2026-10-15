@@ -21,6 +21,8 @@ pub struct Params {
     /// Compiles blocks synchronously instead of on a background
     /// thread, which makes runs deterministic.
     pub jit_sync: bool,
+    /// File for saving and loading JIT compiled code.
+    pub jit_cache: String,
 }
 
 impl Params {

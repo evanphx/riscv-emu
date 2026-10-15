@@ -158,6 +158,12 @@ const FLAGS: &[FlagSpec] = &[
         usage: "compile blocks synchronously (deterministic runs)",
     },
     FlagSpec {
+        name: "jit-cache",
+        boolean: false,
+        multi: false,
+        usage: "load and save JIT compiled code in `file` (implies -jit)",
+    },
+    FlagSpec {
         name: "drive",
         boolean: false,
         multi: true,
@@ -281,7 +287,8 @@ fn main() {
         color: flags.bool("color"),
         cooked: flags.bool("cooked"),
         fs_root: flags.string("fsroot"),
-        jit: flags.bool("jit"),
+        jit: flags.bool("jit") || !flags.string("jit-cache").is_empty(),
+        jit_cache: flags.string("jit-cache"),
         jit_sync: flags.bool("jit-sync"),
         jit_threshold: {
             let v = flags.string("jit-threshold");
