@@ -109,7 +109,7 @@ fn run_test(file: &Path, jit: bool) -> Result<Option<u64>, String> {
 /// Enables the JIT so that every block is compiled on first use.
 #[cfg(feature = "jit")]
 fn enable_jit(cpu: &mut Cpu) -> Result<(), String> {
-    cpu.enable_jit(1)
+    cpu.enable_jit(1, false)
 }
 
 #[cfg(not(feature = "jit"))]
@@ -133,6 +133,9 @@ fn test_suite(dir: &str, jit: bool) -> (usize, Vec<String>) {
             continue;
         }
         count += 1;
+        if std::env::var("RSEMU_TEST_VERBOSE").is_ok() {
+            eprintln!("{}", name);
+        }
         match run_test(&path, jit) {
             Ok(None) => {}
             Ok(Some(n)) => failures.push(format!("{}: assertion {}", name, n)),

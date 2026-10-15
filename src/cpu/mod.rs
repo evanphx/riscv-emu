@@ -96,6 +96,27 @@ impl HartSignals {
     }
 }
 
+/// Enables the JIT compiler for the CPU if the parameters request it.
+pub fn configure_jit(cpu: &mut Cpu, params: &crate::Params) -> Result<(), String> {
+    if !params.jit {
+        return Ok(());
+    }
+    #[cfg(feature = "jit")]
+    {
+        let threshold = if params.jit_threshold == 0 {
+            DEFAULT_HOT_THRESHOLD
+        } else {
+            params.jit_threshold
+        };
+        cpu.enable_jit(threshold, true)
+    }
+    #[cfg(not(feature = "jit"))]
+    {
+        let _ = cpu;
+        Err("JIT support not compiled in (enable the `jit` feature)".to_string())
+    }
+}
+
 /// Trap handler callback. The handler returns Ok(true) if it handled
 /// the trap, in which case execution continues from the current PC.
 pub type TrapHandler = Box<dyn FnMut(&mut Cpu, &Trap) -> Result<bool, String> + Send>;
@@ -106,7 +127,7 @@ struct DecodeEntry {
     instr: Instr,
 }
 
-const DECODE_CACHE_SIZE: usize = 4096;
+const DECODE_CACHE_SIZE: usize = 16384;
 
 /// The RISC-V hart.
 pub struct Cpu {
@@ -314,6 +335,18 @@ impl Cpu {
         self.signals.clear_interrupt(mask);
     }
 
+    /// Returns the JIT statistics if the JIT is enabled.
+    pub fn jit_summary(&self) -> Option<String> {
+        #[cfg(feature = "jit")]
+        {
+            self.jit_stats().map(|s| s.to_string())
+        }
+        #[cfg(not(feature = "jit"))]
+        {
+            None
+        }
+    }
+
     /// Raw CSR value without side effects.
     pub fn csr_raw(&self, csr: u16) -> u64 {
         if csr == isa::CSR_MIP {
@@ -355,7 +388,7 @@ impl Cpu {
                     }
                 }
                 Err(Exception::Fatal(msg)) => {
-                    break Err(format!("CPU: panic: {}", msg));
+                    break Err(format!("CPU: panic: {}", *msg));
                 }
             }
         };
@@ -372,12 +405,11 @@ impl Cpu {
     /// enabled one. Returns true if an interrupt was taken.
     #[inline(never)]
     fn check_interrupts(&mut self) -> bool {
-        let now = self.time;
-        if now >= self.csr[isa::CSR_STIMECMP as usize] {
-            self.signals.mip.fetch_or(isa::INT_STIP, Ordering::Relaxed);
+        let mut mip = self.signals.mip();
+        if self.time >= self.csr[isa::CSR_STIMECMP as usize] && mip & isa::INT_STIP == 0 {
+            mip = self.signals.mip.fetch_or(isa::INT_STIP, Ordering::Relaxed) | isa::INT_STIP;
         }
 
-        let mip = self.signals.mip();
         let pending = mip & self.csr[isa::CSR_MIE as usize];
         if pending == 0 {
             return false;
@@ -410,12 +442,17 @@ impl Cpu {
             self.load_code_page(pc)?;
         }
         let ofs = self.code_ofs + memory::page_offset(pc);
-        let lo = self.mem.read_u16(ofs) as u32;
+        let p = self.mem.ptr_at(ofs);
+        // SAFETY: code_ofs is the RAM offset of the code page, so
+        // reads within the page are inside RAM.
+        let lo = unsafe { (p as *const u16).read_unaligned() } as u32;
         if lo & 0b11 != 0b11 {
             return Ok(lo);
         }
         if memory::page_offset(pc) <= 0xffc {
-            return Ok(lo | (self.mem.read_u16(ofs + 2) as u32) << 16);
+            // SAFETY: the instruction is inside the page.
+            let hi = unsafe { (p.add(2) as *const u16).read_unaligned() } as u32;
+            return Ok(lo | hi << 16);
         }
         // 32-bit instruction crosses page boundary.
         let paddr = self.translate(pc + 2, crate::mmu::ACCESS_EXEC)?;
@@ -486,89 +523,121 @@ impl Cpu {
                 self.code_vpn = INVALID_PAGENUM;
                 self.raise(cause, tval)
             }
-            Err(Exception::Fatal(msg)) => Err(msg),
+            Err(Exception::Fatal(msg)) => Err(*msg),
         }
     }
 
     fn run_loop(&mut self) -> Result<(), Exception> {
         #[cfg(feature = "jit")]
-        let use_jit = self.jit.is_some() && !self.debug_trace;
-        #[cfg(feature = "jit")]
-        let mut block_start = true;
-
+        if self.jit.is_some() && !self.debug_trace {
+            return self.run_loop_jit();
+        }
         loop {
-            // Check interrupts every 64 ticks.
-            if self.time >= self.next_irq_check {
-                self.next_irq_check = (self.time | 0x3f) + 1;
-                if self.check_interrupts() {
-                    #[cfg(feature = "jit")]
-                    {
-                        block_start = true;
-                    }
-                    continue;
-                }
-                if self.signals.is_shutdown() {
+            if self.debug_trace {
+                if self.time >= self.next_irq_check && self.irq_point()? {
                     return Ok(());
                 }
-                if self.instret >= self.instret_limit {
-                    return Err(Exception::fatal("instruction limit reached"));
-                }
-            }
-
-            #[cfg(feature = "jit")]
-            if use_jit && block_start && self.try_jit()? {
+                self.interp_one::<true>()?;
                 continue;
             }
-
-            // Ensure monotonic clock.
-            self.time = self.time.wrapping_add(1);
-
-            let raw = self.fetch()?;
-            let instr = self.decode_cached(raw);
-            self.instret += 1;
-
-            if self.debug_trace {
-                self.trace_instr(raw, &instr);
-            }
-
-            let size = if raw & 0b11 == 0b11 { 4 } else { 2 };
-            match self.execute(instr, raw, size)? {
-                Flow::Next => {
-                    self.pc = self.pc.wrapping_add(size);
-                    #[cfg(feature = "jit")]
-                    {
-                        block_start = !jit::jitable(instr.op);
+            // The debug trace is enabled through a CSR; it is checked
+            // with the interrupts to keep it out of the instruction
+            // loop.
+            loop {
+                if self.time >= self.next_irq_check {
+                    if self.irq_point()? {
+                        return Ok(());
+                    }
+                    if self.debug_trace {
+                        break;
                     }
                 }
-                Flow::Jump => {
-                    #[cfg(feature = "jit")]
-                    {
-                        block_start = true;
-                    }
-                }
+                self.interp_one::<false>()?;
             }
         }
     }
 
+    /// The dispatch loop with the JIT: blocks start at control
+    /// transfers and after instructions the JIT does not compile.
+    #[cfg(feature = "jit")]
+    fn run_loop_jit(&mut self) -> Result<(), Exception> {
+        let mut block_start = true;
+        loop {
+            if self.time >= self.next_irq_check {
+                if self.irq_point()? || self.debug_trace {
+                    return Ok(());
+                }
+                block_start = true;
+            }
+            if block_start && self.try_jit()? {
+                continue;
+            }
+            block_start = match self.interp_one::<false>()? {
+                (Flow::Next, op) => !jit::jitable(op),
+                (Flow::Jump, _) => true,
+            };
+        }
+    }
+
+    /// Checks interrupts, shutdown, and the instruction limit. Called
+    /// every 64 ticks. Returns true if the CPU should stop.
+    #[inline(never)]
+    fn irq_point(&mut self) -> Result<bool, Exception> {
+        self.next_irq_check = (self.time | 0x3f) + 1;
+        if self.check_interrupts() {
+            return Ok(false);
+        }
+        if self.signals.is_shutdown() {
+            return Ok(true);
+        }
+        if self.instret >= self.instret_limit {
+            return Err(Exception::fatal("instruction limit reached"));
+        }
+        Ok(false)
+    }
+
+    /// Interprets one instruction, with the debug trace if TRACE is
+    /// set.
+    #[inline(always)]
+    fn interp_one<const TRACE: bool>(&mut self) -> Result<(Flow, Op), Exception> {
+        // Ensure monotonic clock.
+        self.time = self.time.wrapping_add(1);
+
+        let raw = self.fetch()?;
+        let instr = self.decode_cached(raw);
+        self.instret += 1;
+
+        if TRACE {
+            self.trace_instr(raw, &instr);
+        }
+
+        let size = if raw & 0b11 == 0b11 { 4 } else { 2 };
+        let flow = self.execute(instr, raw, size)?;
+        if let Flow::Next = flow {
+            self.pc = self.pc.wrapping_add(size);
+        }
+        Ok((flow, instr.op))
+    }
+
     #[inline(always)]
     fn set_x(&mut self, rd: u8, v: u64) {
-        self.x[rd as usize] = v;
+        self.x[(rd & 31) as usize] = v;
         self.x[0] = 0;
     }
 
     #[inline(always)]
     fn rs1(&self, i: &Instr) -> u64 {
-        self.x[i.rs1 as usize]
+        self.x[(i.rs1 & 31) as usize]
     }
 
     #[inline(always)]
     fn rs2(&self, i: &Instr) -> u64 {
-        self.x[i.rs2 as usize]
+        self.x[(i.rs2 & 31) as usize]
     }
 
     #[inline(always)]
     fn addr(&self, i: &Instr) -> u64 {
-        self.x[i.rs1 as usize].wrapping_add(i.imm as i64 as u64)
+        self.x[(i.rs1 & 31) as usize].wrapping_add(i.imm as i64 as u64)
     }
 
     fn illegal(&self, raw: u32) -> Exception {

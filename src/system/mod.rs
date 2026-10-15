@@ -111,9 +111,7 @@ pub fn system_emulation(
     let mut cpu = Cpu::new(mem.clone());
     cpu.trace = params.cpu_trace;
     cpu.color = params.color;
-    if params.jit {
-        enable_jit(&mut cpu)?;
-    }
+    crate::cpu::configure_jit(&mut cpu, params)?;
     let signals = cpu.signals.clone();
 
     let plic = Plic::new(vec![signals.clone()], PLIC_BASE);
@@ -325,7 +323,7 @@ pub fn system_emulation(
             .name("cpu".to_string())
             .spawn(move || {
                 let r = cpu.run();
-                (r, cpu.instret, cpu.runtime, jit_stats(&cpu))
+                (r, cpu.instret, cpu.runtime, cpu.jit_summary())
             })
             .map_err(|e| e.to_string())?;
         g.event_loop(signals.clone());
@@ -335,7 +333,7 @@ pub fn system_emulation(
         (instret, runtime, stats)
     } else {
         cpu.run()?;
-        (cpu.instret, cpu.runtime, jit_stats(&cpu))
+        (cpu.instret, cpu.runtime, cpu.jit_summary())
     };
 
     let secs = runtime.as_secs_f64();
@@ -362,26 +360,6 @@ pub fn system_emulation(
         }
     }
     Ok(())
-}
-
-#[cfg(feature = "jit")]
-fn enable_jit(cpu: &mut Cpu) -> Result<(), String> {
-    cpu.enable_jit(crate::cpu::DEFAULT_HOT_THRESHOLD)
-}
-
-#[cfg(not(feature = "jit"))]
-fn enable_jit(_cpu: &mut Cpu) -> Result<(), String> {
-    Err("JIT support not compiled in (enable the `jit` feature)".to_string())
-}
-
-#[cfg(feature = "jit")]
-fn jit_stats(cpu: &Cpu) -> Option<String> {
-    cpu.jit_stats().map(|s| s.to_string())
-}
-
-#[cfg(not(feature = "jit"))]
-fn jit_stats(_cpu: &Cpu) -> Option<String> {
-    None
 }
 
 fn load_ram(mem: &Memory, paddr: u64, data: &[u8]) -> Result<(), String> {

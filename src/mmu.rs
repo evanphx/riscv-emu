@@ -160,31 +160,44 @@ impl fmt::Display for Pte {
 /// Number of TLB entries.
 pub const TLB_SIZE: usize = 4096;
 
-/// A Translation Lookaside Buffer entry. The layout is fixed for the
-/// JIT, which inlines TLB lookups.
+/// A Translation Lookaside Buffer entry. Entries are per 4 KiB virtual
+/// page, also for superpages. The layout is fixed for the JIT, which
+/// inlines TLB lookups.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(C)]
+#[repr(C, align(32))]
 pub struct TlbEntry {
-    /// Virtual page number. `u64::MAX` marks an invalid entry.
-    pub vpn: u64,
-    /// Physical base address of the (super)page.
+    /// Lookup tag: the virtual page number << 4 | privilege key, where
+    /// the key is mode | SUM << 2 | MXR << 3. `u64::MAX` marks an
+    /// invalid entry.
+    pub tag: u64,
+    /// Physical address of the 4 KiB page.
     pub page: u64,
-    /// Offset mask of the (super)page.
-    pub offset_mask: u64,
+    /// Host address of the page minus the virtual page address, for
+    /// pages in RAM.
+    pub host_delta: u64,
     /// Effective PTE flags.
     pub flags: u8,
-    /// Privilege key: mode | SUM << 2 | MXR << 3.
-    pub key: u8,
+    /// The flags for direct host memory access: equal to flags for
+    /// pages in RAM, zero otherwise.
+    pub host_flags: u8,
+}
+
+impl TlbEntry {
+    /// Returns the lookup tag of the virtual page number and key.
+    #[inline(always)]
+    pub fn tag(vpn: u64, key: u8) -> u64 {
+        vpn << 4 | key as u64
+    }
 }
 
 impl Default for TlbEntry {
     fn default() -> Self {
         TlbEntry {
-            vpn: u64::MAX,
+            tag: u64::MAX,
             page: 0,
-            offset_mask: 0,
+            host_delta: 0,
             flags: 0,
-            key: 0,
+            host_flags: 0,
         }
     }
 }

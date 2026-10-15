@@ -143,8 +143,9 @@ impl fmt::Display for Trap {
 pub enum Exception {
     /// An architectural exception with cause and trap value.
     Trap { cause: u64, tval: u64 },
-    /// A fatal emulator error which terminates the CPU.
-    Fatal(String),
+    /// A fatal emulator error which terminates the CPU. The message is
+    /// boxed to keep the exception small on the hot paths.
+    Fatal(Box<String>),
 }
 
 impl Exception {
@@ -154,7 +155,7 @@ impl Exception {
     }
 
     pub fn fatal<S: Into<String>>(msg: S) -> Exception {
-        Exception::Fatal(msg.into())
+        Exception::Fatal(Box::new(msg.into()))
     }
 }
 

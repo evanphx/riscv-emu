@@ -15,6 +15,9 @@ pub struct Params {
     pub fs_root: String,
     /// Enables the JIT compiler.
     pub jit: bool,
+    /// Number of executions before a block is compiled; 0 selects the
+    /// default.
+    pub jit_threshold: u16,
 }
 
 impl Params {

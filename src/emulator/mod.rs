@@ -90,6 +90,7 @@ impl Emulator {
 
         let mut cpu = Cpu::new(mem.clone());
         cpu.trace = params.cpu_trace;
+        crate::cpu::configure_jit(&mut cpu, &params)?;
         cpu.set_mode(Mode::U);
         cpu.set_satp(satp);
         cpu.x[reg::SP as usize] = stack_top;

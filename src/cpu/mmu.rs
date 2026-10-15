@@ -22,7 +22,7 @@ impl Cpu {
     /// Flushes the TLB.
     pub fn flush_tlb(&mut self) {
         for e in self.tlb.iter_mut() {
-            e.vpn = u64::MAX;
+            e.tag = u64::MAX;
         }
     }
 
@@ -54,14 +54,14 @@ impl Cpu {
         }
         let vpn = vaddr >> 12;
         let tlb = &self.tlb[(vpn & 0xfff) as usize];
-        if tlb.vpn == vpn && tlb.key == key {
+        if tlb.tag == TlbEntry::tag(vpn, key) {
             let need = if access & ACCESS_WRITE != 0 {
                 access | PTE_D
             } else {
                 access
             };
             if tlb.flags & need == need {
-                return Ok(tlb.page | (vaddr & tlb.offset_mask));
+                return Ok(tlb.page | (vaddr & 0xfff));
             }
         }
         self.translate_slow(vaddr, access, mode, key)
@@ -81,14 +81,23 @@ impl Cpu {
             1 => (1 << 21) - 1,
             _ => (1 << 12) - 1,
         };
+        let paddr = page | (vaddr & offset_mask);
+        let page4k = paddr & !0xfff;
         let vpn = vaddr >> 12;
-        let tlb = &mut self.tlb[(vpn & 0xfff) as usize];
-        tlb.vpn = vpn;
-        tlb.page = page;
-        tlb.offset_mask = offset_mask;
-        tlb.flags = flags;
-        tlb.key = key;
-        Ok(page | (vaddr & offset_mask))
+        let (host_delta, host_flags) = if self.mem.contains_range(page4k, 0x1000) {
+            let host = self.mem.ptr_at(self.mem.offset(page4k)) as u64;
+            (host.wrapping_sub(vaddr & !0xfff), flags)
+        } else {
+            (0, 0)
+        };
+        self.tlb[(vpn & 0xfff) as usize] = TlbEntry {
+            tag: TlbEntry::tag(vpn, key),
+            page: page4k,
+            host_delta,
+            flags,
+            host_flags,
+        };
+        Ok(paddr)
     }
 
     fn page_fault(access: u8, vaddr: u64) -> Exception {
