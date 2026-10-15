@@ -193,8 +193,15 @@ pub fn system_emulation(
                 let gpudev = cfg
                     .gpu(&d.gpu)
                     .ok_or_else(|| format!("unknown GPU: {}", d.gpu))?;
-                let (vio, handle) =
-                    virtio::Gpu::create(virtio_ram, plic.clone(), virtio_irq, mem.clone(), gpudev)?;
+                let pointer = gpudev.pointer_type()?.into();
+                let (vio, handle) = virtio::Gpu::create(
+                    virtio_ram,
+                    plic.clone(),
+                    virtio_irq,
+                    mem.clone(),
+                    gpudev,
+                    pointer,
+                )?;
                 shm_base = vio.assign_shm(shm_base);
                 for shm in vio.shm_segments() {
                     println!("GPU.SHM: [{:x}-{:x}[", shm.start, shm.end);

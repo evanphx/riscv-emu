@@ -6,6 +6,8 @@ mod input;
 mod mmio;
 mod net;
 mod rng;
+#[cfg(feature = "gui")]
+mod window;
 
 pub use blk::*;
 pub use gpu::*;
