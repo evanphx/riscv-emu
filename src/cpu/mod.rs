@@ -188,8 +188,15 @@ pub struct Cpu {
     /// generation, MXR, SUM, and the privilege mode.
     data_key: u16,
     fetch_key: u16,
-    /// data_key as a 64-bit value for compiled code.
-    jit_data_key: u64,
+    /// Host address of the JIT TLB bank of the data mode.
+    jit_tlb_base: u64,
+    /// Index of the first entry of the JIT TLB bank of the data mode.
+    jbank: usize,
+    /// MXR of the JIT TLB entries.
+    jtlb_mxr: bool,
+    /// JIT TLB entries filled since the last flush, unless jlog_full.
+    jlog: Vec<u32>,
+    jlog_full: bool,
     /// TLB generation. Entries with another generation are invalid.
     tlb_gen: u16,
     /// Superpages with TLB entries since the last flush.
@@ -236,10 +243,16 @@ pub struct Cpu {
     /// Host addresses used by the JIT compiled code.
     #[cfg(feature = "jit")]
     jit_addrs: [u64; jit::NUM_SYMS],
-    /// TLB of compiled code. It is part of the CPU state, so that
-    /// compiled code addresses it relative to the CPU pointer.
-    jtlb: [JitTlbEntry; TLB_SIZE],
+    /// TLB of compiled code, which addresses the bank of the data
+    /// mode through jit_tlb_base. It has a
+    /// bank of TLB_SIZE entries per data mode (U, S, S with SUM, M), and
+    /// the tags are page addresses: entries are invalidated when the
+    /// TLB is flushed or MXR is cleared.
+    jtlb: Box<[JitTlbEntry; JTLB_BANKS * TLB_SIZE]>,
 }
+
+/// Number of JIT TLB banks: one per data mode.
+pub(crate) const JTLB_BANKS: usize = 4;
 
 /// The kind of result of executing one instruction.
 enum Flow {
@@ -283,7 +296,11 @@ impl Cpu {
             data_mode: Mode::M,
             data_key: 0,
             fetch_key: 0,
-            jit_data_key: 0,
+            jit_tlb_base: 0,
+            jbank: 0,
+            jtlb_mxr: false,
+            jlog: Vec::new(),
+            jlog_full: false,
             tlb_gen: 0,
             tlb_super: Default::default(),
             jit_gen: 0,
@@ -313,7 +330,10 @@ impl Cpu {
             jit_value: 0,
             #[cfg(feature = "jit")]
             jit_addrs: [0; jit::NUM_SYMS],
-            jtlb: [JitTlbEntry::INVALID; TLB_SIZE],
+            jtlb: vec![JitTlbEntry::INVALID; JTLB_BANKS * TLB_SIZE]
+                .into_boxed_slice()
+                .try_into()
+                .unwrap(),
         };
         cpu.sync_mmu_state();
         cpu

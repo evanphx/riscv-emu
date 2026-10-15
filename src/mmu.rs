@@ -184,11 +184,12 @@ pub struct TlbEntry {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(C, align(32))]
 pub struct JitTlbEntry {
-    /// Tag for loads: as TlbEntry::tag for readable pages in RAM,
-    /// `u64::MAX` otherwise.
+    /// Tag for loads: the virtual page address for readable pages in
+    /// RAM, `u64::MAX` otherwise. The entries are in a bank per data
+    /// mode, so the tags need no key.
     pub tag_r: u64,
-    /// Tag for stores: as TlbEntry::tag for writable, dirty pages in
-    /// RAM without compiled code, `u64::MAX` otherwise.
+    /// Tag for stores: the virtual page address for writable, dirty
+    /// pages in RAM without compiled code, `u64::MAX` otherwise.
     pub tag_w: u64,
     /// Host address of the page minus the virtual page address.
     pub delta: u64,

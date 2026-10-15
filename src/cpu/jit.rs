@@ -703,14 +703,18 @@ unsafe extern "C" fn jit_exec(cpu: *mut Cpu, packed: u64, raw: u64) {
         instr.op,
         Op::Csrrw | Op::Csrrs | Op::Csrrc | Op::Csrrwi | Op::Csrrsi | Op::Csrrci
     );
+    let bank = cpu.jit_tlb_base;
     if let Err(e) = cpu.execute(instr, raw as u32, size) {
         cpu.jit_exception = Some(e);
         cpu.jit_fault = 1;
         return;
     }
-    // A CSR write that leaves an interrupt deliverable stops the block
-    // after the instruction, so that the dispatcher takes it.
-    if csr && cpu.irq_deliverable() {
+    // A CSR write that changes the JIT TLB bank (SUM), or leaves an
+    // interrupt deliverable stops the block after the instruction:
+    // blocks keep the bank, and the dispatcher takes interrupts.
+    if csr && cpu.jit_tlb_base != bank {
+        cpu.jit_fault = FAULT_STOP;
+    } else if csr && cpu.irq_deliverable() {
         cpu.jit_fault = FAULT_STOP;
         cpu.next_irq_check = 0;
     }
@@ -1638,8 +1642,7 @@ const JE_FUNC: i32 = offset_of!(JEntry, func) as i32;
 const JENTRY_SHIFT: i64 = std::mem::size_of::<JEntry>().trailing_zeros() as i64;
 const _: () = assert!(std::mem::size_of::<JEntry>().is_power_of_two());
 
-const OFS_JTLB: i32 = offset_of!(Cpu, jtlb) as i32;
-const OFS_JIT_DATA_KEY: i32 = offset_of!(Cpu, jit_data_key) as i32;
+const OFS_JIT_TLB: i32 = offset_of!(Cpu, jit_tlb_base) as i32;
 const JTLB_TAG_R: i32 = offset_of!(JitTlbEntry, tag_r) as i32;
 const JTLB_TAG_W: i32 = offset_of!(JitTlbEntry, tag_w) as i32;
 const JTLB_DELTA: i32 = offset_of!(JitTlbEntry, delta) as i32;
@@ -2044,13 +2047,11 @@ impl<'a, 'b> Translator<'a, 'b> {
             let pcv = self.pc_value(pc);
             self.jump_exit(pcv, k, EXIT_OK);
             self.b.switch_to_block(refill);
-            let idx = self.b.ins().ushr_imm_s(lo_v, 12 - JTLB_SHIFT);
-            let idx = self.b.ins().band_imm_s(idx, 0xfff << JTLB_SHIFT);
-            let ent = self.b.ins().iadd(self.cpu, idx);
+            let ent = self.tlb_entry(lo_v);
             let delta = self
                 .b
                 .ins()
-                .load(types::I64, Self::flags(), ent, OFS_JTLB + JTLB_DELTA);
+                .load(types::I64, Self::flags(), ent, JTLB_DELTA);
             let hb = self.b.ins().iadd(base, delta);
             self.b.ins().jump(cont, &[hb.into()]);
 
@@ -2172,12 +2173,24 @@ impl<'a, 'b> Translator<'a, 'b> {
         write: bool,
         slow: cranelift_codegen::ir::Block,
     ) -> Value {
-        let last = if size > 1 {
-            self.b.ins().iadd_imm_s(addr, size - 1)
-        } else {
-            addr
-        };
-        self.tlb_fast_range(addr, last, write, slow)
+        // Aligned accesses do not cross pages. The tag keeps the low
+        // address bits that must be zero, so that misaligned accesses
+        // never match and take the slow path.
+        let tag = self.b.ins().band_imm_s(addr, !0xfff | (size - 1));
+        self.tlb_fast_tag(addr, tag, write, slow)
+    }
+
+    /// Returns the address of the JIT TLB entry of the page of addr in
+    /// the bank of the data mode. The bank changes only in the
+    /// dispatcher.
+    fn tlb_entry(&mut self, addr: Value) -> Value {
+        let f = MemFlagsData::trusted().with_readonly().with_can_move();
+        let base = self.b.ins().load(types::I64, f, self.cpu, OFS_JIT_TLB);
+        // A rotate rather than a shift: with BMI2 it is a rorx, which
+        // does not need a copy of the address.
+        let idx = self.b.ins().rotr_imm_s(addr, 12 - JTLB_SHIFT);
+        let idx = self.b.ins().band_imm_s(idx, 0xfff << JTLB_SHIFT);
+        self.b.ins().iadd(base, idx)
     }
 
     /// Emits the inline TLB lookup of the accesses to [addr, last].
@@ -2188,25 +2201,24 @@ impl<'a, 'b> Translator<'a, 'b> {
         write: bool,
         slow: cranelift_codegen::ir::Block,
     ) -> Value {
-        let f = Self::flags();
-        // The JIT TLB is in the CPU state: the entry of the page is at
-        // cpu + OFS_JTLB + ((addr >> 12) & 0xfff) << JTLB_SHIFT.
-        let idx = self.b.ins().ushr_imm_s(addr, 12 - JTLB_SHIFT);
-        let idx = self.b.ins().band_imm_s(idx, 0xfff << JTLB_SHIFT);
-        let ent = self.b.ins().iadd(self.cpu, idx);
-
-        // The tag is computed from the last byte of the access and
-        // compared with the entry of the first byte, so an access that
-        // crosses a page boundary never matches. The data key is loaded
-        // at each access rather than kept in a register: it folds into
-        // the or as a memory operand.
+        // The tag is computed from the last byte of the range and
+        // compared with the entry of the first byte, so a range that
+        // crosses a page boundary never matches.
         let tag = self.b.ins().band_imm_s(last, !0xfff);
-        let key = self
-            .b
-            .ins()
-            .load(types::I64, f, self.cpu, OFS_JIT_DATA_KEY);
-        let tag = self.b.ins().bor(tag, key);
-        let tag_ofs = OFS_JTLB + if write { JTLB_TAG_W } else { JTLB_TAG_R };
+        self.tlb_fast_tag(addr, tag, write, slow)
+    }
+
+    /// Emits the inline TLB lookup of the access at addr with the tag.
+    fn tlb_fast_tag(
+        &mut self,
+        addr: Value,
+        tag: Value,
+        write: bool,
+        slow: cranelift_codegen::ir::Block,
+    ) -> Value {
+        let f = Self::flags();
+        let ent = self.tlb_entry(addr);
+        let tag_ofs = if write { JTLB_TAG_W } else { JTLB_TAG_R };
         let e_tag = self.b.ins().load(types::I64, f, ent, tag_ofs);
         let ok = self.b.ins().icmp(IntCC::Equal, e_tag, tag);
         let fast = self.b.create_block();
@@ -2216,7 +2228,7 @@ impl<'a, 'b> Translator<'a, 'b> {
         let delta = self
             .b
             .ins()
-            .load(types::I64, f, ent, OFS_JTLB + JTLB_DELTA);
+            .load(types::I64, f, ent, JTLB_DELTA);
         self.b.ins().iadd(addr, delta)
     }
 

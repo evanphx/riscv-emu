@@ -1,6 +1,6 @@
 //! Sv39 address translation and memory accesses.
 
-use super::Cpu;
+use super::{Cpu, JTLB_BANKS};
 use crate::isa::{self, Exception, Mode};
 use crate::memory::{self, PAGE_SIZE};
 use crate::mmu::*;
@@ -38,8 +38,8 @@ impl Cpu {
             for e in self.tlb.iter_mut() {
                 e.tag = u64::MAX;
             }
-            self.jtlb.fill(JitTlbEntry::INVALID);
         }
+        self.jit_tlb_clear();
         self.sync_mmu_state();
         self.new_jit_gen();
     }
@@ -60,7 +60,9 @@ impl Cpu {
         if e.tag & !0xfff == vaddr & !0xfff {
             e.tag = u64::MAX;
         }
-        self.jtlb[idx] = JitTlbEntry::INVALID;
+        for bank in 0..JTLB_BANKS {
+            self.jtlb[bank * TLB_SIZE + idx] = JitTlbEntry::INVALID;
+        }
         #[cfg(feature = "jit")]
         self.jit_flush_page(vaddr);
     }
@@ -90,7 +92,14 @@ impl Cpu {
         };
         let bits = ((ms.sum() as u16) << 2) | ((ms.mxr() as u16) << 3) | (self.tlb_gen << 4);
         self.data_key = self.data_mode as u16 | bits;
-        self.jit_data_key = self.data_key as u64;
+        // JIT TLB entries filled with MXR set lose permissions when it
+        // is cleared.
+        if self.jtlb_mxr && !ms.mxr() {
+            self.jit_tlb_clear();
+        }
+        self.jtlb_mxr = ms.mxr();
+        self.jbank = jtlb_bank(self.data_key) * TLB_SIZE;
+        self.jit_tlb_base = self.jtlb[self.jbank..].as_ptr() as u64;
         self.fetch_key = self.mode as u16 | bits;
         self.jit_jkey = self.jit_gen << 16 | self.fetch_key as u64;
     }
@@ -169,8 +178,8 @@ impl Cpu {
             {
                 return false;
             }
-            let d_lo = self.jtlb[((lo >> 12) & 0xfff) as usize].delta;
-            let d_hi = self.jtlb[((hi >> 12) & 0xfff) as usize].delta;
+            let d_lo = self.jtlb[self.jbank + ((lo >> 12) & 0xfff) as usize].delta;
+            let d_hi = self.jtlb[self.jbank + ((hi >> 12) & 0xfff) as usize].delta;
             return d_lo == d_hi && self.jtlb_host(lo, 1, write).is_some();
         }
         if self.jtlb_host(lo, hi - lo + 1, write).is_some() {
@@ -206,12 +215,18 @@ impl Cpu {
     /// directly from readable pages in RAM, and stores directly only to
     /// dirty pages without compiled code or a store overlay.
     pub(super) fn jit_tlb_fill(&mut self, vaddr: u64, key: u16, page4k: u64, flags: u8) {
-        let idx = ((vaddr >> 12) & 0xfff) as usize;
+        let bank = jtlb_bank(key);
+        let idx = bank * TLB_SIZE + ((vaddr >> 12) & 0xfff) as usize;
         if !self.mem.contains_range(page4k, 0x1000) {
             self.jtlb[idx] = JitTlbEntry::INVALID;
             return;
         }
-        let tag = TlbEntry::tag(vaddr, key);
+        if self.jlog.len() < JLOG_MAX {
+            self.jlog.push(idx as u32);
+        } else {
+            self.jlog_full = true;
+        }
+        let tag = vaddr & !0xfff;
         let ofs = self.mem.offset(page4k);
         let host = self.mem.ptr_at(ofs) as u64;
         let writable = flags & PTE_W != 0
@@ -223,6 +238,19 @@ impl Cpu {
             tag_w: if writable { tag } else { u64::MAX },
             delta: host.wrapping_sub(vaddr & !0xfff),
         };
+    }
+
+    /// Invalidates the JIT TLB entries.
+    pub(super) fn jit_tlb_clear(&mut self) {
+        if self.jlog_full {
+            self.jtlb.fill(JitTlbEntry::INVALID);
+        } else {
+            for &i in &self.jlog {
+                self.jtlb[i as usize] = JitTlbEntry::INVALID;
+            }
+        }
+        self.jlog.clear();
+        self.jlog_full = false;
     }
 
     fn page_fault(access: u8, vaddr: u64) -> Exception {
@@ -443,9 +471,9 @@ impl Cpu {
     /// byte is compared, so that page crossing accesses never match.
     #[inline(always)]
     fn jtlb_host(&self, vaddr: u64, size: u64, write: bool) -> Option<*mut u8> {
-        let e = &self.jtlb[((vaddr >> 12) & 0xfff) as usize];
+        let e = &self.jtlb[self.jbank + ((vaddr >> 12) & 0xfff) as usize];
         let tag = if write { e.tag_w } else { e.tag_r };
-        if tag == TlbEntry::tag(vaddr.wrapping_add(size - 1), self.data_key) {
+        if tag == vaddr.wrapping_add(size - 1) & !0xfff {
             Some(vaddr.wrapping_add(e.delta) as *mut u8)
         } else {
             None
@@ -634,5 +662,22 @@ impl Cpu {
             vaddr += l as u64;
         }
         Ok(())
+    }
+}
+
+/// Maximum length of the logs of filled JIT TLB entries; longer logs
+/// clear everything.
+const JLOG_MAX: usize = 2048;
+
+/// Returns the JIT TLB bank of the TLB key: the bank of the data mode,
+/// with a separate supervisor bank for SUM.
+#[inline]
+fn jtlb_bank(key: u16) -> usize {
+    let sum = key & 1 << 2 != 0;
+    match Mode::from_bits(key as u64 & 3) {
+        Mode::U => 0,
+        Mode::S if sum => 2,
+        Mode::S => 1,
+        _ => 3,
     }
 }
