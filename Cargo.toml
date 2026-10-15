@@ -1,0 +1,20 @@
+[package]
+name = "riscv"
+version = "0.1.0"
+edition = "2021"
+description = "RV64GC RISC-V emulator capable of booting Linux (Rust port of markkurossi/riscv)"
+license = "MIT"
+
+[dependencies]
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+debug = 1
+codegen-units = 4
+panic = "unwind"
+
+[profile.test]
+opt-level = 2
