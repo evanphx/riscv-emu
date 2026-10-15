@@ -1,0 +1,39 @@
+{
+  "bios":    "opensbi/fw_jump.bin",
+  "kernel":  "u-boot-2026.04/u-boot.bin",
+  "_kernel":  "netbsd/netbsd",
+  "_append":  "console=com0 root=sd0a",
+  "append":  "root=dk1",
+  "drives": [
+    {
+      "id":     "hd0",
+      "format": "raw",
+      "file":   "netbsd/riscv64.img"
+    }
+  ],
+  "netdevs": [
+    {
+      "id":         "eth0",
+      "ip":         "192.168.42.3",
+      "gw":         "192.168.42.254",
+      "hostname":   "netbsd",
+      "domainname": "goemu.ephemelier.com"
+    }
+  ],
+  "devices": [
+    {
+      "type":  "virtio-blk-device",
+      "drive": "hd0"
+    },
+    {
+      "type":   "virtio-net-device",
+      "netdev": "eth0"
+    }
+  ],
+  "_devices": [
+    {
+      "type":  "virtio-blk-device",
+      "drive": "hd0"
+    }
+  ]
+}
