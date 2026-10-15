@@ -225,6 +225,9 @@ pub struct Cpu {
     /// Set when jit_exception holds an exception.
     #[cfg(feature = "jit")]
     jit_fault: u8,
+    /// Value loaded by the JIT load helper.
+    #[cfg(feature = "jit")]
+    jit_value: u64,
     /// Bitmap of RAM pages containing compiled code. Empty when the
     /// JIT is disabled.
     #[cfg(feature = "jit")]
@@ -297,6 +300,8 @@ impl Cpu {
             jit_exception: None,
             #[cfg(feature = "jit")]
             jit_fault: 0,
+            #[cfg(feature = "jit")]
+            jit_value: 0,
             #[cfg(feature = "jit")]
             jit_code_pages: Vec::new(),
         };

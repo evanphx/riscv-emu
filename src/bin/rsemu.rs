@@ -149,7 +149,7 @@ const FLAGS: &[FlagSpec] = &[
         name: "jit-threshold",
         boolean: false,
         multi: false,
-        usage: "executions before a block is JIT compiled (default 3000)",
+        usage: "executions before a block is JIT compiled (default 1000)",
     },
     FlagSpec {
         name: "jit-sync",

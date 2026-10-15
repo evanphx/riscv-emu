@@ -40,7 +40,7 @@ use cranelift_codegen::control::ControlPlane;
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::immediates::Imm64;
 use cranelift_codegen::ir::{
-    types, AbiParam, ExternalName, GlobalValue, GlobalValueData, InstBuilder, MemFlagsData,
+    types, AbiParam, ExternalName, GlobalValue, GlobalValueData, InstBuilder, MemFlagsData, SigRef,
     Signature, Type, UserExternalName, Value,
 };
 use cranelift_codegen::isa::{CallConv, OwnedTargetIsa};
@@ -100,7 +100,7 @@ const MAX_BLOCK_INSTRS: usize = 200;
 
 /// Default number of times the interpreter must reach a block start
 /// before the block is compiled.
-pub const DEFAULT_HOT_THRESHOLD: u16 = 3000;
+pub const DEFAULT_HOT_THRESHOLD: u16 = 1000;
 
 /// JIT statistics.
 #[derive(Clone, Copy, Debug, Default)]
@@ -274,6 +274,8 @@ pub struct Jit {
     /// Trampoline arena and entry.
     _enter_arena: CodeArena,
     enter: EnterFn,
+    /// Helper stubs: load, store, exec.
+    stubs: [u64; 3],
     jcache: Box<[JEntry]>,
     cache: Box<[CacheEntry]>,
     blocks: Vec<Block>,
@@ -317,10 +319,46 @@ impl Hasher for FxHasher {
     }
 }
 
-/// Marks the RAM page at the offset as containing compiled code.
-fn mark_code_page(code_pages: &mut [u64], ofs: u64) {
-    let page = ofs >> 12;
-    code_pages[(page >> 6) as usize] |= 1 << (page & 63);
+/// The RAM pages that contain compiled code. Stores to them go
+/// through the CPU, which invalidates the code. Compiled code stores
+/// directly through TLB entries with PTE_W in host_flags, so the
+/// entries of code pages lose PTE_W.
+struct CodePages<'a> {
+    bits: &'a mut [u64],
+    tlb: &'a mut [TlbEntry],
+    /// Host address of RAM offset 0.
+    ram: u64,
+}
+
+impl CodePages<'_> {
+    /// Marks the RAM page at the offset as containing compiled code.
+    fn mark(&mut self, ofs: u64) {
+        let page = ofs >> 12;
+        let word = &mut self.bits[(page >> 6) as usize];
+        let bit = 1 << (page & 63);
+        if *word & bit != 0 {
+            return;
+        }
+        *word |= bit;
+        let host = self.ram + (page << 12);
+        for e in self.tlb.iter_mut() {
+            if e.host_flags & PTE_W != 0 && (e.tag & !0xfff).wrapping_add(e.host_delta) == host {
+                e.host_flags &= !PTE_W;
+            }
+        }
+    }
+}
+
+/// Returns the code pages of the CPU. A macro so that the borrows of
+/// the fields stay disjoint from the JIT.
+macro_rules! code_pages {
+    ($cpu:expr) => {
+        &mut CodePages {
+            bits: &mut $cpu.jit_code_pages,
+            tlb: &mut $cpu.tlb[..],
+            ram: $cpu.mem.ptr_at(0) as u64,
+        }
+    };
 }
 
 const CODE_FILTER_WORDS: usize = 1024;
@@ -687,11 +725,13 @@ impl Jit {
         };
         let mut enter_arena = CodeArena::new(PAGE_SIZE as usize)?;
         let enter = compile_enter(&mut enter_arena)?;
+        let stubs = compile_stubs(&mut enter_arena)?;
         Ok(Jit {
             compiler,
             worker,
             _enter_arena: enter_arena,
             enter,
+            stubs,
             jcache: vec![EMPTY_JENTRY; JCACHE_SIZE].into_boxed_slice(),
             pending: HashSet::default(),
             poll: 0,
@@ -720,7 +760,7 @@ impl Jit {
     fn lookup(
         &mut self,
         cpu_mem: &crate::memory::Memory,
-        code_pages: &mut [u64],
+        code_pages: &mut CodePages,
         vpc: u64,
         phys: u64,
     ) -> Option<BlockFn> {
@@ -754,7 +794,7 @@ impl Jit {
                 self.stats.cache_hits += 1;
             }
             b.epoch = self.epoch;
-            mark_code_page(code_pages, b.phys);
+            code_pages.mark(b.phys);
         }
         Some(b.func)
     }
@@ -775,7 +815,7 @@ impl Jit {
     fn reuse(
         &mut self,
         mem: &crate::memory::Memory,
-        code_pages: &mut [u64],
+        code_pages: &mut CodePages,
         vpc: u64,
         phys: u64,
     ) -> Option<BlockFn> {
@@ -811,7 +851,7 @@ impl Jit {
             used: true,
         };
         // The original block keeps its own location.
-        mark_code_page(code_pages, block.phys);
+        code_pages.mark(block.phys);
         self.stats.reused += 1;
         let idx = self.blocks.len() as u32;
         let func = block.func;
@@ -991,14 +1031,14 @@ impl Jit {
     }
 
     /// Installs the blocks compiled in the background.
-    fn install_pending(&mut self, code_pages: &mut [u64], syms: &Syms) -> Result<(), String> {
+    fn install_pending(&mut self, code_pages: &mut CodePages, syms: &Syms) -> Result<(), String> {
         loop {
             let Some(r) = self.worker.as_ref().and_then(|w| w.rx.try_recv().ok()) else {
                 return Ok(());
             };
             let r = r?;
             self.pending.remove(&(r.request.vpc, r.request.phys));
-            mark_code_page(code_pages, r.request.code_ofs);
+            code_pages.mark(r.request.code_ofs);
             self.install(r, syms)?;
         }
     }
@@ -1041,45 +1081,106 @@ fn block_signature(ptr: Type) -> Signature {
     sig
 }
 
-/// Compiles the trampoline that calls a block from Rust.
-fn compile_enter(arena: &mut CodeArena) -> Result<EnterFn, String> {
+/// Compiles a glue function with the signature into the arena. The
+/// body is built from the function parameters.
+fn compile_glue(
+    arena: &mut CodeArena,
+    sig: Signature,
+    body: impl FnOnce(&mut FunctionBuilder, &[Value]),
+) -> Result<*const u8, String> {
     let isa = host_isa()?;
-    let ptr = isa.pointer_type();
     let mut ctx = Context::new();
     let mut fctx = FunctionBuilderContext::new();
-    let mut sig = Signature::new(isa.default_call_conv());
-    sig.params.push(AbiParam::new(ptr));
-    sig.params.push(AbiParam::new(ptr));
-    sig.returns.push(AbiParam::new(types::I64));
     ctx.func.signature = sig;
     {
         let mut b = FunctionBuilder::new(&mut ctx.func, &mut fctx);
         let entry = b.create_block();
         b.append_block_params_for_function_params(entry);
         b.switch_to_block(entry);
-        let (cpu, func) = (b.block_params(entry)[0], b.block_params(entry)[1]);
-        let sigref = b.import_signature(block_signature(ptr));
-        let zero = b.ins().iconst(types::I64, 0);
-        let call = b.ins().call_indirect(sigref, func, &[cpu, zero]);
-        let r = b.inst_results(call)[0];
-        b.ins().return_(&[r]);
+        let params = b.block_params(entry).to_vec();
+        body(&mut b, &params);
         b.seal_all_blocks();
         b.finalize(isa.frontend_config());
     }
     let compiled = ctx
         .compile(&*isa, &mut ControlPlane::default())
-        .map_err(|e| format!("JIT trampoline: {:?}", e.inner))?;
-    let code = arena
+        .map_err(|e| format!("JIT glue: {:?}", e.inner))?;
+    arena
         .add(compiled.code_buffer())
-        .ok_or("JIT trampoline: no space")?;
+        .ok_or_else(|| "JIT glue: no space".to_string())
+}
+
+/// Compiles the trampoline that calls a block from Rust.
+fn compile_enter(arena: &mut CodeArena) -> Result<EnterFn, String> {
+    let ptr = types::I64;
+    let mut sig = Signature::new(CallConv::SystemV);
+    sig.params.push(AbiParam::new(ptr));
+    sig.params.push(AbiParam::new(ptr));
+    sig.returns.push(AbiParam::new(types::I64));
+    let code = compile_glue(arena, sig, |b, p| {
+        let sigref = b.import_signature(block_signature(ptr));
+        let zero = b.ins().iconst(types::I64, 0);
+        let call = b.ins().call_indirect(sigref, p[1], &[p[0], zero]);
+        let r = b.inst_results(call)[0];
+        b.ins().return_(&[r]);
+    })?;
     // SAFETY: the code was compiled with the EnterFn signature.
     Ok(unsafe { std::mem::transmute::<*const u8, EnterFn>(code) })
+}
+
+/// Number of parameters of the helper functions: load, store, exec.
+const HELPER_PARAMS: [usize; 3] = [3, 4, 3];
+
+/// Returns the signature of the helper stubs called by the blocks.
+/// The stubs preserve all registers, so that the rarely taken helper
+/// calls do not constrain register allocation in the blocks.
+fn stub_signature(helper: usize) -> Signature {
+    let mut sig = Signature::new(CallConv::PreserveAll);
+    for _ in 0..HELPER_PARAMS[helper] {
+        sig.params.push(AbiParam::new(types::I64));
+    }
+    sig
+}
+
+/// Compiles the stubs that call the helper functions jit_load,
+/// jit_store, and jit_exec with the system calling convention. The
+/// load stub stores the loaded value in Cpu::jit_value.
+fn compile_stubs(arena: &mut CodeArena) -> Result<[u64; 3], String> {
+    let helpers = [
+        jit_load as *const () as i64,
+        jit_store as *const () as i64,
+        jit_exec as *const () as i64,
+    ];
+    let mut out = [0; 3];
+    for (h, addr) in helpers.into_iter().enumerate() {
+        let code = compile_glue(arena, stub_signature(h), |b, p| {
+            let mut sig = Signature::new(CallConv::SystemV);
+            for _ in 0..HELPER_PARAMS[h] {
+                sig.params.push(AbiParam::new(types::I64));
+            }
+            if h == 0 {
+                sig.returns.push(AbiParam::new(types::I64));
+            }
+            let sigref = b.import_signature(sig);
+            let callee = b.ins().iconst(types::I64, addr);
+            let call = b.ins().call_indirect(sigref, callee, p);
+            if h == 0 {
+                let v = b.inst_results(call)[0];
+                b.ins().store(MemFlagsData::trusted(), v, p[0], OFS_VALUE);
+            }
+            b.ins().return_(&[]);
+        })?;
+        out[h] = code as u64;
+    }
+    Ok(out)
 }
 
 /// Returns the code generator for the host.
 fn host_isa() -> Result<OwnedTargetIsa, String> {
     let mut flags = settings::builder();
-    flags.set("opt_level", "speed").map_err(|e| e.to_string())?;
+    // The generated IR is already simple; Cranelift's optimizations
+    // do not make it faster but make compiling slower.
+    flags.set("opt_level", "none").map_err(|e| e.to_string())?;
     flags
         .set("enable_verifier", "false")
         .map_err(|e| e.to_string())?;
@@ -1108,12 +1209,11 @@ impl Compiler {
         let ptr = self.isa.pointer_type();
         self.ctx.clear();
         self.ctx.func.signature = block_signature(ptr);
-        let helper_cc = self.isa.default_call_conv();
 
         let frontend_config = self.isa.frontend_config();
         {
             let mut b = FunctionBuilder::new(&mut self.ctx.func, &mut self.fctx);
-            let mut t = Translator::new(&mut b, ptr, helper_cc, req.env, req.vpc);
+            let mut t = Translator::new(&mut b, ptr, req.env, req.vpc);
             t.translate(&req.instrs);
             b.seal_all_blocks();
             b.finalize(frontend_config);
@@ -1188,16 +1288,14 @@ struct CodegenEnv {
 /// another process.
 #[derive(Clone, Copy)]
 enum Sym {
-    Ram,
     Tlb,
-    CodePages,
     Load,
     Store,
     Exec,
     JCache,
 }
 
-const NUM_SYMS: usize = 7;
+const NUM_SYMS: usize = 5;
 
 /// Values of the symbols, indexed by Sym.
 type Syms = [u64; NUM_SYMS];
@@ -1231,6 +1329,7 @@ const OFS_DATA_KEY: i32 = offset_of!(Cpu, data_key) as i32;
 const OFS_FAULT: i32 = offset_of!(Cpu, jit_fault) as i32;
 const OFS_RESV: i32 = offset_of!(Cpu, reservation_valid) as i32;
 const OFS_JKEY: i32 = offset_of!(Cpu, jit_jkey) as i32;
+const OFS_VALUE: i32 = offset_of!(Cpu, jit_value) as i32;
 
 const JE_VPC: i32 = offset_of!(JEntry, vpc) as i32;
 const JE_KEY: i32 = offset_of!(JEntry, key) as i32;
@@ -1252,8 +1351,6 @@ const LOOP_LIMIT: i64 = 4096;
 struct Translator<'a, 'b> {
     b: &'a mut FunctionBuilder<'b>,
     ptr: Type,
-    /// Calling convention of the helper functions.
-    helper_cc: CallConv,
     env: CodegenEnv,
     cpu: Value,
     /// Loop header following the register loads.
@@ -1267,29 +1364,34 @@ struct Translator<'a, 'b> {
     entry_pc: Value,
     vars: [Option<Variable>; 32],
     syms: [Option<GlobalValue>; NUM_SYMS],
+    /// TLB key for data accesses, which compiled code cannot change.
+    data_key: Value,
+    /// Shared exit blocks.
+    exit_blk: Option<cranelift_codegen::ir::Block>,
+    chain_blk: Option<cranelift_codegen::ir::Block>,
+    /// Signatures of the helper functions.
+    load_sig: Option<SigRef>,
+    store_sig: Option<SigRef>,
+    exec_sig: Option<SigRef>,
 }
 
 impl<'a, 'b> Translator<'a, 'b> {
-    fn new(
-        b: &'a mut FunctionBuilder<'b>,
-        ptr: Type,
-        helper_cc: CallConv,
-        env: CodegenEnv,
-        start_vpc: u64,
-    ) -> Self {
+    fn new(b: &'a mut FunctionBuilder<'b>, ptr: Type, env: CodegenEnv, start_vpc: u64) -> Self {
         let entry = b.create_block();
         b.append_block_params_for_function_params(entry);
         b.switch_to_block(entry);
         let cpu = b.block_params(entry)[0];
         let count_in = b.block_params(entry)[1];
         let entry_pc = b.ins().load(types::I64, Self::flags(), cpu, OFS_PC);
+        let data_key = b
+            .ins()
+            .uload16(types::I64, Self::flags(), cpu, OFS_DATA_KEY);
         let header = b.create_block();
         let count = b.declare_var(types::I64);
         b.def_var(count, count_in);
         Translator {
             b,
             ptr,
-            helper_cc,
             env,
             cpu,
             header,
@@ -1298,6 +1400,12 @@ impl<'a, 'b> Translator<'a, 'b> {
             entry_pc,
             vars: [None; 32],
             syms: [None; NUM_SYMS],
+            data_key,
+            exit_blk: None,
+            chain_blk: None,
+            load_sig: None,
+            store_sig: None,
+            exec_sig: None,
         }
     }
 
@@ -1390,13 +1498,27 @@ impl<'a, 'b> Translator<'a, 'b> {
     /// Exits the block: writes PC and returns the instruction count
     /// and status.
     fn exit_with(&mut self, pc: Value, count: Value, status: u64) {
-        self.b.ins().store(Self::flags(), pc, self.cpu, OFS_PC);
         let ret = if status == 0 {
             count
         } else {
             self.b.ins().bor_imm_s(count, (status << 32) as i64)
         };
-        self.b.ins().return_(&[ret]);
+        let exit = self.exit_block();
+        self.b.ins().jump(exit, &[pc.into(), ret.into()]);
+    }
+
+    /// Returns the shared exit block, which takes the guest PC and the
+    /// return value.
+    fn exit_block(&mut self) -> cranelift_codegen::ir::Block {
+        if let Some(blk) = self.exit_blk {
+            return blk;
+        }
+        let blk = self.b.create_block();
+        self.b.append_block_param(blk, types::I64);
+        self.b.append_block_param(blk, types::I64);
+        self.b.set_cold_block(blk);
+        self.exit_blk = Some(blk);
+        blk
     }
 
     /// Exits the block to pc after n instructions of the current
@@ -1411,46 +1533,71 @@ impl<'a, 'b> Translator<'a, 'b> {
     /// has one and the instruction budget allows, otherwise returns to
     /// the dispatcher.
     fn chain_exit(&mut self, pc: Value, n: u64) {
-        let f = Self::flags();
         let total = self.total(n);
-        self.b.ins().store(f, pc, self.cpu, OFS_PC);
-        let ret = self.b.create_block();
-        let lookup = self.b.create_block();
-        let check_key = self.b.create_block();
-        let jump = self.b.create_block();
-        self.b.set_cold_block(ret);
+        let chain = match self.chain_blk {
+            Some(blk) => blk,
+            None => {
+                let blk = self.b.create_block();
+                self.b.append_block_param(blk, types::I64);
+                self.b.append_block_param(blk, types::I64);
+                self.chain_blk = Some(blk);
+                blk
+            }
+        };
+        self.b.ins().jump(chain, &[pc.into(), total.into()]);
+    }
 
-        let more = self
-            .b
-            .ins()
-            .icmp_imm_s(IntCC::SignedLessThan, total, LOOP_LIMIT);
-        self.b.ins().brif(more, lookup, &[], ret, &[]);
+    /// Emits the shared exit blocks.
+    fn finish(&mut self) {
+        let f = Self::flags();
+        if let Some(chain) = self.chain_blk {
+            self.b.switch_to_block(chain);
+            let (pc, total) = (self.b.block_params(chain)[0], self.b.block_params(chain)[1]);
+            self.b.ins().store(f, pc, self.cpu, OFS_PC);
+            let ret = self.b.create_block();
+            let lookup = self.b.create_block();
+            let check_key = self.b.create_block();
+            let jump = self.b.create_block();
+            self.b.set_cold_block(ret);
 
-        self.b.switch_to_block(lookup);
-        let idx = self.b.ins().ushr_imm_s(pc, 1);
-        let idx = self.b.ins().band_imm_s(idx, JCACHE_SIZE as i64 - 1);
-        let ofs = self.b.ins().ishl_imm_s(idx, JENTRY_SHIFT);
-        let jcache = self.sym(Sym::JCache);
-        let ent = self.b.ins().iadd(jcache, ofs);
-        let e_vpc = self.b.ins().load(types::I64, f, ent, JE_VPC);
-        let hit = self.b.ins().icmp(IntCC::Equal, e_vpc, pc);
-        self.b.ins().brif(hit, check_key, &[], ret, &[]);
+            let more = self
+                .b
+                .ins()
+                .icmp_imm_s(IntCC::SignedLessThan, total, LOOP_LIMIT);
+            self.b.ins().brif(more, lookup, &[], ret, &[]);
 
-        self.b.switch_to_block(check_key);
-        let e_key = self.b.ins().load(types::I64, f, ent, JE_KEY);
-        let key = self.b.ins().load(types::I64, f, self.cpu, OFS_JKEY);
-        let ok = self.b.ins().icmp(IntCC::Equal, e_key, key);
-        self.b.ins().brif(ok, jump, &[], ret, &[]);
+            self.b.switch_to_block(lookup);
+            let idx = self.b.ins().ushr_imm_s(pc, 1);
+            let idx = self.b.ins().band_imm_s(idx, JCACHE_SIZE as i64 - 1);
+            let ofs = self.b.ins().ishl_imm_s(idx, JENTRY_SHIFT);
+            let jcache = self.sym(Sym::JCache);
+            let ent = self.b.ins().iadd(jcache, ofs);
+            let e_vpc = self.b.ins().load(types::I64, f, ent, JE_VPC);
+            let hit = self.b.ins().icmp(IntCC::Equal, e_vpc, pc);
+            self.b.ins().brif(hit, check_key, &[], ret, &[]);
 
-        self.b.switch_to_block(jump);
-        let func = self.b.ins().load(self.ptr, f, ent, JE_FUNC);
-        let sigref = self.b.import_signature(block_signature(self.ptr));
-        self.b
-            .ins()
-            .return_call_indirect(sigref, func, &[self.cpu, total]);
+            self.b.switch_to_block(check_key);
+            let e_key = self.b.ins().load(types::I64, f, ent, JE_KEY);
+            let key = self.b.ins().load(types::I64, f, self.cpu, OFS_JKEY);
+            let ok = self.b.ins().icmp(IntCC::Equal, e_key, key);
+            self.b.ins().brif(ok, jump, &[], ret, &[]);
 
-        self.b.switch_to_block(ret);
-        self.b.ins().return_(&[total]);
+            self.b.switch_to_block(jump);
+            let func = self.b.ins().load(self.ptr, f, ent, JE_FUNC);
+            let sigref = self.b.import_signature(block_signature(self.ptr));
+            self.b
+                .ins()
+                .return_call_indirect(sigref, func, &[self.cpu, total]);
+
+            self.b.switch_to_block(ret);
+            self.b.ins().return_(&[total]);
+        }
+        if let Some(exit) = self.exit_blk {
+            self.b.switch_to_block(exit);
+            let (pc, ret) = (self.b.block_params(exit)[0], self.b.block_params(exit)[1]);
+            self.b.ins().store(f, pc, self.cpu, OFS_PC);
+            self.b.ins().return_(&[ret]);
+        }
     }
 
     /// Jumps to the guest PC target after n instructions of the
@@ -1491,6 +1638,7 @@ impl<'a, 'b> Translator<'a, 'b> {
             let last = instrs.last().unwrap();
             self.jump_to(last.pc.wrapping_add(last.size), instrs.len() as u64);
         }
+        self.finish();
     }
 
     fn sext32(&mut self, v: Value) -> Value {
@@ -1516,29 +1664,47 @@ impl<'a, 'b> Translator<'a, 'b> {
         let tlb = self.sym(Sym::Tlb);
         let ent = self.b.ins().iadd(tlb, eofs);
 
-        let key = self.b.ins().uload16(types::I64, f, self.cpu, OFS_DATA_KEY);
-        let tag = self.b.ins().band_imm_s(addr, !0xfff);
-        let tag = self.b.ins().bor(tag, key);
+        // The tag is computed from the last byte of the access and
+        // compared with the entry of the first byte, so an access that
+        // crosses a page boundary never matches.
+        let last = if size > 1 {
+            self.b.ins().iadd_imm_s(addr, size - 1)
+        } else {
+            addr
+        };
+        let tag = self.b.ins().band_imm_s(last, !0xfff);
+        let tag = self.b.ins().bor(tag, self.data_key);
         let e_tag = self.b.ins().load(types::I64, f, ent, TLB_TAG);
-        let mut ok = self.b.ins().icmp(IntCC::Equal, e_tag, tag);
+        let ok = self.b.ins().icmp(IntCC::Equal, e_tag, tag);
 
         let e_flags = self.b.ins().uload8(types::I32, f, ent, TLB_HOST_FLAGS);
         let masked = self.b.ins().band_imm_s(e_flags, need as i64);
         let c_flags = self.b.ins().icmp_imm_s(IntCC::Equal, masked, need as i64);
-        ok = self.b.ins().band(ok, c_flags);
-
-        if size > 1 {
-            let pofs = self.b.ins().band_imm_s(addr, 0xfff);
-            let c_page =
-                self.b
-                    .ins()
-                    .icmp_imm_s(IntCC::UnsignedLessThanOrEqual, pofs, 0x1000 - size);
-            ok = self.b.ins().band(ok, c_page);
-        }
+        let ok = self.b.ins().band(ok, c_flags);
 
         let delta = self.b.ins().load(types::I64, f, ent, TLB_HOST_DELTA);
         let host = self.b.ins().iadd(addr, delta);
         (ok, host)
+    }
+
+    /// Returns the signature reference, importing the signature with
+    /// the parameter count and return on first use.
+    fn helper_sig(&mut self, which: u8) -> SigRef {
+        let slot = match which {
+            0 => &self.load_sig,
+            1 => &self.store_sig,
+            _ => &self.exec_sig,
+        };
+        if let Some(s) = *slot {
+            return s;
+        }
+        let s = self.b.import_signature(stub_signature(which as usize));
+        match which {
+            0 => self.load_sig = Some(s),
+            1 => self.store_sig = Some(s),
+            _ => self.exec_sig = Some(s),
+        }
+        s
     }
 
     /// Emits a guest load. Faults exit the block at the instruction.
@@ -1546,9 +1712,9 @@ impl<'a, 'b> Translator<'a, 'b> {
         let (ok, host) = self.tlb_fast(addr, size, PTE_R);
         let fast = self.b.create_block();
         let slow = self.b.create_block();
-        let cont = self.b.create_block();
         let done = self.b.create_block();
         self.b.append_block_param(done, types::I64);
+        self.b.set_cold_block(slow);
         self.b.ins().brif(ok, fast, &[], slow, &[]);
 
         // Fast path: direct RAM access.
@@ -1567,22 +1733,16 @@ impl<'a, 'b> Translator<'a, 'b> {
 
         // Slow path: call the CPU.
         self.b.switch_to_block(slow);
-        let mut sig = Signature::new(self.helper_cc);
-        sig.params.push(AbiParam::new(self.ptr));
-        sig.params.push(AbiParam::new(types::I64));
-        sig.params.push(AbiParam::new(types::I64));
-        sig.returns.push(AbiParam::new(types::I64));
-        let sigref = self.b.import_signature(sig);
+        let sigref = self.helper_sig(0);
         let callee = self.sym(Sym::Load);
         let sz = self.iconst(size);
-        let call = self
-            .b
+        self.b
             .ins()
             .call_indirect(sigref, callee, &[self.cpu, addr, sz]);
-        let raw = self.b.inst_results(call)[0];
-        self.check_fault(k, pc, cont);
-
-        self.b.switch_to_block(cont);
+        let raw = self
+            .b
+            .ins()
+            .load(types::I64, Self::flags(), self.cpu, OFS_VALUE);
         let v = match (size, signed) {
             (1, true) => {
                 let n = self.b.ins().ireduce(types::I8, raw);
@@ -1595,7 +1755,7 @@ impl<'a, 'b> Translator<'a, 'b> {
             (4, true) => self.sext32(raw),
             _ => raw,
         };
-        self.b.ins().jump(done, &[v.into()]);
+        self.check_fault(k, pc, done, &[v]);
 
         self.b.switch_to_block(done);
         self.b.block_params(done)[0]
@@ -1605,27 +1765,14 @@ impl<'a, 'b> Translator<'a, 'b> {
     fn store(&mut self, k: u64, pc: u64, addr: Value, size: i64, v: Value) {
         let done = self.b.create_block();
         let slow = self.b.create_block();
+        self.b.set_cold_block(slow);
         if self.env.inline_stores {
+            // Pages with compiled code have no direct write permission,
+            // so stores to them take the slow path, which invalidates
+            // the code.
             let (ok, host) = self.tlb_fast(addr, size, PTE_W | PTE_D);
-            let check = self.b.create_block();
             let fast = self.b.create_block();
-            self.b.ins().brif(ok, check, &[], slow, &[]);
-
-            // Stores to pages with compiled code take the slow path,
-            // which invalidates the code.
-            self.b.switch_to_block(check);
-            let ram = self.sym(Sym::Ram);
-            let ofs = self.b.ins().isub(host, ram);
-            let page = self.b.ins().ushr_imm_s(ofs, 12);
-            let word = self.b.ins().ushr_imm_s(page, 6);
-            let word_ofs = self.b.ins().ishl_imm_s(word, 3);
-            let pages = self.sym(Sym::CodePages);
-            let word_addr = self.b.ins().iadd(pages, word_ofs);
-            let bits = self.b.ins().load(types::I64, Self::flags(), word_addr, 0);
-            let bit = self.b.ins().band_imm_s(page, 63);
-            let bits = self.b.ins().ushr(bits, bit);
-            let code = self.b.ins().band_imm_s(bits, 1);
-            self.b.ins().brif(code, slow, &[], fast, &[]);
+            self.b.ins().brif(ok, fast, &[], slow, &[]);
 
             self.b.switch_to_block(fast);
             let f = MemFlagsData::new();
@@ -1651,34 +1798,32 @@ impl<'a, 'b> Translator<'a, 'b> {
         }
 
         self.b.switch_to_block(slow);
-        let mut sig = Signature::new(self.helper_cc);
-        sig.params.push(AbiParam::new(self.ptr));
-        sig.params.push(AbiParam::new(types::I64));
-        sig.params.push(AbiParam::new(types::I64));
-        sig.params.push(AbiParam::new(types::I64));
-        let sigref = self.b.import_signature(sig);
+        let sigref = self.helper_sig(1);
         let callee = self.sym(Sym::Store);
         let sz = self.iconst(size);
         self.b
             .ins()
             .call_indirect(sigref, callee, &[self.cpu, addr, sz, v]);
-        self.check_fault(k, pc, done);
+        self.check_fault(k, pc, done, &[]);
 
         self.b.switch_to_block(done);
     }
 
     /// Exits the block with a fault if the last helper call faulted;
-    /// otherwise continues at cont.
-    fn check_fault(&mut self, k: u64, pc: u64, cont: cranelift_codegen::ir::Block) {
+    /// otherwise continues at cont with the arguments.
+    fn check_fault(&mut self, k: u64, pc: u64, cont: cranelift_codegen::ir::Block, args: &[Value]) {
         let fault = self
             .b
             .ins()
             .uload8(types::I32, Self::flags(), self.cpu, OFS_FAULT);
-        let stub = self.b.create_block();
-        self.b.ins().brif(fault, stub, &[], cont, &[]);
-        self.b.switch_to_block(stub);
         let pcv = self.pc_value(pc);
-        self.jump_exit(pcv, k + 1, EXIT_FAULT);
+        let c = self.total(k + 1);
+        let ret = self.b.ins().bor_imm_s(c, (EXIT_FAULT << 32) as i64);
+        let exit = self.exit_block();
+        let args: Vec<_> = args.iter().map(|&v| v.into()).collect();
+        self.b
+            .ins()
+            .brif(fault, exit, &[pcv.into(), ret.into()], cont, &args);
     }
 
     /// Exits before the floating point instruction if the FP unit is
@@ -1725,11 +1870,7 @@ impl<'a, 'b> Translator<'a, 'b> {
 
     /// Executes the instruction in the interpreter and reloads rd.
     fn helper(&mut self, k: u64, bi: &BlockInstr) {
-        let mut sig = Signature::new(self.helper_cc);
-        sig.params.push(AbiParam::new(self.ptr));
-        sig.params.push(AbiParam::new(types::I64));
-        sig.params.push(AbiParam::new(types::I64));
-        let sigref = self.b.import_signature(sig);
+        let sigref = self.helper_sig(2);
         let callee = self.sym(Sym::Exec);
         let packed = self.iconst(pack_instr(&bi.instr) as i64);
         let raw = self.iconst(bi.raw as i64);
@@ -1737,7 +1878,7 @@ impl<'a, 'b> Translator<'a, 'b> {
             .ins()
             .call_indirect(sigref, callee, &[self.cpu, packed, raw]);
         let cont = self.b.create_block();
-        self.check_fault(k, bi.pc, cont);
+        self.check_fault(k, bi.pc, cont, &[]);
         self.b.switch_to_block(cont);
         let rd = bi.instr.rd;
         if rd != 0 {
@@ -2310,12 +2451,11 @@ impl Cpu {
     /// Returns the host addresses the generated code refers to.
     fn jit_syms(&self) -> Syms {
         let mut syms = [0; NUM_SYMS];
-        syms[Sym::Ram as usize] = self.mem.ptr_at(0) as u64;
         syms[Sym::Tlb as usize] = self.tlb.as_ptr() as u64;
-        syms[Sym::CodePages as usize] = self.jit_code_pages.as_ptr() as u64;
-        syms[Sym::Load as usize] = jit_load as *const () as u64;
-        syms[Sym::Store as usize] = jit_store as *const () as u64;
-        syms[Sym::Exec as usize] = jit_exec as *const () as u64;
+        let stubs = self.jit.as_ref().map_or([0; 3], |j| j.stubs);
+        syms[Sym::Load as usize] = stubs[0];
+        syms[Sym::Store as usize] = stubs[1];
+        syms[Sym::Exec as usize] = stubs[2];
         syms[Sym::JCache as usize] = self.jit.as_ref().map_or(0, |j| j.jcache.as_ptr() as u64);
         syms
     }
@@ -2353,6 +2493,15 @@ impl Cpu {
     /// if a block was executed.
     pub(super) fn try_jit(&mut self) -> Result<bool, Exception> {
         let pc = self.pc;
+        // Fast path: the jump cache has the blocks that ran with the
+        // current translations and code.
+        if let Some(jit) = self.jit.as_ref() {
+            let e = &jit.jcache[((pc >> 1) as usize) & (JCACHE_SIZE - 1)];
+            if e.vpc == pc && e.key == self.jit_jkey {
+                let func = e.func;
+                return self.jit_enter(func);
+            }
+        }
         if crate::memory::page(pc) != self.code_vpn {
             self.load_code_page(pc)?;
         }
@@ -2366,12 +2515,12 @@ impl Cpu {
             if jit.poll % 64 == 0 {
                 let syms = self.jit_syms();
                 let jit = self.jit.as_mut().unwrap();
-                jit.install_pending(&mut self.jit_code_pages, &syms)
+                jit.install_pending(code_pages!(self), &syms)
                     .map_err(Exception::fatal)?;
             }
         }
         let jit = self.jit.as_mut().unwrap();
-        let func = match jit.lookup(&self.mem, &mut self.jit_code_pages, pc, phys) {
+        let func = match jit.lookup(&self.mem, code_pages!(self), pc, phys) {
             Some(f) => f,
             None => {
                 if jit.pending.contains(&(pc, phys)) {
@@ -2379,7 +2528,7 @@ impl Cpu {
                 }
                 let visits = jit.bump(phys);
                 let reused = if visits == 1 || visits >= jit.hot_threshold {
-                    jit.reuse(&self.mem, &mut self.jit_code_pages, pc, phys)
+                    jit.reuse(&self.mem, code_pages!(self), pc, phys)
                 } else {
                     None
                 };
@@ -2423,7 +2572,7 @@ impl Cpu {
             .unwrap()
             .compile(req)
             .map_err(Exception::fatal)?;
-        mark_code_page(&mut self.jit_code_pages, compiled.request.code_ofs);
+        code_pages!(self).mark(compiled.request.code_ofs);
         jit.install(compiled, &syms)
             .map(Some)
             .map_err(Exception::fatal)
@@ -2441,7 +2590,13 @@ impl Cpu {
             key: self.jit_jkey,
             func,
         };
-        let enter = jit.enter;
+        self.jit_enter(func)
+    }
+
+    /// Calls the block.
+    #[inline(always)]
+    fn jit_enter(&mut self, func: BlockFn) -> Result<bool, Exception> {
+        let enter = self.jit.as_ref().unwrap().enter;
         // SAFETY: the block was compiled for this CPU's memory and TLB
         // layout and accesses the CPU only through the pointer.
         let r = unsafe { enter(self as *mut Cpu, func) };
@@ -2466,7 +2621,7 @@ impl Cpu {
 }
 
 /// Code cache file format version.
-const CACHE_VERSION: u32 = 3;
+const CACHE_VERSION: u32 = 5;
 const CACHE_MAGIC: &[u8; 8] = b"RSEMUJIT";
 /// Blocks loaded from the cache but not used in this many runs are
 /// dropped from the cache.
@@ -2672,7 +2827,7 @@ impl Jit {
 
     /// Waits for the background compiler to finish the pending
     /// blocks.
-    fn drain_pending(&mut self, code_pages: &mut [u64], syms: &Syms) -> Result<(), String> {
+    fn drain_pending(&mut self, code_pages: &mut CodePages, syms: &Syms) -> Result<(), String> {
         while !self.pending.is_empty() {
             let Some(worker) = self.worker.as_ref() else {
                 break;
@@ -2682,7 +2837,7 @@ impl Jit {
             };
             let r = r?;
             self.pending.remove(&(r.request.vpc, r.request.phys));
-            mark_code_page(code_pages, r.request.code_ofs);
+            code_pages.mark(r.request.code_ofs);
             self.install(r, syms)?;
         }
         Ok(())
@@ -2753,7 +2908,7 @@ impl Cpu {
         let env = self.jit_env();
         let jit = self.jit.as_mut().unwrap();
         let r = jit
-            .drain_pending(&mut self.jit_code_pages, &syms)
+            .drain_pending(code_pages!(self), &syms)
             .and_then(|_| cache_fingerprint(env))
             .and_then(|fp| jit.save_cache(&path, fp));
         jit.cache_notes.push(match r {

@@ -36,6 +36,18 @@ impl Cpu {
         self.new_jit_gen();
     }
 
+    /// Tests if the RAM page at the offset contains JIT compiled code.
+    #[inline]
+    fn jit_code_page(&self, ofs: u64) -> bool {
+        #[cfg(feature = "jit")]
+        if !self.jit_code_pages.is_empty() {
+            let page = ofs >> 12;
+            return self.jit_code_pages[(page >> 6) as usize] & (1 << (page & 63)) != 0;
+        }
+        let _ = ofs;
+        false
+    }
+
     /// Invalidates the JIT jump cache entries.
     pub(super) fn new_jit_gen(&mut self) {
         self.jit_gen += 1;
@@ -102,8 +114,15 @@ impl Cpu {
         let page4k = paddr & !0xfff;
         let vpn = vaddr >> 12;
         let (host_delta, host_flags) = if self.mem.contains_range(page4k, 0x1000) {
-            let host = self.mem.ptr_at(self.mem.offset(page4k)) as u64;
-            (host.wrapping_sub(vaddr & !0xfff), flags)
+            let ofs = self.mem.offset(page4k);
+            let host = self.mem.ptr_at(ofs) as u64;
+            // Compiled code stores directly only to pages without
+            // compiled code.
+            let mut host_flags = flags;
+            if self.jit_code_page(ofs) {
+                host_flags &= !PTE_W;
+            }
+            (host.wrapping_sub(vaddr & !0xfff), host_flags)
         } else {
             (0, 0)
         };

@@ -91,7 +91,7 @@ Main flags:
 | `-gpu id=gpu0,width=1024,height=768` | add a VirtIO GPU with keyboard and pointer |
 | `-nographic` | ignore GPU devices |
 | `-jit` | enable the JIT compiler |
-| `-jit-threshold n` | executions before a block is compiled (default 3000) |
+| `-jit-threshold n` | executions before a block is compiled (default 1000) |
 | `-jit-sync` | compile blocks synchronously, for deterministic runs |
 | `-jit-cache file` | load and save JIT compiled code in `file` (implies `-jit`) |
 | `-cooked` | don't put the terminal into raw mode |
@@ -151,7 +151,7 @@ such as `riscv64-linux-gnu-gcc`.
 
 ## The JIT
 
-With `-jit`, guest code that has run `-jit-threshold` times (3000 by
+With `-jit`, guest code that has run `-jit-threshold` times (1000 by
 default) is compiled to native code with Cranelift on a background
 thread while the interpreter keeps running:
 
@@ -170,7 +170,12 @@ thread while the interpreter keeps running:
   machine code is reused instead of being compiled again.
 - Loads and stores inline the TLB lookup and access guest RAM directly
   on a hit; misses, MMIO, and faults call back into the CPU, so the
-  memory model and exceptions are identical to the interpreter.
+  memory model and exceptions are identical to the interpreter. The
+  calls go through stubs that preserve all registers, so the rarely
+  taken slow paths do not cost register moves on the fast paths. TLB
+  entries for pages that hold compiled code have no direct write
+  permission, so stores to code always go through the CPU, which
+  invalidates the code.
 - Floating point loads, stores, and moves are compiled natively; other
   floating point, atomic, and vector instructions call the interpreter
   from compiled code. CSR, system, and privileged instructions end the
@@ -190,8 +195,9 @@ thread while the interpreter keeps running:
   new epoch; traces from an older epoch are checked against the
   current guest code before they run again.
 
-The machine code is generated with `cranelift-codegen` and copied into
-the emulator's own executable code arena. The JIT supports x86-64
+The machine code is generated with `cranelift-codegen` (without its
+optimization passes, which do not speed up this code but slow down
+compiling) and copied into the emulator's own executable code arena. The JIT supports x86-64
 hosts. `-jit-sync` compiles blocks before running them instead of in
 the background, which makes runs deterministic and is useful for
 debugging.
