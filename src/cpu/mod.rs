@@ -477,6 +477,19 @@ impl Cpu {
         false
     }
 
+    /// Tests if a pending interrupt is enabled and would be taken.
+    #[cfg(feature = "jit")]
+    fn irq_deliverable(&self) -> bool {
+        let pending = self.signals.mip() & self.csr[isa::CSR_MIE as usize];
+        if pending == 0 {
+            return false;
+        }
+        let deleg = pending & self.csr[isa::CSR_MIDELEG as usize];
+        let m = pending & !deleg != 0 && (self.mode < Mode::M || self.mstatus.mie());
+        let s = deleg != 0 && (self.mode < Mode::S || (self.mode == Mode::S && self.mstatus.sie()));
+        m || s
+    }
+
     /// Fetches the instruction at PC. Returns the raw instruction.
     #[inline(always)]
     fn fetch(&mut self) -> Result<u32, Exception> {
@@ -616,7 +629,7 @@ impl Cpu {
                 continue;
             }
             block_start = match self.interp_one::<false>()? {
-                (Flow::Next, op) => !jit::jitable(op),
+                (Flow::Next, i) => !jit::jitable(&i),
                 (Flow::Jump, _) => true,
             };
         }
@@ -642,7 +655,7 @@ impl Cpu {
     /// Interprets one instruction, with the debug trace if TRACE is
     /// set.
     #[inline(always)]
-    fn interp_one<const TRACE: bool>(&mut self) -> Result<(Flow, Op), Exception> {
+    fn interp_one<const TRACE: bool>(&mut self) -> Result<(Flow, Instr), Exception> {
         // Ensure monotonic clock.
         self.time = self.time.wrapping_add(1);
 
@@ -659,7 +672,7 @@ impl Cpu {
         if let Flow::Next = flow {
             self.pc = self.pc.wrapping_add(size);
         }
-        Ok((flow, instr.op))
+        Ok((flow, instr))
     }
 
     #[inline(always)]

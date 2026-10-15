@@ -394,8 +394,53 @@ fn slot(phys: u64) -> usize {
     (((phys >> 1) ^ (phys >> (CACHE_BITS + 1))) as usize) & (CACHE_SIZE - 1)
 }
 
+/// How compiled code executes a CSR instruction.
+#[derive(Clone, Copy, PartialEq)]
+enum CsrKind {
+    /// A read of a counter, computed from the instruction count.
+    Counter,
+    /// An access to a CSR that does not change the privilege or
+    /// translation state, executed by the interpreter.
+    Helper,
+}
+
+/// Returns how compiled code executes the CSR instruction, or None if
+/// it must run in the dispatcher.
+#[inline(always)]
+fn csr_kind(i: &Instr) -> Option<CsrKind> {
+    use Op::*;
+    if !matches!(i.op, Csrrw | Csrrs | Csrrc | Csrrwi | Csrrsi | Csrrci) {
+        return None;
+    }
+    let write = matches!(i.op, Csrrw | Csrrwi) || i.rs1 != 0;
+    match (i.imm as u32 & 0xfff) as u16 {
+        isa::CSR_CYCLE | isa::CSR_TIME | isa::CSR_INSTRET if !write => Some(CsrKind::Counter),
+        isa::CSR_FFLAGS
+        | isa::CSR_FRM
+        | isa::CSR_FCSR
+        | isa::CSR_SSTATUS
+        | isa::CSR_SIE
+        | isa::CSR_STVEC
+        | isa::CSR_SCOUNTEREN
+        | isa::CSR_SSCRATCH
+        | isa::CSR_SEPC
+        | isa::CSR_SCAUSE
+        | isa::CSR_STVAL
+        | isa::CSR_SIP => Some(CsrKind::Helper),
+        _ => None,
+    }
+}
+
 /// Tests if the JIT can compile the instruction.
-pub(super) fn jitable(op: Op) -> bool {
+#[inline(always)]
+pub(super) fn jitable(i: &Instr) -> bool {
+    jitable_op(i.op) || csr_kind(i).is_some()
+}
+
+/// Tests if the JIT compiles the instruction, apart from CSR
+/// instructions, which depend on the CSR number.
+#[inline(always)]
+fn jitable_op(op: Op) -> bool {
     use Op::*;
     native_fp(op)
         || helper_op(op)
@@ -654,11 +699,26 @@ unsafe extern "C" fn jit_exec(cpu: *mut Cpu, packed: u64, raw: u64) {
     let cpu = &mut *cpu;
     let instr = unpack_instr(packed);
     let size = if raw & 0b11 == 0b11 { 4 } else { 2 };
+    let csr = matches!(
+        instr.op,
+        Op::Csrrw | Op::Csrrs | Op::Csrrc | Op::Csrrwi | Op::Csrrsi | Op::Csrrci
+    );
     if let Err(e) = cpu.execute(instr, raw as u32, size) {
         cpu.jit_exception = Some(e);
         cpu.jit_fault = 1;
+        return;
+    }
+    // A CSR write that leaves an interrupt deliverable stops the block
+    // after the instruction, so that the dispatcher takes it.
+    if csr && cpu.irq_deliverable() {
+        cpu.jit_fault = FAULT_STOP;
+        cpu.next_irq_check = 0;
     }
 }
+
+/// Cpu::jit_fault value requesting that the block stops after the
+/// helper instruction.
+const FAULT_STOP: u8 = 2;
 
 /// Returns the size and whether it is a store of an integer or
 /// floating point memory access compiled to native code.
@@ -935,7 +995,7 @@ impl Jit {
             } else {
                 (isa::decode_c_fast(lo as u16), 2, lo)
             };
-            if !jitable(instr.op) {
+            if !jitable(&instr) {
                 break;
             }
             out.push(BlockInstr {
@@ -1009,7 +1069,7 @@ impl Jit {
             } else {
                 (isa::decode_c_fast(lo as u16), 2, lo)
             };
-            if !jitable(instr.op) {
+            if !jitable(&instr) {
                 continue;
             }
             if let Some((&p, _)) = region.range(pc + 1..).next() {
@@ -1439,6 +1499,8 @@ const OFS_X: i32 = offset_of!(Cpu, x) as i32;
 const OFS_ADDRS: i32 = offset_of!(Cpu, jit_addrs) as i32;
 const OFS_F: i32 = offset_of!(Cpu, f) as i32;
 const OFS_MSTATUS: i32 = offset_of!(Cpu, mstatus) as i32;
+const OFS_TIME: i32 = offset_of!(Cpu, time) as i32;
+const OFS_INSTRET: i32 = offset_of!(Cpu, instret) as i32;
 const OFS_PC: i32 = offset_of!(Cpu, pc) as i32;
 const OFS_FAULT: i32 = offset_of!(Cpu, jit_fault) as i32;
 const OFS_RESV: i32 = offset_of!(Cpu, reservation_valid) as i32;
@@ -1803,7 +1865,7 @@ impl<'a, 'b> Translator<'a, 'b> {
             if i.rd == SP && mem_access(i.op).is_none_or(|(_, st)| !st) {
                 close(self, &mut cur);
             }
-            if is_terminator(i.op) || helper_op(i.op) {
+            if is_terminator(i.op) || helper_op(i.op) || csr_kind(&i).is_some() {
                 close(self, &mut cur);
             }
         }
@@ -2199,6 +2261,36 @@ impl<'a, 'b> Translator<'a, 'b> {
             .brif(fault, exit, &[pcv.into(), ret.into()], cont, &args);
     }
 
+    /// Continues at cont after the helper instruction bi unless it
+    /// faulted or requested a stop. A stop exits after the instruction.
+    fn check_stop(&mut self, k: u64, bi: &BlockInstr, cont: cranelift_codegen::ir::Block) {
+        let fault = self
+            .b
+            .ins()
+            .uload8(types::I32, Self::flags(), self.cpu, OFS_FAULT);
+        let slow = self.b.create_block();
+        let stop = self.b.create_block();
+        let fail = self.b.create_block();
+        self.b.set_cold_block(slow);
+        self.b.set_cold_block(stop);
+        self.b.set_cold_block(fail);
+        self.b.ins().brif(fault, slow, &[], cont, &[]);
+        self.b.switch_to_block(slow);
+        let is_stop = self
+            .b
+            .ins()
+            .icmp_imm_s(IntCC::Equal, fault, FAULT_STOP as i64);
+        self.b.ins().brif(is_stop, stop, &[], fail, &[]);
+        self.b.switch_to_block(stop);
+        let zero = self.b.ins().iconst(types::I8, 0);
+        self.b.ins().store(Self::flags(), zero, self.cpu, OFS_FAULT);
+        let next = self.pc_value(bi.pc.wrapping_add(bi.size));
+        self.jump_exit(next, k + 1, EXIT_OK);
+        self.b.switch_to_block(fail);
+        let pcv = self.pc_value(bi.pc);
+        self.jump_exit(pcv, k + 1, EXIT_FAULT);
+    }
+
     /// Exits before the floating point instruction if the FP unit is
     /// off, so that the interpreter raises the exception.
     fn check_fs(&mut self, k: u64, pc: u64) {
@@ -2242,7 +2334,7 @@ impl<'a, 'b> Translator<'a, 'b> {
     }
 
     /// Executes the instruction in the interpreter and reloads rd.
-    fn helper(&mut self, k: u64, bi: &BlockInstr) {
+    fn helper(&mut self, k: u64, bi: &BlockInstr, stop: bool) {
         let sigref = self.helper_sig(2);
         let callee = self.sym(Sym::Exec);
         let packed = self.iconst(pack_instr(&bi.instr) as i64);
@@ -2251,7 +2343,11 @@ impl<'a, 'b> Translator<'a, 'b> {
             .ins()
             .call_indirect(sigref, callee, &[self.cpu, packed, raw]);
         let cont = self.b.create_block();
-        self.check_fault(k, bi.pc, cont, &[]);
+        if stop {
+            self.check_stop(k, bi, cont);
+        } else {
+            self.check_fault(k, bi.pc, cont, &[]);
+        }
         self.b.switch_to_block(cont);
         let rd = bi.instr.rd;
         if rd != 0 {
@@ -2292,8 +2388,32 @@ impl<'a, 'b> Translator<'a, 'b> {
         }
 
         if helper_op(i.op) {
-            self.helper(k, bi);
+            self.helper(k, bi, false);
             return false;
+        }
+        match csr_kind(&i) {
+            Some(CsrKind::Helper) => {
+                self.helper(k, bi, true);
+                return false;
+            }
+            Some(CsrKind::Counter) => {
+                // The dispatcher adds the instruction count to time
+                // and instret when the block returns. The interpreter
+                // increments both before executing an instruction, and
+                // instret reads exclude the current instruction.
+                let csr = (i.imm as u32 & 0xfff) as u16;
+                let (ofs, n) = if csr == isa::CSR_INSTRET {
+                    (OFS_INSTRET, k)
+                } else {
+                    (OFS_TIME, k + 1)
+                };
+                let base = ins!().load(types::I64, Self::flags(), self.cpu, ofs);
+                let c = self.total(n);
+                let v = ins!().iadd(base, c);
+                self.set(rd, v);
+                return false;
+            }
+            None => {}
         }
 
         let v = match i.op {
@@ -3017,7 +3137,7 @@ impl Cpu {
 }
 
 /// Code cache file format version.
-const CACHE_VERSION: u32 = 6;
+const CACHE_VERSION: u32 = 7;
 const CACHE_MAGIC: &[u8; 8] = b"RSEMUJIT";
 /// Blocks loaded from the cache but not used in this many runs are
 /// dropped from the cache.
