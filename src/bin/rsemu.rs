@@ -41,6 +41,7 @@ const FLAGS: &[FlagSpec] = &[
     FlagSpec { name: "nographic", boolean: true, multi: false, usage: "disable graphical output" },
     FlagSpec { name: "jit", boolean: true, multi: false, usage: "enable the Cranelift JIT compiler" },
     FlagSpec { name: "jit-threshold", boolean: false, multi: false, usage: "executions before a block is JIT compiled (default 3000)" },
+    FlagSpec { name: "jit-sync", boolean: true, multi: false, usage: "compile blocks synchronously (deterministic runs)" },
     FlagSpec { name: "drive", boolean: false, multi: true, usage: "configure drive" },
     FlagSpec { name: "device", boolean: false, multi: true, usage: "configure device" },
     FlagSpec { name: "netdev", boolean: false, multi: true, usage: "configure network device" },
@@ -148,6 +149,7 @@ fn main() {
         cooked: flags.bool("cooked"),
         fs_root: flags.string("fsroot"),
         jit: flags.bool("jit"),
+        jit_sync: flags.bool("jit-sync"),
         jit_threshold: {
             let v = flags.string("jit-threshold");
             if v.is_empty() {

@@ -18,6 +18,9 @@ pub struct Params {
     /// Number of executions before a block is compiled; 0 selects the
     /// default.
     pub jit_threshold: u16,
+    /// Compiles blocks synchronously instead of on a background
+    /// thread, which makes runs deterministic.
+    pub jit_sync: bool,
 }
 
 impl Params {

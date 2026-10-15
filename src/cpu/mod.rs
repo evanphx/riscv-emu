@@ -108,7 +108,7 @@ pub fn configure_jit(cpu: &mut Cpu, params: &crate::Params) -> Result<(), String
         } else {
             params.jit_threshold
         };
-        cpu.enable_jit(threshold, true)
+        cpu.enable_jit(threshold, !params.jit_sync)
     }
     #[cfg(not(feature = "jit"))]
     {

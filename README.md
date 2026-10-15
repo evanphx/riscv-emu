@@ -92,6 +92,7 @@ Main flags:
 | `-nographic` | ignore GPU devices |
 | `-jit` | enable the JIT compiler |
 | `-jit-threshold n` | executions before a block is compiled (default 3000) |
+| `-jit-sync` | compile blocks synchronously, for deterministic runs |
 | `-cooked` | don't put the terminal into raw mode |
 | `-htif` | enable the HTIF tohost/fromhost device for ELF kernels |
 | `-symbols file` | kernel System.map for traces |
