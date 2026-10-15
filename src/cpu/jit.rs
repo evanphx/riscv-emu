@@ -277,8 +277,8 @@ pub struct Jit {
     /// Trampoline arena and entry.
     _enter_arena: CodeArena,
     enter: EnterFn,
-    /// Helper stubs: load, store, exec, probe.
-    stubs: [u64; 4],
+    /// Helper stubs: exec, probe.
+    stubs: [u64; 2],
     jcache: Box<[JEntry]>,
     /// Hashed bitmap of the pages with jump cache entries.
     jcache_pages: [u64; 64],
@@ -745,42 +745,169 @@ fn is_terminator(op: Op) -> bool {
     matches!(op, Beq | Bne | Blt | Bge | Bltu | Bgeu | Jal | Jalr)
 }
 
-/// Loads a value from guest memory for the generated code.
-unsafe extern "C" fn jit_load(cpu: *mut Cpu, addr: u64, size: u64) -> u64 {
+/// Kinds of memory access stubs, in the order of the entries.
+const MEM_LB: u64 = 0;
+const MEM_LBU: u64 = 1;
+const MEM_LH: u64 = 2;
+const MEM_LHU: u64 = 3;
+const MEM_LW: u64 = 4;
+const MEM_LWU: u64 = 5;
+const MEM_LD: u64 = 6;
+const MEM_SB: u64 = 8;
+/// Number of memory access stub entries.
+const MEM_KINDS: u64 = 12;
+/// Distance between the entries of the memory access stubs.
+const MEM_STUB_STRIDE: u64 = 16;
+
+/// Returns the signature of the memory access stubs: CPU, address,
+/// instruction count after the access, guest PC, store value. The
+/// stubs preserve all registers and return the loaded value.
+fn mem_stub_signature() -> Signature {
+    let mut sig = Signature::new(CallConv::PreserveAll);
+    for _ in 0..5 {
+        sig.params.push(AbiParam::new(types::I64));
+    }
+    sig.returns.push(AbiParam::new(types::I64));
+    sig
+}
+
+/// Performs a memory access of the kind for the generated code. On
+/// success, stores the loaded value in Cpu::jit_value and returns 0.
+/// On a fault, records the exception at pc and returns the block's
+/// return value, which the stub returns from the block.
+unsafe extern "C" fn jit_mem(
+    cpu: *mut Cpu,
+    addr: u64,
+    count: u64,
+    pc: u64,
+    v: u64,
+    kind: u64,
+) -> u64 {
     let cpu = &mut *cpu;
-    let r = match size {
-        1 => cpu.load8(addr).map(|v| v as u64),
-        2 => cpu.load16(addr).map(|v| v as u64),
-        4 => cpu.load32(addr).map(|v| v as u64),
-        _ => cpu.load64(addr),
+    let r = match kind {
+        MEM_LB => cpu.load8(addr).map(|x| x as i8 as u64),
+        MEM_LBU => cpu.load8(addr).map(|x| x as u64),
+        MEM_LH => cpu.load16(addr).map(|x| x as i16 as u64),
+        MEM_LHU => cpu.load16(addr).map(|x| x as u64),
+        MEM_LW => cpu.load32(addr).map(|x| x as i32 as u64),
+        MEM_LWU => cpu.load32(addr).map(|x| x as u64),
+        MEM_LD => cpu.load64(addr),
+        _ => match kind - MEM_SB {
+            0 => cpu.store8(addr, v as u8),
+            1 => cpu.store16(addr, v as u16),
+            2 => cpu.store32(addr, v as u32),
+            _ => cpu.store64(addr, v),
+        }
+        .map(|()| {
+            cpu.reservation_valid = false;
+            0
+        }),
     };
     match r {
-        Ok(v) => v,
+        Ok(x) => {
+            cpu.jit_value = x;
+            0
+        }
         Err(e) => {
             cpu.jit_exception = Some(e);
-            cpu.jit_fault = 1;
-            0
+            cpu.pc = pc;
+            count | EXIT_FAULT << 32
         }
     }
 }
 
-/// Stores a value to guest memory for the generated code.
-unsafe extern "C" fn jit_store(cpu: *mut Cpu, addr: u64, size: u64, v: u64) {
-    let cpu = &mut *cpu;
-    let r = match size {
-        1 => cpu.store8(addr, v as u8),
-        2 => cpu.store16(addr, v as u16),
-        4 => cpu.store32(addr, v as u32),
-        _ => cpu.store64(addr, v),
-    };
-    match r {
-        Ok(()) => cpu.reservation_valid = false,
-        Err(e) => {
-            cpu.jit_exception = Some(e);
-            cpu.jit_fault = 1;
-        }
-    }
+extern "C" {
+    /// The entries of the memory access stubs, MEM_STUB_STRIDE bytes
+    /// apart, indexed by the access kind.
+    fn rsemu_jit_mem_stubs();
 }
+
+// The memory access stubs called by the generated code. An entry
+// passes its kind to the common part, which saves the registers that
+// jit_mem may clobber (the generated code expects all registers
+// preserved) and calls jit_mem. If the access faulted, it returns from
+// the block instead: blocks keep RBP as the frame pointer and save no
+// other registers, so restoring RSP from RBP and popping RBP is the
+// block's epilogue.
+#[cfg(target_arch = "x86_64")]
+std::arch::global_asm!(
+    ".text",
+    ".p2align 4",
+    ".globl rsemu_jit_mem_stubs",
+    "rsemu_jit_mem_stubs:",
+    ".irp kind, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11",
+    ".p2align 4",
+    "mov $\\kind, %eax",
+    "jmp 2f",
+    ".endr",
+    ".p2align 4",
+    "2:",
+    "push %rbp",
+    "push %rcx",
+    "push %rdx",
+    "push %rsi",
+    "push %rdi",
+    "push %r8",
+    "push %r9",
+    "push %r10",
+    "push %r11",
+    "sub $256, %rsp",
+    "movdqu %xmm0, 0(%rsp)",
+    "movdqu %xmm1, 16(%rsp)",
+    "movdqu %xmm2, 32(%rsp)",
+    "movdqu %xmm3, 48(%rsp)",
+    "movdqu %xmm4, 64(%rsp)",
+    "movdqu %xmm5, 80(%rsp)",
+    "movdqu %xmm6, 96(%rsp)",
+    "movdqu %xmm7, 112(%rsp)",
+    "movdqu %xmm8, 128(%rsp)",
+    "movdqu %xmm9, 144(%rsp)",
+    "movdqu %xmm10, 160(%rsp)",
+    "movdqu %xmm11, 176(%rsp)",
+    "movdqu %xmm12, 192(%rsp)",
+    "movdqu %xmm13, 208(%rsp)",
+    "movdqu %xmm14, 224(%rsp)",
+    "movdqu %xmm15, 240(%rsp)",
+    "mov %rax, %r9",
+    "call {jit_mem}",
+    "test %rax, %rax",
+    "jnz 3f",
+    "movdqu 0(%rsp), %xmm0",
+    "movdqu 16(%rsp), %xmm1",
+    "movdqu 32(%rsp), %xmm2",
+    "movdqu 48(%rsp), %xmm3",
+    "movdqu 64(%rsp), %xmm4",
+    "movdqu 80(%rsp), %xmm5",
+    "movdqu 96(%rsp), %xmm6",
+    "movdqu 112(%rsp), %xmm7",
+    "movdqu 128(%rsp), %xmm8",
+    "movdqu 144(%rsp), %xmm9",
+    "movdqu 160(%rsp), %xmm10",
+    "movdqu 176(%rsp), %xmm11",
+    "movdqu 192(%rsp), %xmm12",
+    "movdqu 208(%rsp), %xmm13",
+    "movdqu 224(%rsp), %xmm14",
+    "movdqu 240(%rsp), %xmm15",
+    "add $256, %rsp",
+    "pop %r11",
+    "pop %r10",
+    "pop %r9",
+    "pop %r8",
+    "pop %rdi",
+    "pop %rsi",
+    "pop %rdx",
+    "pop %rcx",
+    "mov {value}(%rdi), %rax",
+    "pop %rbp",
+    "ret",
+    "3:",
+    "mov %rbp, %rsp",
+    "pop %rbp",
+    "ret",
+    jit_mem = sym jit_mem,
+    value = const OFS_VALUE,
+    options(att_syntax)
+);
 
 /// Checks for the generated code that the data accesses to the range
 /// [lo, hi] are on one page that the JIT TLB allows for loads, or for
@@ -1322,8 +1449,11 @@ fn compile_enter(arena: &mut CodeArena) -> Result<EnterFn, String> {
     Ok(unsafe { std::mem::transmute::<*const u8, EnterFn>(code) })
 }
 
-/// Number of parameters of the helper functions: load, store, exec.
-const HELPER_PARAMS: [usize; 4] = [3, 4, 3, 4];
+/// Helper stubs: exec and probe.
+const HELPER_EXEC: usize = 0;
+const HELPER_PROBE: usize = 1;
+/// Number of parameters of the helper functions.
+const HELPER_PARAMS: [usize; 2] = [3, 4];
 
 /// Returns the signature of the helper stubs called by the blocks.
 /// The stubs preserve all registers, so that the rarely taken helper
@@ -1336,30 +1466,25 @@ fn stub_signature(helper: usize) -> Signature {
     sig
 }
 
-/// Compiles the stubs that call the helper functions jit_load,
-/// jit_store, and jit_exec with the system calling convention. The
-/// load stub stores the loaded value in Cpu::jit_value.
-fn compile_stubs(arena: &mut CodeArena) -> Result<[u64; 4], String> {
-    let helpers = [
-        jit_load as *const () as i64,
-        jit_store as *const () as i64,
-        jit_exec as *const () as i64,
-        jit_probe as *const () as i64,
-    ];
-    let mut out = [0; 4];
+/// Compiles the stubs that call the helper functions jit_exec and
+/// jit_probe with the system calling convention. The probe stub stores
+/// its result in Cpu::jit_value.
+fn compile_stubs(arena: &mut CodeArena) -> Result<[u64; 2], String> {
+    let helpers = [jit_exec as *const () as i64, jit_probe as *const () as i64];
+    let mut out = [0; 2];
     for (h, addr) in helpers.into_iter().enumerate() {
         let code = compile_glue(arena, stub_signature(h), |b, p| {
             let mut sig = Signature::new(CallConv::SystemV);
             for _ in 0..HELPER_PARAMS[h] {
                 sig.params.push(AbiParam::new(types::I64));
             }
-            if h == 0 || h == 3 {
+            if h == HELPER_PROBE {
                 sig.returns.push(AbiParam::new(types::I64));
             }
             let sigref = b.import_signature(sig);
             let callee = b.ins().iconst(types::I64, addr);
             let call = b.ins().call_indirect(sigref, callee, p);
-            if h == 0 || h == 3 {
+            if h == HELPER_PROBE {
                 let v = b.inst_results(call)[0];
                 b.ins().store(MemFlagsData::trusted(), v, p[0], OFS_VALUE);
             }
@@ -1485,14 +1610,14 @@ struct CodegenEnv {
 #[derive(Clone, Copy)]
 enum Sym {
     Tlb,
-    Load,
-    Store,
     Exec,
     JCache,
     Probe,
+    Mem,
 }
 
-pub(super) const NUM_SYMS: usize = 6;
+/// Symbols: the Sym values, then the memory access stub entries.
+pub(super) const NUM_SYMS: usize = Sym::Mem as usize + MEM_KINDS as usize;
 
 /// Values of the symbols, indexed by Sym.
 const OFS_X: i32 = offset_of!(Cpu, x) as i32;
@@ -1551,10 +1676,9 @@ struct Translator<'a, 'b> {
     exit_blk: Option<cranelift_codegen::ir::Block>,
     chain_blk: Option<cranelift_codegen::ir::Block>,
     /// Signatures of the helper functions.
-    load_sig: Option<SigRef>,
-    store_sig: Option<SigRef>,
     exec_sig: Option<SigRef>,
     probe_sig: Option<SigRef>,
+    mem_sig: Option<SigRef>,
     /// Groups of stack accesses that share one TLB check: the group and
     /// the offset from the group base of the accesses by guest PC.
     group_of: HashMap<u64, (usize, i64)>,
@@ -1600,10 +1724,9 @@ impl<'a, 'b> Translator<'a, 'b> {
             vars: [None; 32],
             exit_blk: None,
             chain_blk: None,
-            load_sig: None,
-            store_sig: None,
             exec_sig: None,
             probe_sig: None,
+            mem_sig: None,
             group_of: HashMap::new(),
             groups: Vec::new(),
         }
@@ -1616,6 +1739,14 @@ impl<'a, 'b> Translator<'a, 'b> {
         self.b
             .ins()
             .load(self.ptr, f, self.cpu, OFS_ADDRS + 8 * s as i32)
+    }
+
+    /// Returns the host address of the symbol with index i for a slow
+    /// path. The load is not hoisted into the fast path, where it would
+    /// occupy a register.
+    fn sym_cold(&mut self, i: i32) -> Value {
+        let f = MemFlagsData::trusted().with_readonly();
+        self.b.ins().load(self.ptr, f, self.cpu, OFS_ADDRS + 8 * i)
     }
 
     fn flags() -> MemFlagsData {
@@ -1894,8 +2025,8 @@ impl<'a, 'b> Translator<'a, 'b> {
             // Fill the TLB entry and check again; run the accesses in
             // the interpreter if that does not help.
             self.b.switch_to_block(slow);
-            let sigref = self.helper_sig(3);
-            let callee = self.sym(Sym::Probe);
+            let sigref = self.helper_sig(HELPER_PROBE);
+            let callee = self.sym_cold(Sym::Probe as i32);
             let w = self.iconst(write as i64);
             self.b
                 .ins()
@@ -1906,6 +2037,8 @@ impl<'a, 'b> Translator<'a, 'b> {
                 .load(types::I64, Self::flags(), self.cpu, OFS_VALUE);
             let refill = self.b.create_block();
             let out = self.b.create_block();
+            self.b.set_cold_block(refill);
+            self.b.set_cold_block(out);
             self.b.ins().brif(ok, refill, &[], out, &[]);
             self.b.switch_to_block(out);
             let pcv = self.pc_value(pc);
@@ -2089,21 +2222,17 @@ impl<'a, 'b> Translator<'a, 'b> {
 
     /// Returns the signature reference, importing the signature with
     /// the parameter count and return on first use.
-    fn helper_sig(&mut self, which: u8) -> SigRef {
+    fn helper_sig(&mut self, which: usize) -> SigRef {
         let slot = match which {
-            0 => &self.load_sig,
-            1 => &self.store_sig,
-            2 => &self.exec_sig,
+            HELPER_EXEC => &self.exec_sig,
             _ => &self.probe_sig,
         };
         if let Some(s) = *slot {
             return s;
         }
-        let s = self.b.import_signature(stub_signature(which as usize));
+        let s = self.b.import_signature(stub_signature(which));
         match which {
-            0 => self.load_sig = Some(s),
-            1 => self.store_sig = Some(s),
-            2 => self.exec_sig = Some(s),
+            HELPER_EXEC => self.exec_sig = Some(s),
             _ => self.probe_sig = Some(s),
         }
         s
@@ -2144,29 +2273,17 @@ impl<'a, 'b> Translator<'a, 'b> {
 
         // Slow path: call the CPU.
         self.b.switch_to_block(slow);
-        let sigref = self.helper_sig(0);
-        let callee = self.sym(Sym::Load);
-        let sz = self.iconst(size);
-        self.b
-            .ins()
-            .call_indirect(sigref, callee, &[self.cpu, addr, sz]);
-        let raw = self
-            .b
-            .ins()
-            .load(types::I64, Self::flags(), self.cpu, OFS_VALUE);
-        let v = match (size, signed) {
-            (1, true) => {
-                let n = self.b.ins().ireduce(types::I8, raw);
-                self.b.ins().sextend(types::I64, n)
-            }
-            (2, true) => {
-                let n = self.b.ins().ireduce(types::I16, raw);
-                self.b.ins().sextend(types::I64, n)
-            }
-            (4, true) => self.sext32(raw),
-            _ => raw,
+        let kind = match (size, signed) {
+            (1, true) => MEM_LB,
+            (1, false) => MEM_LBU,
+            (2, true) => MEM_LH,
+            (2, false) => MEM_LHU,
+            (4, true) => MEM_LW,
+            (4, false) => MEM_LWU,
+            _ => MEM_LD,
         };
-        self.check_fault(k, pc, done, &[v]);
+        let v = self.mem_slow(k, pc, kind, addr, addr);
+        self.b.ins().jump(done, &[v.into()]);
 
         self.b.switch_to_block(done);
         self.b.block_params(done)[0]
@@ -2223,15 +2340,33 @@ impl<'a, 'b> Translator<'a, 'b> {
         }
 
         self.b.switch_to_block(slow);
-        let sigref = self.helper_sig(1);
-        let callee = self.sym(Sym::Store);
-        let sz = self.iconst(size);
-        self.b
-            .ins()
-            .call_indirect(sigref, callee, &[self.cpu, addr, sz, v]);
-        self.check_fault(k, pc, done, &[]);
+        let kind = MEM_SB + size.trailing_zeros() as u64;
+        self.mem_slow(k, pc, kind, addr, v);
+        self.b.ins().jump(done, &[]);
 
         self.b.switch_to_block(done);
+    }
+
+    /// Calls the memory access stub of the kind for the access of the
+    /// instruction at pc. Returns the loaded value. A fault does not
+    /// return: the stub exits the block.
+    fn mem_slow(&mut self, k: u64, pc: u64, kind: u64, addr: Value, v: Value) -> Value {
+        let sigref = match self.mem_sig {
+            Some(s) => s,
+            None => {
+                let s = self.b.import_signature(mem_stub_signature());
+                self.mem_sig = Some(s);
+                s
+            }
+        };
+        let callee = self.sym_cold(Sym::Mem as i32 + kind as i32);
+        let count = self.total(k + 1);
+        let pcv = self.pc_value(pc);
+        let call = self
+            .b
+            .ins()
+            .call_indirect(sigref, callee, &[self.cpu, addr, count, pcv, v]);
+        self.b.inst_results(call)[0]
     }
 
     /// Returns the host address of the access at pc if it is in a
@@ -2335,7 +2470,7 @@ impl<'a, 'b> Translator<'a, 'b> {
 
     /// Executes the instruction in the interpreter and reloads rd.
     fn helper(&mut self, k: u64, bi: &BlockInstr, stop: bool) {
-        let sigref = self.helper_sig(2);
+        let sigref = self.helper_sig(HELPER_EXEC);
         let callee = self.sym(Sym::Exec);
         let packed = self.iconst(pack_instr(&bi.instr) as i64);
         let raw = self.iconst(bi.raw as i64);
@@ -2944,12 +3079,14 @@ impl Cpu {
     fn jit_addresses(&self) -> [u64; NUM_SYMS] {
         let mut syms = [0; NUM_SYMS];
         syms[Sym::Tlb as usize] = self.tlb.as_ptr() as u64;
-        let stubs = self.jit.as_ref().map_or([0; 4], |j| j.stubs);
-        syms[Sym::Probe as usize] = stubs[3];
-        syms[Sym::Load as usize] = stubs[0];
-        syms[Sym::Store as usize] = stubs[1];
-        syms[Sym::Exec as usize] = stubs[2];
+        let stubs = self.jit.as_ref().map_or([0; 2], |j| j.stubs);
+        syms[Sym::Exec as usize] = stubs[HELPER_EXEC];
+        syms[Sym::Probe as usize] = stubs[HELPER_PROBE];
         syms[Sym::JCache as usize] = self.jit.as_ref().map_or(0, |j| j.jcache.as_ptr() as u64);
+        for kind in 0..MEM_KINDS {
+            syms[Sym::Mem as usize + kind as usize] =
+                rsemu_jit_mem_stubs as *const () as u64 + kind * MEM_STUB_STRIDE;
+        }
         syms
     }
 
