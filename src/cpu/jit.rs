@@ -22,6 +22,10 @@
 //! starts a new epoch. A block compiled in an older epoch is checked
 //! against the current guest code bytes before it runs again.
 //!
+//! Blocks chain to each other: an exit looks up the next block in the
+//! jump cache and tail-calls it, up to an instruction budget, so most
+//! block transitions do not return to the dispatcher.
+//!
 //! The generated code refers to host addresses through relocations,
 //! so it can be saved to a code cache file and loaded by a later run.
 //! Loaded blocks are validated against the guest code like blocks from
@@ -39,7 +43,7 @@ use cranelift_codegen::ir::{
     types, AbiParam, ExternalName, GlobalValue, GlobalValueData, InstBuilder, MemFlagsData,
     Signature, Type, UserExternalName, Value,
 };
-use cranelift_codegen::isa::OwnedTargetIsa;
+use cranelift_codegen::isa::{CallConv, OwnedTargetIsa};
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_codegen::Context;
 use cranelift_codegen::FinalizedRelocTarget;
@@ -51,10 +55,38 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-/// Compiled block entry point. Returns the number of executed
+/// Compiled block entry point. Blocks use Cranelift's tail calling
+/// convention with the arguments (cpu: *mut Cpu, count: u64), where
+/// count is the number of instructions executed by the chained blocks
+/// before this one. A block returns the total number of executed
 /// instructions in the low 32 bits and the exit status in the high
-/// bits.
-type BlockFn = unsafe extern "C" fn(*mut Cpu) -> u64;
+/// bits. The dispatcher enters blocks through the enter trampoline.
+type BlockFn = *const u8;
+
+/// Trampoline that calls the block with the system calling convention.
+type EnterFn = unsafe extern "C" fn(*mut Cpu, BlockFn) -> u64;
+
+/// Number of entries in the jump cache.
+const JCACHE_SIZE: usize = 4096;
+
+/// Jump cache entry. Blocks jump directly to the next block through
+/// the jump cache, which maps a guest virtual PC to its block. An entry
+/// is valid if its key matches Cpu::jit_jkey, which combines the
+/// privilege mode and fetch translation state with a generation that
+/// changes on TLB flushes and code changes.
+#[repr(C, align(32))]
+#[derive(Clone, Copy)]
+struct JEntry {
+    vpc: u64,
+    key: u64,
+    func: BlockFn,
+}
+
+const EMPTY_JENTRY: JEntry = JEntry {
+    vpc: u64::MAX,
+    key: 0,
+    func: std::ptr::null(),
+};
 
 /// Exit status: the block completed and PC holds the next PC.
 const EXIT_OK: u64 = 0;
@@ -77,7 +109,8 @@ pub struct JitStats {
     pub compiled_instrs: u64,
     pub compile_time: Duration,
     pub invalidated: u64,
-    pub block_runs: u64,
+    /// Calls from the dispatcher into compiled code.
+    pub dispatches: u64,
     /// Instructions executed by compiled code.
     pub jit_instrs: u64,
     /// Blocks reused for the same code at another RAM location.
@@ -92,12 +125,12 @@ impl std::fmt::Display for JitStats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "JIT: {} blocks ({} instructions) compiled in {:?}, {} block runs, \
+            "JIT: {} blocks ({} instructions) compiled in {:?}, {} dispatches, \
              {} instructions executed, {} invalidated",
             self.compiled,
             self.compiled_instrs,
             self.compile_time,
-            self.block_runs,
+            self.dispatches,
             self.jit_instrs,
             self.invalidated
         )?;
@@ -238,6 +271,10 @@ pub struct Jit {
     /// Counter for polling the background compiler.
     poll: u32,
     arena: CodeArena,
+    /// Trampoline arena and entry.
+    _enter_arena: CodeArena,
+    enter: EnterFn,
+    jcache: Box<[JEntry]>,
     cache: Box<[CacheEntry]>,
     blocks: Vec<Block>,
     index: HashMap<(u64, u64), u32, BuildHasherDefault<FxHasher>>,
@@ -571,11 +608,6 @@ fn unpack_instr(v: u64) -> Instr {
     }
 }
 
-/// Placeholder for a block function before the block is installed.
-unsafe extern "C" fn invalid_block(_cpu: *mut Cpu) -> u64 {
-    unreachable!("JIT block not installed")
-}
-
 /// Executes the instruction in the interpreter for the generated code.
 unsafe extern "C" fn jit_exec(cpu: *mut Cpu, packed: u64, raw: u64) {
     let cpu = &mut *cpu;
@@ -653,9 +685,14 @@ impl Jit {
         } else {
             (Some(Compiler::new()?), None)
         };
+        let mut enter_arena = CodeArena::new(PAGE_SIZE as usize)?;
+        let enter = compile_enter(&mut enter_arena)?;
         Ok(Jit {
             compiler,
             worker,
+            _enter_arena: enter_arena,
+            enter,
+            jcache: vec![EMPTY_JENTRY; JCACHE_SIZE].into_boxed_slice(),
             pending: HashSet::default(),
             poll: 0,
             arena: CodeArena::new(CODE_ARENA_SIZE)?,
@@ -892,8 +929,7 @@ impl Jit {
         // SAFETY: the code was just copied to the arena and the
         // relocations are inside it.
         unsafe { apply_relocs(entry as *mut u8, &block.relocs, syms) };
-        // SAFETY: the code was compiled with the BlockFn signature.
-        let func: BlockFn = unsafe { std::mem::transmute(entry) };
+        let func: BlockFn = entry;
         block.func = func;
         block.size = machine_code.len() as u32;
         let (vpc, start) = (block.vpc, block.start);
@@ -919,6 +955,7 @@ impl Jit {
         self.index.clear();
         self.by_code.clear();
         self.code_filter.fill(0);
+        self.jcache.fill(EMPTY_JENTRY);
         self.arena.reset();
     }
 
@@ -926,7 +963,7 @@ impl Jit {
     fn install(&mut self, r: Compiled, syms: &Syms) -> Result<BlockFn, String> {
         let req = r.request;
         let block = Block {
-            func: invalid_block,
+            func: std::ptr::null(),
             epoch: req.epoch,
             phys: req.code_ofs,
             code: req.code,
@@ -995,12 +1032,60 @@ struct Compiler {
     fctx: FunctionBuilderContext,
 }
 
+/// Returns the signature of the block functions.
+fn block_signature(ptr: Type) -> Signature {
+    let mut sig = Signature::new(CallConv::Tail);
+    sig.params.push(AbiParam::new(ptr));
+    sig.params.push(AbiParam::new(types::I64));
+    sig.returns.push(AbiParam::new(types::I64));
+    sig
+}
+
+/// Compiles the trampoline that calls a block from Rust.
+fn compile_enter(arena: &mut CodeArena) -> Result<EnterFn, String> {
+    let isa = host_isa()?;
+    let ptr = isa.pointer_type();
+    let mut ctx = Context::new();
+    let mut fctx = FunctionBuilderContext::new();
+    let mut sig = Signature::new(isa.default_call_conv());
+    sig.params.push(AbiParam::new(ptr));
+    sig.params.push(AbiParam::new(ptr));
+    sig.returns.push(AbiParam::new(types::I64));
+    ctx.func.signature = sig;
+    {
+        let mut b = FunctionBuilder::new(&mut ctx.func, &mut fctx);
+        let entry = b.create_block();
+        b.append_block_params_for_function_params(entry);
+        b.switch_to_block(entry);
+        let (cpu, func) = (b.block_params(entry)[0], b.block_params(entry)[1]);
+        let sigref = b.import_signature(block_signature(ptr));
+        let zero = b.ins().iconst(types::I64, 0);
+        let call = b.ins().call_indirect(sigref, func, &[cpu, zero]);
+        let r = b.inst_results(call)[0];
+        b.ins().return_(&[r]);
+        b.seal_all_blocks();
+        b.finalize(isa.frontend_config());
+    }
+    let compiled = ctx
+        .compile(&*isa, &mut ControlPlane::default())
+        .map_err(|e| format!("JIT trampoline: {:?}", e.inner))?;
+    let code = arena
+        .add(compiled.code_buffer())
+        .ok_or("JIT trampoline: no space")?;
+    // SAFETY: the code was compiled with the EnterFn signature.
+    Ok(unsafe { std::mem::transmute::<*const u8, EnterFn>(code) })
+}
+
 /// Returns the code generator for the host.
 fn host_isa() -> Result<OwnedTargetIsa, String> {
     let mut flags = settings::builder();
     flags.set("opt_level", "speed").map_err(|e| e.to_string())?;
     flags
         .set("enable_verifier", "false")
+        .map_err(|e| e.to_string())?;
+    // Required by tail calls.
+    flags
+        .set("preserve_frame_pointers", "true")
         .map_err(|e| e.to_string())?;
     cranelift_native::builder()
         .map_err(|e| e.to_string())?
@@ -1022,15 +1107,13 @@ impl Compiler {
         let start = Instant::now();
         let ptr = self.isa.pointer_type();
         self.ctx.clear();
-        let mut sig = Signature::new(self.isa.default_call_conv());
-        sig.params.push(AbiParam::new(ptr));
-        sig.returns.push(AbiParam::new(types::I64));
-        self.ctx.func.signature = sig;
+        self.ctx.func.signature = block_signature(ptr);
+        let helper_cc = self.isa.default_call_conv();
 
         let frontend_config = self.isa.frontend_config();
         {
             let mut b = FunctionBuilder::new(&mut self.ctx.func, &mut self.fctx);
-            let mut t = Translator::new(&mut b, ptr, req.env, req.vpc);
+            let mut t = Translator::new(&mut b, ptr, helper_cc, req.env, req.vpc);
             t.translate(&req.instrs);
             b.seal_all_blocks();
             b.finalize(frontend_config);
@@ -1111,9 +1194,10 @@ enum Sym {
     Load,
     Store,
     Exec,
+    JCache,
 }
 
-const NUM_SYMS: usize = 6;
+const NUM_SYMS: usize = 7;
 
 /// Values of the symbols, indexed by Sym.
 type Syms = [u64; NUM_SYMS];
@@ -1146,6 +1230,13 @@ const OFS_PC: i32 = offset_of!(Cpu, pc) as i32;
 const OFS_DATA_KEY: i32 = offset_of!(Cpu, data_key) as i32;
 const OFS_FAULT: i32 = offset_of!(Cpu, jit_fault) as i32;
 const OFS_RESV: i32 = offset_of!(Cpu, reservation_valid) as i32;
+const OFS_JKEY: i32 = offset_of!(Cpu, jit_jkey) as i32;
+
+const JE_VPC: i32 = offset_of!(JEntry, vpc) as i32;
+const JE_KEY: i32 = offset_of!(JEntry, key) as i32;
+const JE_FUNC: i32 = offset_of!(JEntry, func) as i32;
+const JENTRY_SHIFT: i64 = std::mem::size_of::<JEntry>().trailing_zeros() as i64;
+const _: () = assert!(std::mem::size_of::<JEntry>().is_power_of_two());
 
 const TLB_TAG: i32 = offset_of!(TlbEntry, tag) as i32;
 const TLB_HOST_DELTA: i32 = offset_of!(TlbEntry, host_delta) as i32;
@@ -1161,6 +1252,8 @@ const LOOP_LIMIT: i64 = 4096;
 struct Translator<'a, 'b> {
     b: &'a mut FunctionBuilder<'b>,
     ptr: Type,
+    /// Calling convention of the helper functions.
+    helper_cc: CallConv,
     env: CodegenEnv,
     cpu: Value,
     /// Loop header following the register loads.
@@ -1177,17 +1270,26 @@ struct Translator<'a, 'b> {
 }
 
 impl<'a, 'b> Translator<'a, 'b> {
-    fn new(b: &'a mut FunctionBuilder<'b>, ptr: Type, env: CodegenEnv, start_vpc: u64) -> Self {
+    fn new(
+        b: &'a mut FunctionBuilder<'b>,
+        ptr: Type,
+        helper_cc: CallConv,
+        env: CodegenEnv,
+        start_vpc: u64,
+    ) -> Self {
         let entry = b.create_block();
         b.append_block_params_for_function_params(entry);
         b.switch_to_block(entry);
         let cpu = b.block_params(entry)[0];
+        let count_in = b.block_params(entry)[1];
         let entry_pc = b.ins().load(types::I64, Self::flags(), cpu, OFS_PC);
         let header = b.create_block();
         let count = b.declare_var(types::I64);
+        b.def_var(count, count_in);
         Translator {
             b,
             ptr,
+            helper_cc,
             env,
             cpu,
             header,
@@ -1304,13 +1406,60 @@ impl<'a, 'b> Translator<'a, 'b> {
         self.exit_with(pc, c, status);
     }
 
+    /// Continues at the guest PC pc after n instructions of the current
+    /// iteration: jumps directly to the next block if the jump cache
+    /// has one and the instruction budget allows, otherwise returns to
+    /// the dispatcher.
+    fn chain_exit(&mut self, pc: Value, n: u64) {
+        let f = Self::flags();
+        let total = self.total(n);
+        self.b.ins().store(f, pc, self.cpu, OFS_PC);
+        let ret = self.b.create_block();
+        let lookup = self.b.create_block();
+        let check_key = self.b.create_block();
+        let jump = self.b.create_block();
+        self.b.set_cold_block(ret);
+
+        let more = self
+            .b
+            .ins()
+            .icmp_imm_s(IntCC::SignedLessThan, total, LOOP_LIMIT);
+        self.b.ins().brif(more, lookup, &[], ret, &[]);
+
+        self.b.switch_to_block(lookup);
+        let idx = self.b.ins().ushr_imm_s(pc, 1);
+        let idx = self.b.ins().band_imm_s(idx, JCACHE_SIZE as i64 - 1);
+        let ofs = self.b.ins().ishl_imm_s(idx, JENTRY_SHIFT);
+        let jcache = self.sym(Sym::JCache);
+        let ent = self.b.ins().iadd(jcache, ofs);
+        let e_vpc = self.b.ins().load(types::I64, f, ent, JE_VPC);
+        let hit = self.b.ins().icmp(IntCC::Equal, e_vpc, pc);
+        self.b.ins().brif(hit, check_key, &[], ret, &[]);
+
+        self.b.switch_to_block(check_key);
+        let e_key = self.b.ins().load(types::I64, f, ent, JE_KEY);
+        let key = self.b.ins().load(types::I64, f, self.cpu, OFS_JKEY);
+        let ok = self.b.ins().icmp(IntCC::Equal, e_key, key);
+        self.b.ins().brif(ok, jump, &[], ret, &[]);
+
+        self.b.switch_to_block(jump);
+        let func = self.b.ins().load(self.ptr, f, ent, JE_FUNC);
+        let sigref = self.b.import_signature(block_signature(self.ptr));
+        self.b
+            .ins()
+            .return_call_indirect(sigref, func, &[self.cpu, total]);
+
+        self.b.switch_to_block(ret);
+        self.b.ins().return_(&[total]);
+    }
+
     /// Jumps to the guest PC target after n instructions of the
     /// current iteration. A jump to the block start loops in native
     /// code until the loop limit is reached.
     fn jump_to(&mut self, target: u64, n: u64) {
         let pcv = self.pc_value(target);
         if target != self.start_vpc {
-            self.jump_exit(pcv, n, EXIT_OK);
+            self.chain_exit(pcv, n);
             return;
         }
         let total = self.total(n);
@@ -1328,8 +1477,6 @@ impl<'a, 'b> Translator<'a, 'b> {
     fn translate(&mut self, instrs: &[BlockInstr]) {
         self.load_regs(instrs);
 
-        let zero = self.iconst(0);
-        self.b.def_var(self.count, zero);
         self.b.ins().jump(self.header, &[]);
         self.b.switch_to_block(self.header);
 
@@ -1420,7 +1567,7 @@ impl<'a, 'b> Translator<'a, 'b> {
 
         // Slow path: call the CPU.
         self.b.switch_to_block(slow);
-        let mut sig = Signature::new(self.b.func.signature.call_conv);
+        let mut sig = Signature::new(self.helper_cc);
         sig.params.push(AbiParam::new(self.ptr));
         sig.params.push(AbiParam::new(types::I64));
         sig.params.push(AbiParam::new(types::I64));
@@ -1504,7 +1651,7 @@ impl<'a, 'b> Translator<'a, 'b> {
         }
 
         self.b.switch_to_block(slow);
-        let mut sig = Signature::new(self.b.func.signature.call_conv);
+        let mut sig = Signature::new(self.helper_cc);
         sig.params.push(AbiParam::new(self.ptr));
         sig.params.push(AbiParam::new(types::I64));
         sig.params.push(AbiParam::new(types::I64));
@@ -1578,7 +1725,7 @@ impl<'a, 'b> Translator<'a, 'b> {
 
     /// Executes the instruction in the interpreter and reloads rd.
     fn helper(&mut self, k: u64, bi: &BlockInstr) {
-        let mut sig = Signature::new(self.b.func.signature.call_conv);
+        let mut sig = Signature::new(self.helper_cc);
         sig.params.push(AbiParam::new(self.ptr));
         sig.params.push(AbiParam::new(types::I64));
         sig.params.push(AbiParam::new(types::I64));
@@ -1974,7 +2121,7 @@ impl<'a, 'b> Translator<'a, 'b> {
                 let target = ins!().band_imm_s(t, !1);
                 let link = self.pc_value(next);
                 self.set(rd, link);
-                self.jump_exit(target, k + 1, EXIT_OK);
+                self.chain_exit(target, k + 1);
                 return true;
             }
             Lui => self.iconst(imm),
@@ -2169,6 +2316,7 @@ impl Cpu {
         syms[Sym::Load as usize] = jit_load as *const () as u64;
         syms[Sym::Store as usize] = jit_store as *const () as u64;
         syms[Sym::Exec as usize] = jit_exec as *const () as u64;
+        syms[Sym::JCache as usize] = self.jit.as_ref().map_or(0, |j| j.jcache.as_ptr() as u64);
         syms
     }
 
@@ -2189,6 +2337,7 @@ impl Cpu {
             if let Some(jit) = self.jit.as_mut() {
                 jit.new_epoch();
             }
+            self.new_jit_gen();
         }
     }
 
@@ -2197,6 +2346,7 @@ impl Cpu {
         if let Some(jit) = self.jit.as_mut() {
             jit.new_epoch();
         }
+        self.new_jit_gen();
     }
 
     /// Runs the compiled block at PC if there is one. Returns Ok(true)
@@ -2282,14 +2432,24 @@ impl Cpu {
     /// Runs the compiled block. Returns Ok(true) if the block executed
     /// instructions.
     fn jit_run(&mut self, func: BlockFn) -> Result<bool, Exception> {
+        let jit = self.jit.as_mut().unwrap();
+        // Blocks that end at this PC can jump directly to the block
+        // from now on.
+        let pc = self.pc;
+        jit.jcache[((pc >> 1) as usize) & (JCACHE_SIZE - 1)] = JEntry {
+            vpc: pc,
+            key: self.jit_jkey,
+            func,
+        };
+        let enter = jit.enter;
         // SAFETY: the block was compiled for this CPU's memory and TLB
         // layout and accesses the CPU only through the pointer.
-        let r = unsafe { func(self as *mut Cpu) };
+        let r = unsafe { enter(self as *mut Cpu, func) };
         let count = r & 0xffff_ffff;
         self.time = self.time.wrapping_add(count);
         self.instret = self.instret.wrapping_add(count);
         if let Some(jit) = self.jit.as_mut() {
-            jit.stats.block_runs += 1;
+            jit.stats.dispatches += 1;
             jit.stats.jit_instrs += count;
         }
         if r >> 32 == EXIT_FAULT {
@@ -2306,7 +2466,7 @@ impl Cpu {
 }
 
 /// Code cache file format version.
-const CACHE_VERSION: u32 = 1;
+const CACHE_VERSION: u32 = 2;
 const CACHE_MAGIC: &[u8; 8] = b"RSEMUJIT";
 /// Blocks loaded from the cache but not used in this many runs are
 /// dropped from the cache.
@@ -2425,7 +2585,7 @@ impl Jit {
                 continue;
             }
             let block = Block {
-                func: invalid_block,
+                func: std::ptr::null(),
                 epoch: UNVALIDATED,
                 phys: code_ofs,
                 code,
@@ -2477,8 +2637,7 @@ impl Jit {
                 continue;
             }
             // SAFETY: the block's machine code is in the arena.
-            let machine_code =
-                unsafe { std::slice::from_raw_parts(b.func as *const u8, b.size as usize) };
+            let machine_code = unsafe { std::slice::from_raw_parts(b.func, b.size as usize) };
             out.extend_from_slice(&b.vpc.to_le_bytes());
             out.extend_from_slice(&b.start.to_le_bytes());
             out.extend_from_slice(&b.phys.to_le_bytes());

@@ -24,6 +24,13 @@ impl Cpu {
         for e in self.tlb.iter_mut() {
             e.tag = u64::MAX;
         }
+        self.new_jit_gen();
+    }
+
+    /// Invalidates the JIT jump cache entries.
+    pub(super) fn new_jit_gen(&mut self) {
+        self.jit_gen += 1;
+        self.jit_jkey = self.jit_gen << 8 | self.fetch_key as u64;
     }
 
     /// Recomputes the cached translation state after changes to the
@@ -38,6 +45,7 @@ impl Cpu {
         let bits = ((ms.sum() as u8) << 2) | ((ms.mxr() as u8) << 3);
         self.data_key = self.data_mode as u8 | bits;
         self.fetch_key = self.mode as u8 | bits;
+        self.jit_jkey = self.jit_gen << 8 | self.fetch_key as u64;
     }
 
     /// Translates the virtual address for the access type. The access

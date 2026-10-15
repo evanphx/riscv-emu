@@ -175,9 +175,17 @@ thread while the interpreter keeps running:
   floating point, atomic, and vector instructions call the interpreter
   from compiled code. CSR, system, and privileged instructions end the
   trace and run in the interpreter.
-- Each trace returns the number of instructions it executed, so time,
-  `instret`, and the interrupt checks advance exactly as in the
-  interpreter.
+- Traces jump directly to each other: an exit to a known PC or a
+  `jalr` looks up the target in a jump cache and tail-calls the next
+  trace, so most transitions never return to the dispatcher. Jump cache
+  entries are tagged with the privilege mode and a generation that
+  changes on TLB flushes, `satp` writes, and code changes, so a jump
+  never bypasses an address translation or code check that the
+  dispatcher would make.
+- A chain of traces runs at most 4096 instructions before returning to
+  the dispatcher, which then checks for interrupts. Traces return the
+  number of instructions they executed, so time and `instret` advance
+  exactly as in the interpreter.
 - `fence.i` and CPU stores to pages that contain compiled code start a
   new epoch; traces from an older epoch are checked against the
   current guest code before they run again.
@@ -224,14 +232,17 @@ use the default settings.
 Host wall-clock times on a shared 2-core x86-64 machine. The md5sum,
 shell loop, and sort benchmarks run inside the booted buildroot guest.
 
-| Workload | Go original | Rust interpreter | Rust JIT |
-|----------|------------:|-----------------:|---------:|
-| Linux boot to login prompt | 9.6 s | 9.7 s | 4.2 s |
-| `fibo(35)` (userspace mode) | 3.48 s | 4.24 s | 0.99 s |
-| `fibo(40)` (userspace mode) | 34.4 s | 38.5 s | 8.3 s |
-| md5sum of 8 MB in the guest | – | 1.78 s | 0.67 s |
-| shell loop, 20000 iterations | – | 4.40 s | 1.24 s |
-| `seq 1 30000 \| sort -r` | – | 2.05 s | 0.75 s |
+| Workload | Go original | Rust interpreter | Rust JIT | JIT, warm `-jit-cache` |
+|----------|------------:|-----------------:|---------:|-----------------------:|
+| Linux boot to login prompt | 9.6 s | 9.7 s | 3.2 s | 2.5–2.9 s |
+| `fibo(35)` (userspace mode) | 3.48 s | 4.24 s | 0.49 s | |
+| `fibo(40)` (userspace mode) | 34.4 s | 38.5 s | 6.0 s | |
+| md5sum of 8 MB in the guest | – | 1.78 s | 0.51 s | 0.51 s |
+| shell loop, 20000 iterations | – | 4.40 s | 0.86 s | 0.76 s |
+| `seq 1 30000 \| sort -r` | – | 2.05 s | 0.51 s | 0.37 s |
+
+The JIT times are medians of three runs; the machine is shared, so
+individual runs vary by about 10%.
 
 ## Tests
 

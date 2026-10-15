@@ -185,6 +185,12 @@ pub struct Cpu {
     data_mode: Mode,
     data_key: u8,
     fetch_key: u8,
+    /// Generation of the instruction fetch translations and the guest
+    /// code. Changes on TLB flushes and JIT code epochs.
+    jit_gen: u64,
+    /// Key of the valid JIT jump cache entries: the generation and the
+    /// fetch key.
+    jit_jkey: u64,
 
     // Instruction fetch caches.
     code_vpn: u64,
@@ -263,6 +269,8 @@ impl Cpu {
             data_mode: Mode::M,
             data_key: 0,
             fetch_key: 0,
+            jit_gen: 0,
+            jit_jkey: 0,
             code_vpn: INVALID_PAGENUM,
             code_ofs: 0,
             decode_cache: vec![DecodeEntry::default(); DECODE_CACHE_SIZE]
