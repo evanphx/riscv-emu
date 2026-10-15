@@ -12,6 +12,7 @@ pub mod isa;
 pub mod logger;
 pub mod memory;
 pub mod mmu;
+pub mod network;
 pub mod params;
 pub mod system;
 pub mod virtio;
