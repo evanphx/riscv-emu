@@ -148,6 +148,7 @@ impl BlkShared {
                             }
                         };
                         let n = read_full_at(&self.file, buf, file_offset);
+                        g.note_write(req.addr, req.len as u64);
                         match n {
                             Ok(n) => {
                                 self.st_read.fetch_add(n as u64, Ordering::Relaxed);

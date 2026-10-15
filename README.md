@@ -91,8 +91,8 @@ Main flags:
 | `-gpu id=gpu0,width=1024,height=768` | add a VirtIO GPU with keyboard and pointer |
 | `-nographic` | ignore GPU devices |
 | `-jit` | enable the JIT compiler |
-| `-jit-threshold n` | executions before a block is compiled (default 1000) |
-| `-jit-sync` | compile blocks synchronously, for deterministic runs |
+| `-jit-threshold n` | executions before a block is compiled (default 1000; implies `-jit`) |
+| `-jit-sync` | compile blocks synchronously, for deterministic runs (implies `-jit`) |
 | `-jit-cache file` | load and save JIT compiled code in `file` (implies `-jit`) |
 | `-cooked` | don't put the terminal into raw mode |
 | `-htif` | enable the HTIF tohost/fromhost device for ELF kernels |
@@ -191,9 +191,14 @@ thread while the interpreter keeps running:
   the dispatcher, which then checks for interrupts. Traces return the
   number of instructions they executed, so time and `instret` advance
   exactly as in the interpreter.
-- `fence.i` and CPU stores to pages that contain compiled code start a
-  new epoch; traces from an older epoch are checked against the
-  current guest code before they run again.
+- Writes to pages that contain compiled code, by the CPU or by device
+  DMA, mark the code as modified. A CPU store, or the next `fence.i`
+  after a DMA write, starts a new epoch; traces from an older epoch are
+  checked against the current guest code before they run again. A
+  `fence.i` without modified code costs nothing, which matters because
+  Linux executes about a thousand of them while booting.
+- `sfence.vma` with an address flushes only that page from the TLB and
+  the jump cache.
 
 The machine code is generated with `cranelift-codegen` (without its
 optimization passes, which do not speed up this code but slow down

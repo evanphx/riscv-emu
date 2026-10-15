@@ -149,13 +149,13 @@ const FLAGS: &[FlagSpec] = &[
         name: "jit-threshold",
         boolean: false,
         multi: false,
-        usage: "executions before a block is JIT compiled (default 1000)",
+        usage: "executions before a block is JIT compiled (default 1000, implies -jit)",
     },
     FlagSpec {
         name: "jit-sync",
         boolean: true,
         multi: false,
-        usage: "compile blocks synchronously (deterministic runs)",
+        usage: "compile blocks synchronously, for deterministic runs (implies -jit)",
     },
     FlagSpec {
         name: "jit-cache",
@@ -287,7 +287,11 @@ fn main() {
         color: flags.bool("color"),
         cooked: flags.bool("cooked"),
         fs_root: flags.string("fsroot"),
-        jit: flags.bool("jit") || !flags.string("jit-cache").is_empty(),
+        // The JIT options imply -jit.
+        jit: flags.bool("jit")
+            || flags.bool("jit-sync")
+            || !flags.string("jit-threshold").is_empty()
+            || !flags.string("jit-cache").is_empty(),
         jit_cache: flags.string("jit-cache"),
         jit_sync: flags.bool("jit-sync"),
         jit_threshold: {

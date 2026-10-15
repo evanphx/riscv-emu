@@ -189,6 +189,8 @@ pub struct Cpu {
     fetch_key: u16,
     /// TLB generation. Entries with another generation are invalid.
     tlb_gen: u16,
+    /// Superpages with TLB entries since the last flush.
+    tlb_super: std::collections::HashSet<u64>,
     /// Generation of the instruction fetch translations and the guest
     /// code. Changes on TLB flushes and JIT code epochs.
     jit_gen: u64,
@@ -228,10 +230,6 @@ pub struct Cpu {
     /// Value loaded by the JIT load helper.
     #[cfg(feature = "jit")]
     jit_value: u64,
-    /// Bitmap of RAM pages containing compiled code. Empty when the
-    /// JIT is disabled.
-    #[cfg(feature = "jit")]
-    jit_code_pages: Vec<u64>,
 }
 
 /// The kind of result of executing one instruction.
@@ -277,6 +275,7 @@ impl Cpu {
             data_key: 0,
             fetch_key: 0,
             tlb_gen: 0,
+            tlb_super: Default::default(),
             jit_gen: 0,
             jit_jkey: 0,
             code_vpn: INVALID_PAGENUM,
@@ -302,8 +301,6 @@ impl Cpu {
             jit_fault: 0,
             #[cfg(feature = "jit")]
             jit_value: 0,
-            #[cfg(feature = "jit")]
-            jit_code_pages: Vec::new(),
         };
         cpu.sync_mmu_state();
         cpu
@@ -990,7 +987,11 @@ impl Cpu {
                 if self.mode < Mode::S || (self.mode == Mode::S && self.mstatus.tvm()) {
                     return Err(self.illegal(raw));
                 }
-                self.flush_tlb();
+                if i.rs1 == 0 {
+                    self.flush_tlb();
+                } else {
+                    self.flush_tlb_page(self.x[(i.rs1 & 31) as usize]);
+                }
                 self.code_vpn = INVALID_PAGENUM;
                 self.reservation_valid = false;
             }

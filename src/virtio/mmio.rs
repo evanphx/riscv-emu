@@ -186,7 +186,14 @@ impl GuestMem {
         Ok(())
     }
 
-    /// Returns the guest buffer as a mutable slice for device DMA.
+    /// Records that the device wrote to the guest range through a
+    /// slice from slice_mut.
+    pub fn note_write(&self, addr: u64, len: u64) {
+        self.mem.note_dma_write(addr, len);
+    }
+
+    /// Returns the guest buffer as a mutable slice for device DMA. Call
+    /// note_write after writing to it.
     ///
     /// # Safety
     ///

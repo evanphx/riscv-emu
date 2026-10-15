@@ -5,6 +5,12 @@ use crate::isa::{self, Exception, Mode};
 use crate::memory::{self, PAGE_SIZE};
 use crate::mmu::*;
 
+/// Returns the key of the superpage of the level containing vaddr.
+fn super_key(vaddr: u64, level: u32) -> u64 {
+    let shift = 12 + 9 * level;
+    (vaddr >> shift << shift) | level as u64
+}
+
 impl Cpu {
     /// Returns the current satp value.
     pub fn satp(&self) -> Satp {
@@ -26,6 +32,7 @@ impl Cpu {
         // generation never reaches 0xff, so a tag is never u64::MAX,
         // which marks unused entries.
         self.tlb_gen += 1;
+        self.tlb_super.clear();
         if self.tlb_gen == 0xff {
             self.tlb_gen = 0;
             for e in self.tlb.iter_mut() {
@@ -36,22 +43,37 @@ impl Cpu {
         self.new_jit_gen();
     }
 
+    /// Flushes the translations of the virtual address (sfence.vma
+    /// with an address).
+    pub fn flush_tlb_page(&mut self, vaddr: u64) {
+        // Superpage translations are cached as 4 KiB entries; flushing
+        // a superpage flushes everything.
+        if self.tlb_super.contains(&super_key(vaddr, 1))
+            || self.tlb_super.contains(&super_key(vaddr, 2))
+        {
+            self.flush_tlb();
+            return;
+        }
+        let e = &mut self.tlb[((vaddr >> 12) & 0xfff) as usize];
+        if e.tag & !0xfff == vaddr & !0xfff {
+            e.tag = u64::MAX;
+        }
+        #[cfg(feature = "jit")]
+        self.jit_flush_page(vaddr);
+    }
+
     /// Tests if the RAM page at the offset contains JIT compiled code.
     #[inline]
     fn jit_code_page(&self, ofs: u64) -> bool {
-        #[cfg(feature = "jit")]
-        if !self.jit_code_pages.is_empty() {
-            let page = ofs >> 12;
-            return self.jit_code_pages[(page >> 6) as usize] & (1 << (page & 63)) != 0;
-        }
-        let _ = ofs;
-        false
+        self.mem.is_code(ofs)
     }
 
     /// Invalidates the JIT jump cache entries.
     pub(super) fn new_jit_gen(&mut self) {
         self.jit_gen += 1;
         self.jit_jkey = self.jit_gen << 16 | self.fetch_key as u64;
+        #[cfg(feature = "jit")]
+        self.jit_clear_jcache_pages();
     }
 
     /// Recomputes the cached translation state after changes to the
@@ -112,6 +134,9 @@ impl Cpu {
         };
         let paddr = page | (vaddr & offset_mask);
         let page4k = paddr & !0xfff;
+        if level > 0 {
+            self.tlb_super.insert(super_key(vaddr, level));
+        }
         let vpn = vaddr >> 12;
         let (host_delta, host_flags) = if self.mem.contains_range(page4k, 0x1000) {
             let ofs = self.mem.offset(page4k);
@@ -319,8 +344,8 @@ impl Cpu {
                 _ => mem.write_u64(ofs, v),
             }
             #[cfg(feature = "jit")]
-            if !self.jit_code_pages.is_empty() {
-                self.jit_code_write(ofs);
+            if mem.code_dirty() {
+                self.jit_code_written();
             }
             if self.overlay.is_some() {
                 return self.overlay_store(paddr, size);

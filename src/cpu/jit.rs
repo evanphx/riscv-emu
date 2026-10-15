@@ -67,7 +67,7 @@ type BlockFn = *const u8;
 type EnterFn = unsafe extern "C" fn(*mut Cpu, BlockFn) -> u64;
 
 /// Number of entries in the jump cache.
-const JCACHE_SIZE: usize = 4096;
+const JCACHE_SIZE: usize = 16384;
 
 /// Jump cache entry. Blocks jump directly to the next block through
 /// the jump cache, which maps a guest virtual PC to its block. An entry
@@ -277,6 +277,8 @@ pub struct Jit {
     /// Helper stubs: load, store, exec.
     stubs: [u64; 3],
     jcache: Box<[JEntry]>,
+    /// Hashed bitmap of the pages with jump cache entries.
+    jcache_pages: [u64; 64],
     cache: Box<[CacheEntry]>,
     blocks: Vec<Block>,
     index: HashMap<(u64, u64), u32, BuildHasherDefault<FxHasher>>,
@@ -324,7 +326,7 @@ impl Hasher for FxHasher {
 /// directly through TLB entries with PTE_W in host_flags, so the
 /// entries of code pages lose PTE_W.
 struct CodePages<'a> {
-    bits: &'a mut [u64],
+    mem: &'a crate::memory::Memory,
     tlb: &'a mut [TlbEntry],
     /// Host address of RAM offset 0.
     ram: u64,
@@ -333,14 +335,10 @@ struct CodePages<'a> {
 impl CodePages<'_> {
     /// Marks the RAM page at the offset as containing compiled code.
     fn mark(&mut self, ofs: u64) {
-        let page = ofs >> 12;
-        let word = &mut self.bits[(page >> 6) as usize];
-        let bit = 1 << (page & 63);
-        if *word & bit != 0 {
+        if !self.mem.mark_code(ofs) {
             return;
         }
-        *word |= bit;
-        let host = self.ram + (page << 12);
+        let host = self.ram + (ofs & !0xfff);
         for e in self.tlb.iter_mut() {
             if e.host_flags & PTE_W != 0 && (e.tag & !0xfff).wrapping_add(e.host_delta) == host {
                 e.host_flags &= !PTE_W;
@@ -354,7 +352,7 @@ impl CodePages<'_> {
 macro_rules! code_pages {
     ($cpu:expr) => {
         &mut CodePages {
-            bits: &mut $cpu.jit_code_pages,
+            mem: &$cpu.mem,
             tlb: &mut $cpu.tlb[..],
             ram: $cpu.mem.ptr_at(0) as u64,
         }
@@ -733,6 +731,7 @@ impl Jit {
             enter,
             stubs,
             jcache: vec![EMPTY_JENTRY; JCACHE_SIZE].into_boxed_slice(),
+            jcache_pages: [0; 64],
             pending: HashSet::default(),
             poll: 0,
             arena: CodeArena::new(CODE_ARENA_SIZE)?,
@@ -781,9 +780,10 @@ impl Jit {
         };
         let b = &mut self.blocks[idx as usize];
         if b.epoch != self.epoch {
-            let mut cur = vec![0u8; b.code.len()];
-            cpu_mem.read_bytes(b.phys, &mut cur);
-            if cur != b.code {
+            // Mark before comparing, so that a concurrent write is
+            // noticed.
+            code_pages.mark(b.phys);
+            if !cpu_mem.bytes_equal(b.phys, &b.code) {
                 self.stats.invalidated += 1;
                 self.index.remove(&(vpc, phys));
                 self.cache[s] = TOMBSTONE;
@@ -794,7 +794,6 @@ impl Jit {
                 self.stats.cache_hits += 1;
             }
             b.epoch = self.epoch;
-            code_pages.mark(b.phys);
         }
         Some(b.func)
     }
@@ -825,12 +824,12 @@ impl Jit {
             return None;
         }
         let page_base = phys & !(PAGE_SIZE - 1);
-        let mut cur = Vec::new();
-        let found = self.by_code.get(&key)?.iter().copied().find(|&idx| {
+        let candidates = self.by_code.get(&key)?;
+        // Mark before comparing, so that a concurrent write is noticed.
+        code_pages.mark(phys);
+        let found = candidates.iter().copied().find(|&idx| {
             let b = &self.blocks[idx as usize];
-            cur.resize(b.code.len(), 0);
-            mem.read_bytes(page_base + (b.phys & (PAGE_SIZE - 1)), &mut cur);
-            cur == b.code
+            mem.bytes_equal(page_base + (b.phys & (PAGE_SIZE - 1)), &b.code)
         })?;
         let b = &mut self.blocks[found as usize];
         if !b.used {
@@ -850,8 +849,6 @@ impl Jit {
             age: 0,
             used: true,
         };
-        // The original block keeps its own location.
-        code_pages.mark(block.phys);
         self.stats.reused += 1;
         let idx = self.blocks.len() as u32;
         let func = block.func;
@@ -868,22 +865,21 @@ impl Jit {
     /// Decodes the trace starting at vpc, with its code at the RAM
     /// offset phys. The trace follows not-taken conditional branches
     /// and direct jumps within the page.
-    fn decode_block(cpu: &Cpu, vpc: u64, phys: u64) -> Vec<BlockInstr> {
-        let mem = &cpu.mem;
-        let page_base = phys & !(PAGE_SIZE - 1);
-        let page_end = page_base + PAGE_SIZE;
+    fn decode_block(page: &[u8], vpc: u64) -> Vec<BlockInstr> {
+        let rd16 = |o: usize| u16::from_le_bytes([page[o], page[o + 1]]) as u32;
+        let page_end = PAGE_SIZE as usize;
         let mut out: Vec<BlockInstr> = Vec::new();
-        let (mut pc, mut ofs) = (vpc, phys);
+        let (mut pc, mut ofs) = (vpc, (vpc & (PAGE_SIZE - 1)) as usize);
         loop {
             if out.len() >= MAX_BLOCK_INSTRS || ofs + 2 > page_end {
                 break;
             }
-            let lo = mem.read_u16(ofs) as u32;
+            let lo = rd16(ofs);
             let (instr, size, raw) = if lo & 0b11 == 0b11 {
                 if ofs + 4 > page_end {
                     break;
                 }
-                let raw = mem.read_u32(ofs);
+                let raw = lo | rd16(ofs + 2) << 16;
                 (isa::decode(raw).unwrap_or_default(), 4, raw)
             } else {
                 (isa::decode_c_fast(lo as u16), 2, lo)
@@ -908,11 +904,11 @@ impl Jit {
                         break;
                     }
                     pc = target;
-                    ofs = page_base + (target & (PAGE_SIZE - 1));
+                    ofs = (target & (PAGE_SIZE - 1)) as usize;
                 }
                 _ => {
                     pc = pc.wrapping_add(size);
-                    ofs += size;
+                    ofs += size as usize;
                 }
             }
             if out.iter().any(|b| b.pc == pc) {
@@ -925,22 +921,27 @@ impl Jit {
         out
     }
 
-    /// Creates the compile request for the block at vpc / phys.
+    /// Creates the compile request for the block at vpc / phys. The
+    /// page must be marked as a code page before, so that writes after
+    /// the snapshot of the code are noticed.
     fn request(cpu: &Cpu, vpc: u64, phys: u64, epoch: u64) -> Option<Request> {
-        let instrs = Self::decode_block(cpu, vpc, phys);
+        // Decode from a snapshot of the page, so that the compiled
+        // code matches the saved code bytes even if the page changes
+        // concurrently.
+        let page_base = phys & !(PAGE_SIZE - 1);
+        let mut page = vec![0u8; PAGE_SIZE as usize];
+        cpu.mem.read_bytes(page_base, &mut page);
+        let instrs = Self::decode_block(&page, vpc);
         if instrs.is_empty() {
             return None;
         }
-        // Snapshot the guest code for revalidation.
-        let page_base = phys & !(PAGE_SIZE - 1);
         let lo = instrs.iter().map(|b| b.pc & (PAGE_SIZE - 1)).min().unwrap();
         let hi = instrs
             .iter()
             .map(|b| (b.pc & (PAGE_SIZE - 1)) + b.size)
             .max()
             .unwrap();
-        let mut code = vec![0u8; (hi - lo) as usize];
-        cpu.mem.read_bytes(page_base + lo, &mut code);
+        let code = page[lo as usize..hi as usize].to_vec();
         Some(Request {
             vpc,
             phys,
@@ -2443,8 +2444,6 @@ impl Cpu {
     /// background thread if background is set.
     pub fn enable_jit(&mut self, hot_threshold: u16, background: bool) -> Result<(), String> {
         self.jit = Some(Box::new(Jit::new(hot_threshold, background)?));
-        let pages = self.mem.size().div_ceil(PAGE_SIZE);
-        self.jit_code_pages = vec![0; pages.div_ceil(64) as usize];
         Ok(())
     }
 
@@ -2465,15 +2464,12 @@ impl Cpu {
         self.jit.as_ref().map(|j| j.stats)
     }
 
-    /// Handles a CPU store to the RAM offset: if the page contains
-    /// compiled code, the code is revalidated before it runs again.
+    /// Handles a write to compiled code: the code is revalidated
+    /// before it runs again. CPU stores take effect immediately; other
+    /// writes, such as device DMA, at the latest at the next fence.i.
     #[inline(never)]
-    pub(super) fn jit_code_write(&mut self, ofs: u64) {
-        let page = ofs >> 12;
-        let word = &mut self.jit_code_pages[(page >> 6) as usize];
-        let bit = 1 << (page & 63);
-        if *word & bit != 0 {
-            *word &= !bit;
+    pub(super) fn jit_code_written(&mut self) {
+        if self.mem.take_code_dirty() {
             if let Some(jit) = self.jit.as_mut() {
                 jit.new_epoch();
             }
@@ -2481,12 +2477,39 @@ impl Cpu {
         }
     }
 
-    /// Starts a new JIT code epoch after fence.i.
-    pub(super) fn jit_fence_i(&mut self) {
-        if let Some(jit) = self.jit.as_mut() {
-            jit.new_epoch();
+    /// Removes the jump cache entries of the virtual page of vaddr
+    /// after its translation was flushed.
+    pub(super) fn jit_flush_page(&mut self, vaddr: u64) {
+        let Some(jit) = self.jit.as_mut() else {
+            return;
+        };
+        let page = (vaddr >> 12) & 0xfff;
+        if jit.jcache_pages[(page >> 6) as usize] & (1 << (page & 63)) == 0 {
+            return;
         }
-        self.new_jit_gen();
+        // The entries of a page are at consecutive indices.
+        let vpage = vaddr >> 12;
+        let first = ((vaddr & !0xfff) >> 1) as usize & (JCACHE_SIZE - 1);
+        for i in 0..(PAGE_SIZE as usize / 2).min(JCACHE_SIZE) {
+            let e = &mut jit.jcache[(first + i) & (JCACHE_SIZE - 1)];
+            if e.vpc >> 12 == vpage {
+                e.vpc = u64::MAX;
+            }
+        }
+    }
+
+    /// Forgets the pages of the jump cache entries, which are all
+    /// invalid after a generation change.
+    pub(super) fn jit_clear_jcache_pages(&mut self) {
+        if let Some(jit) = self.jit.as_mut() {
+            jit.jcache_pages = [0; 64];
+        }
+    }
+
+    /// Handles fence.i: starts a new JIT code epoch if compiled code
+    /// was modified.
+    pub(super) fn jit_fence_i(&mut self) {
+        self.jit_code_written();
     }
 
     /// Runs the compiled block at PC if there is one. Returns Ok(true)
@@ -2553,6 +2576,7 @@ impl Cpu {
     /// background compiler. Returns None if the block is not ready.
     fn jit_compile(&mut self, pc: u64, phys: u64) -> Result<Option<BlockFn>, Exception> {
         let epoch = self.jit.as_ref().unwrap().epoch;
+        code_pages!(self).mark(phys);
         let Some(req) = Jit::request(self, pc, phys, epoch) else {
             return Ok(None);
         };
@@ -2590,6 +2614,8 @@ impl Cpu {
             key: self.jit_jkey,
             func,
         };
+        let page = (pc >> 12) & 0xfff;
+        jit.jcache_pages[(page >> 6) as usize] |= 1 << (page & 63);
         self.jit_enter(func)
     }
 

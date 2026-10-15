@@ -7,7 +7,7 @@
 //! descriptor ownership). All accessors therefore go through raw
 //! pointers with unaligned loads and stores.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{fence, AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 /// System page size in bytes.
 pub const PAGE_SIZE: u64 = 4096;
@@ -63,6 +63,10 @@ pub struct Memory {
     pub ram_end: u64,
     num_pages: usize,
     next_page: AtomicUsize,
+    /// Bitmap of the pages that hold JIT compiled code.
+    code_pages: Box<[AtomicU64]>,
+    /// Set when a write modified a page in code_pages.
+    code_dirty: AtomicBool,
 }
 
 // SAFETY: guest memory is intentionally shared between the CPU and
@@ -98,7 +102,73 @@ impl Memory {
             ram_end: base + size,
             num_pages: (size / PAGE_SIZE) as usize,
             next_page: AtomicUsize::new(0),
+            code_pages: (0..(size / PAGE_SIZE).div_ceil(64))
+                .map(|_| AtomicU64::new(0))
+                .collect(),
+            code_dirty: AtomicBool::new(false),
         }
+    }
+
+    /// Marks the page at the RAM offset as holding compiled code.
+    /// Returns true if the page was not marked before. A later write to
+    /// the page clears the mark and sets the code dirty flag.
+    pub fn mark_code(&self, ofs: u64) -> bool {
+        let page = ofs >> 12;
+        let bit = 1 << (page & 63);
+        // SeqCst orders the mark before the caller reads the code, so a
+        // concurrent device write either is seen by the read or sees
+        // the mark.
+        self.code_pages[(page >> 6) as usize].fetch_or(bit, Ordering::SeqCst) & bit == 0
+    }
+
+    /// Tests if the page at the RAM offset holds compiled code.
+    #[inline(always)]
+    pub fn is_code(&self, ofs: u64) -> bool {
+        let page = ofs >> 12;
+        self.code_pages[(page >> 6) as usize].load(Ordering::Relaxed) & (1 << (page & 63)) != 0
+    }
+
+    /// Tests if a write modified compiled code since the last
+    /// take_code_dirty().
+    #[inline(always)]
+    pub fn code_dirty(&self) -> bool {
+        self.code_dirty.load(Ordering::Relaxed)
+    }
+
+    /// Returns and clears the code dirty flag.
+    pub fn take_code_dirty(&self) -> bool {
+        self.code_dirty.swap(false, Ordering::SeqCst)
+    }
+
+    /// Records a write to n > 0 bytes at the RAM offset.
+    #[inline(always)]
+    fn note_write(&self, ofs: u64, n: u64) {
+        let (first, last) = (ofs >> 12, (ofs + n - 1) >> 12);
+        for page in first..=last {
+            if self.code_pages[(page >> 6) as usize].load(Ordering::Relaxed) & (1 << (page & 63))
+                != 0
+            {
+                self.code_written(page);
+            }
+        }
+    }
+
+    #[cold]
+    fn code_written(&self, page: u64) {
+        self.code_pages[(page >> 6) as usize].fetch_and(!(1 << (page & 63)), Ordering::SeqCst);
+        self.code_dirty.store(true, Ordering::SeqCst);
+    }
+
+    /// Records a device (DMA) write to the physical range, after the
+    /// data was written through a slice from guest_slice_mut.
+    pub fn note_dma_write(&self, paddr: u64, n: u64) {
+        if n == 0 || !self.contains_range(paddr, n) {
+            return;
+        }
+        // Order the data writes before reading the code marks; see
+        // mark_code.
+        fence(Ordering::SeqCst);
+        self.note_write(self.offset(paddr), n);
     }
 
     /// RAM size in bytes.
@@ -192,24 +262,28 @@ impl Memory {
     pub fn write_u8(&self, ofs: u64, v: u8) {
         self.check(ofs, 1);
         unsafe { *self.ptr.add(ofs as usize) = v }
+        self.note_write(ofs, 1);
     }
 
     #[inline(always)]
     pub fn write_u16(&self, ofs: u64, v: u16) {
         self.check(ofs, 2);
         unsafe { (self.ptr.add(ofs as usize) as *mut u16).write_unaligned(v) }
+        self.note_write(ofs, 2);
     }
 
     #[inline(always)]
     pub fn write_u32(&self, ofs: u64, v: u32) {
         self.check(ofs, 4);
         unsafe { (self.ptr.add(ofs as usize) as *mut u32).write_unaligned(v) }
+        self.note_write(ofs, 4);
     }
 
     #[inline(always)]
     pub fn write_u64(&self, ofs: u64, v: u64) {
         self.check(ofs, 8);
         unsafe { (self.ptr.add(ofs as usize) as *mut u64).write_unaligned(v) }
+        self.note_write(ofs, 8);
     }
 
     /// Copies RAM starting from offset ofs into buf.
@@ -220,11 +294,23 @@ impl Memory {
         }
     }
 
+    /// Tests if the RAM at offset ofs holds the bytes of data.
+    pub fn bytes_equal(&self, ofs: u64, data: &[u8]) -> bool {
+        self.check(ofs, data.len() as u64);
+        // SAFETY: the range is inside RAM.
+        let ram = unsafe { std::slice::from_raw_parts(self.ptr.add(ofs as usize), data.len()) };
+        ram == data
+    }
+
     /// Copies data into RAM starting from offset ofs.
     pub fn write_bytes(&self, ofs: u64, data: &[u8]) {
         self.check(ofs, data.len() as u64);
         unsafe {
             std::ptr::copy_nonoverlapping(data.as_ptr(), self.ptr.add(ofs as usize), data.len())
+        }
+        if !data.is_empty() {
+            fence(Ordering::SeqCst);
+            self.note_write(ofs, data.len() as u64);
         }
     }
 
@@ -232,9 +318,15 @@ impl Memory {
     pub fn fill(&self, ofs: u64, n: u64, v: u8) {
         self.check(ofs, n);
         unsafe { std::ptr::write_bytes(self.ptr.add(ofs as usize), v, n as usize) }
+        if n > 0 {
+            fence(Ordering::SeqCst);
+            self.note_write(ofs, n);
+        }
     }
 
     /// Returns a mutable slice of guest RAM at the physical address.
+    /// After writing, the caller must call note_dma_write for the
+    /// range, so that writes to compiled code are noticed.
     ///
     /// # Safety
     ///
