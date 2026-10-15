@@ -94,6 +94,7 @@ Main flags:
 | `-jit-threshold n` | executions before a block is compiled (default 1000; implies `-jit`) |
 | `-jit-sync` | compile blocks synchronously, for deterministic runs (implies `-jit`) |
 | `-jit-cache file` | load and save JIT compiled code in `file` (implies `-jit`) |
+| `-jit-opt` | compile slower, optimized code, e.g. to build a `-jit-cache` (implies `-jit`) |
 | `-cooked` | don't put the terminal into raw mode |
 | `-htif` | enable the HTIF tohost/fromhost device for ELF kernels |
 | `-symbols file` | kernel System.map for traces |
@@ -200,10 +201,10 @@ thread while the interpreter keeps running:
 - `sfence.vma` with an address flushes only that page from the TLB and
   the jump cache.
 
-The machine code is generated with `cranelift-codegen` (without its
-optimization passes, which do not speed up this code but slow down
-compiling) and copied into the emulator's own executable code arena. The JIT supports x86-64
-hosts. `-jit-sync` compiles blocks before running them instead of in
+The machine code is generated with `cranelift-codegen`, by default
+without its optimization passes, which keeps compiling fast, and
+copied into the emulator's own executable code arena. The JIT supports
+x86-64 hosts. `-jit-sync` compiles blocks before running them instead of in
 the background, which makes runs deterministic and is useful for
 debugging. With the environment variable `RSEMU_PERF_MAP` set, the JIT
 writes `/tmp/perf-PID.map`, so that `perf report` shows compiled code
@@ -221,13 +222,10 @@ $ rsemu -jit-cache linux.jit configs/buildroot.goemu   # first run compiles and 
 $ rsemu -jit-cache linux.jit configs/buildroot.goemu   # later runs load the code
 ```
 
-To precompile everything that a run executes, not just the hot code,
-make one training run with `-jit-sync -jit-threshold 2`; later runs can
-use the default settings.
-
-- The code refers to host addresses (guest RAM, the TLB, helper
-  functions) through relocations, which are patched when the code is
-  loaded.
+- The generated code is position independent: it finds host
+  addresses (the TLB, helper functions, the jump cache) through the CPU
+  state. The cache file is mapped into memory and its code runs in
+  place, so loading a cache of 30,000 blocks takes about 25 ms.
 - Loaded code is checked against the guest code before it first runs,
   just like code from an older `fence.i` epoch, so a cache from another
   kernel or disk image is safe to use; blocks that do not match are
@@ -240,19 +238,61 @@ use the default settings.
 - The cache is written when the CPU stops (guest poweroff or program
   exit).
 
+### Precompiling the kernel
+
+A training run can compile everything that a boot executes, ahead of
+time and at a higher quality than the background compiler can afford:
+
+```
+$ rsemu -jit-sync -jit-threshold 1 -jit-opt -jit-cache linux.jit configs/buildroot.goemu
+  (log in and power off; about 35 s)
+$ rsemu -jit-cache linux.jit configs/buildroot.goemu
+```
+
+- `-jit-threshold 1` compiles code the first time it runs, so also the
+  kernel's run-once initialization code ends up in the cache.
+- `-jit-opt` compiles regions instead of traces: all code reachable
+  from the entry within the page, following both sides of branches, up
+  to 128 instructions, with native control flow inside the region, so
+  loops with internal branches stay in native code. Cranelift's
+  optimizations are on. Compiling is about twice as slow, which does
+  not matter for a training run.
+- Later runs use the default settings; code that the training run did
+  not see is compiled as usual and added to the cache.
+
+For the buildroot image the cache holds about 26,600 kernel regions and
+6,500 user space regions (75 MiB). A boot with it executes 99.5% of the
+instructions in loaded code; only 3 blocks are compiled before the
+kernel starts init.
+
+Time from start to the kernel's `Run /sbin/init` message (medians of
+10 interleaved runs):
+
+| Configuration | Time to init |
+|---------------|-------------:|
+| Interpreter | 7.97 s |
+| `-jit` | 1.76 s |
+| `-jit-cache`, after one normal run | 1.45 s |
+| `-jit-cache`, precompiled with `-jit-sync -jit-threshold 1` | 1.29 s |
+| `-jit-cache`, precompiled with `-jit-sync -jit-threshold 1 -jit-opt` | 0.98 s |
+
+About a third of the remaining time is a single kernel function,
+`trace_event_update_all`, which scans the format strings of all trace
+events while booting.
+
 ### Performance
 
 Host wall-clock times on a shared 2-core x86-64 machine. The md5sum,
 shell loop, and sort benchmarks run inside the booted buildroot guest.
 
-| Workload | Go original | Rust interpreter | Rust JIT | JIT, warm `-jit-cache` |
-|----------|------------:|-----------------:|---------:|-----------------------:|
-| Linux boot to login prompt | 9.6 s | 9.7 s | 2.6 s | 2.0 s |
-| `fibo(35)` (userspace mode) | 3.48 s | 4.24 s | 0.49 s | |
-| `fibo(40)` (userspace mode) | 34.4 s | 38.5 s | 6.0 s | |
-| md5sum of 8 MB in the guest | – | 1.78 s | 0.40 s | 0.38 s |
-| shell loop, 20000 iterations | – | 4.40 s | 0.53 s | 0.46 s |
-| `seq 1 30000 \| sort -r` | – | 2.05 s | 0.36 s | 0.30 s |
+| Workload | Go original | Rust interpreter | Rust JIT | JIT, warm `-jit-cache` | JIT, precompiled `-jit-opt` cache |
+|----------|------------:|-----------------:|---------:|-----------------------:|----------------------------------:|
+| Linux boot to login prompt | 9.6 s | 9.7 s | 2.5 s | 2.0 s | 1.4 s |
+| `fibo(35)` (userspace mode) | 3.48 s | 4.24 s | 0.49 s | | |
+| `fibo(40)` (userspace mode) | 34.4 s | 38.5 s | 6.0 s | | |
+| md5sum of 8 MB in the guest | – | 1.78 s | 0.41 s | 0.38 s | 0.27 s |
+| shell loop, 20000 iterations | – | 4.40 s | 0.55 s | 0.46 s | 0.32 s |
+| `seq 1 30000 \| sort -r` | – | 2.05 s | 0.37 s | 0.30 s | 0.22 s |
 
 The JIT times are medians of three runs; the machine is shared, so
 individual runs vary by about 10%.

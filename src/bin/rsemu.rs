@@ -164,6 +164,12 @@ const FLAGS: &[FlagSpec] = &[
         usage: "load and save JIT compiled code in `file` (implies -jit)",
     },
     FlagSpec {
+        name: "jit-opt",
+        boolean: true,
+        multi: false,
+        usage: "compile slower, optimized code, e.g. to build a -jit-cache (implies -jit)",
+    },
+    FlagSpec {
         name: "drive",
         boolean: false,
         multi: true,
@@ -290,10 +296,12 @@ fn main() {
         // The JIT options imply -jit.
         jit: flags.bool("jit")
             || flags.bool("jit-sync")
+            || flags.bool("jit-opt")
             || !flags.string("jit-threshold").is_empty()
             || !flags.string("jit-cache").is_empty(),
         jit_cache: flags.string("jit-cache"),
         jit_sync: flags.bool("jit-sync"),
+        jit_opt: flags.bool("jit-opt"),
         jit_threshold: {
             let v = flags.string("jit-threshold");
             if v.is_empty() {

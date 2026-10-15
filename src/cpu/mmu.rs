@@ -141,10 +141,10 @@ impl Cpu {
         let (host_delta, host_flags) = if self.mem.contains_range(page4k, 0x1000) {
             let ofs = self.mem.offset(page4k);
             let host = self.mem.ptr_at(ofs) as u64;
-            // Compiled code stores directly only to pages without
-            // compiled code.
+            // Compiled code stores directly only to dirty pages
+            // without compiled code.
             let mut host_flags = flags;
-            if self.jit_code_page(ofs) {
+            if flags & PTE_D == 0 || self.jit_code_page(ofs) {
                 host_flags &= !PTE_W;
             }
             (host.wrapping_sub(vaddr & !0xfff), host_flags)

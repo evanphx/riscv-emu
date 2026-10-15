@@ -26,29 +26,26 @@
 //! jump cache and tail-calls it, up to an instruction budget, so most
 //! block transitions do not return to the dispatcher.
 //!
-//! The generated code refers to host addresses through relocations,
-//! so it can be saved to a code cache file and loaded by a later run.
+//! The generated code is position independent: it reaches host
+//! addresses through the CPU state, so it can be saved to a code cache
+//! file and a later run can map the file and run the code in place.
 //! Loaded blocks are validated against the guest code like blocks from
 //! an older epoch.
 
 use super::Cpu;
 use crate::isa::{self, Exception, Instr, Op};
 use crate::memory::PAGE_SIZE;
-use crate::mmu::{TlbEntry, PTE_D, PTE_R, PTE_W};
-use cranelift_codegen::binemit::Reloc;
+use crate::mmu::{TlbEntry, PTE_R, PTE_W};
 use cranelift_codegen::control::ControlPlane;
 use cranelift_codegen::ir::condcodes::IntCC;
-use cranelift_codegen::ir::immediates::Imm64;
 use cranelift_codegen::ir::{
-    types, AbiParam, ExternalName, GlobalValue, GlobalValueData, InstBuilder, MemFlagsData, SigRef,
-    Signature, Type, UserExternalName, Value,
+    types, AbiParam, InstBuilder, MemFlagsData, SigRef, Signature, Type, Value,
 };
 use cranelift_codegen::isa::{CallConv, OwnedTargetIsa};
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_codegen::Context;
-use cranelift_codegen::FinalizedRelocTarget;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{BuildHasherDefault, Hasher};
 use std::mem::offset_of;
 use std::path::{Path, PathBuf};
@@ -97,6 +94,9 @@ const EXIT_FAULT: u64 = 1;
 const CACHE_BITS: u32 = 16;
 const CACHE_SIZE: usize = 1 << CACHE_BITS;
 const MAX_BLOCK_INSTRS: usize = 200;
+
+/// Maximum number of instructions in an optimized region.
+const MAX_REGION_INSTRS: usize = 128;
 
 /// Default number of times the interpreter must reach a block start
 /// before the block is compiled.
@@ -170,7 +170,6 @@ struct Block {
     instrs: u32,
     /// Machine code length.
     size: u32,
-    relocs: Vec<JitReloc>,
     /// Number of runs since the block was last used, for blocks
     /// loaded from the code cache.
     age: u8,
@@ -271,8 +270,10 @@ pub struct Jit {
     /// Counter for polling the background compiler.
     poll: u32,
     arena: CodeArena,
+    /// Mapped code cache files, which loaded blocks run from.
+    mapped: Vec<Mapping>,
     /// Linux perf map of the blocks, enabled with RSEMU_PERF_MAP.
-    perf_map: Option<std::fs::File>,
+    perf_map: Option<std::io::BufWriter<std::fs::File>>,
     /// Trampoline arena and entry.
     _enter_arena: CodeArena,
     enter: EnterFn,
@@ -291,6 +292,8 @@ pub struct Jit {
     code_filter: Box<[u64]>,
     hot: Box<[u16]>,
     hot_threshold: u16,
+    /// Compile with Cranelift's optimizations.
+    optimize: bool,
     epoch: u64,
     pub stats: JitStats,
     /// Persistent code cache file.
@@ -702,11 +705,12 @@ unsafe extern "C" fn jit_store(cpu: *mut Cpu, addr: u64, size: u64, v: u64) {
 /// Opens the perf map file /tmp/perf-PID.map that names the compiled
 /// code for Linux perf, if the environment variable RSEMU_PERF_MAP is
 /// set. Blocks are named by their guest PC.
-fn open_perf_map(glue: &CodeArena) -> Option<std::fs::File> {
+fn open_perf_map(glue: &CodeArena) -> Option<std::io::BufWriter<std::fs::File>> {
     use std::io::Write;
     std::env::var_os("RSEMU_PERF_MAP")?;
     let path = format!("/tmp/perf-{}.map", std::process::id());
-    let mut f = std::fs::File::create(path).ok()?;
+    let f = std::fs::File::create(path).ok()?;
+    let mut f = std::io::BufWriter::with_capacity(1 << 20, f);
     let _ = writeln!(f, "{:x} {:x} jit-glue", glue.ptr as usize, glue.pos);
     Some(f)
 }
@@ -750,6 +754,7 @@ impl Jit {
             pending: HashSet::default(),
             poll: 0,
             arena: CodeArena::new(CODE_ARENA_SIZE)?,
+            mapped: Vec::new(),
             perf_map,
             cache: vec![CacheEntry::default(); CACHE_SIZE].into_boxed_slice(),
             blocks: Vec::new(),
@@ -758,6 +763,7 @@ impl Jit {
             code_filter: vec![0u64; CODE_FILTER_WORDS].into_boxed_slice(),
             hot: vec![0u16; CACHE_SIZE].into_boxed_slice(),
             hot_threshold: hot_threshold.max(1),
+            optimize: false,
             epoch: 0,
             stats: JitStats::default(),
             cache_path: None,
@@ -861,7 +867,6 @@ impl Jit {
             start: phys,
             instrs: b.instrs,
             size: b.size,
-            relocs: b.relocs.clone(),
             age: 0,
             used: true,
         };
@@ -937,6 +942,76 @@ impl Jit {
         out
     }
 
+    /// Decodes the region of the code at vpc for optimized
+    /// compilation: the instructions reachable from vpc within the page
+    /// through fall-through, branches, and direct jumps, in address
+    /// order. Branches and jumps are marked as last instructions; the
+    /// translator links them to the region's instructions.
+    fn decode_region(page: &[u8], vpc: u64) -> Vec<BlockInstr> {
+        let rd16 = |o: usize| u16::from_le_bytes([page[o], page[o + 1]]) as u32;
+        let base = vpc & !(PAGE_SIZE - 1);
+        let mut region: BTreeMap<u64, BlockInstr> = BTreeMap::new();
+        let mut work = vec![vpc];
+        while let Some(pc) = work.pop() {
+            if region.len() >= MAX_REGION_INSTRS {
+                break;
+            }
+            if pc & !(PAGE_SIZE - 1) != base || region.contains_key(&pc) {
+                continue;
+            }
+            // Instructions may not overlap.
+            if let Some((p, b)) = region.range(..pc).next_back() {
+                if p + b.size > pc {
+                    continue;
+                }
+            }
+            let ofs = (pc - base) as usize;
+            if ofs + 2 > page.len() {
+                continue;
+            }
+            let lo = rd16(ofs);
+            let (instr, size, raw) = if lo & 0b11 == 0b11 {
+                if ofs + 4 > page.len() {
+                    continue;
+                }
+                let raw = lo | rd16(ofs + 2) << 16;
+                (isa::decode(raw).unwrap_or_default(), 4, raw)
+            } else {
+                (isa::decode_c_fast(lo as u16), 2, lo)
+            };
+            if !jitable(instr.op) {
+                continue;
+            }
+            if let Some((&p, _)) = region.range(pc + 1..).next() {
+                if p < pc + size {
+                    continue;
+                }
+            }
+            let next = pc.wrapping_add(size);
+            let target = pc.wrapping_add(instr.imm as i64 as u64);
+            match instr.op {
+                Op::Jalr => {}
+                Op::Jal => work.push(target),
+                op if is_terminator(op) => {
+                    work.push(target);
+                    work.push(next);
+                }
+                _ => work.push(next),
+            }
+            region.insert(
+                pc,
+                BlockInstr {
+                    pc,
+                    instr,
+                    raw,
+                    size,
+                    last: is_terminator(instr.op),
+                },
+            );
+        }
+        region.into_values().collect()
+    }
+
     /// Creates the compile request for the block at vpc / phys. The
     /// page must be marked as a code page before, so that writes after
     /// the snapshot of the code are noticed.
@@ -947,7 +1022,11 @@ impl Jit {
         let page_base = phys & !(PAGE_SIZE - 1);
         let mut page = vec![0u8; PAGE_SIZE as usize];
         cpu.mem.read_bytes(page_base, &mut page);
-        let instrs = Self::decode_block(&page, vpc);
+        let instrs = if cpu.jit_env().optimize {
+            Self::decode_region(&page, vpc)
+        } else {
+            Self::decode_block(&page, vpc)
+        };
         if instrs.is_empty() {
             return None;
         }
@@ -965,30 +1044,26 @@ impl Jit {
             code_ofs: page_base + lo,
             code,
             instrs,
-            env: CodegenEnv {
-                inline_stores: cpu.overlay.is_none(),
-            },
+            env: cpu.jit_env(),
         })
     }
 
-    /// Copies the machine code into the arena, patches its
-    /// relocations, and adds the block to the translation cache.
-    /// Returns the block back if the arena is full.
-    fn add_block(
-        &mut self,
-        mut block: Block,
-        machine_code: &[u8],
-        syms: &Syms,
-    ) -> Result<BlockFn, Block> {
+    /// Copies the machine code into the arena and adds the block to
+    /// the translation cache. Returns the block back if the arena is
+    /// full.
+    fn add_block(&mut self, block: Block, machine_code: &[u8]) -> Result<BlockFn, Block> {
         let Some(entry) = self.arena.add(machine_code) else {
             return Err(block);
         };
-        // SAFETY: the code was just copied to the arena and the
-        // relocations are inside it.
-        unsafe { apply_relocs(entry as *mut u8, &block.relocs, syms) };
+        Ok(self.add_code(block, entry, machine_code.len()))
+    }
+
+    /// Adds the block with the machine code at entry to the
+    /// translation cache.
+    fn add_code(&mut self, mut block: Block, entry: BlockFn, size: usize) -> BlockFn {
         let func: BlockFn = entry;
         block.func = func;
-        block.size = machine_code.len() as u32;
+        block.size = size as u32;
         let (vpc, start) = (block.vpc, block.start);
         if let Some(f) = self.perf_map.as_mut() {
             use std::io::Write;
@@ -1006,7 +1081,13 @@ impl Jit {
             phys: start,
             block: idx + 1,
         };
-        Ok(func)
+        func
+    }
+
+    fn flush_perf_map(&mut self) {
+        if let Some(f) = self.perf_map.as_mut() {
+            let _ = std::io::Write::flush(f);
+        }
     }
 
     /// Drops all compiled code.
@@ -1018,10 +1099,11 @@ impl Jit {
         self.code_filter.fill(0);
         self.jcache.fill(EMPTY_JENTRY);
         self.arena.reset();
+        self.mapped.clear();
     }
 
     /// Installs the compiled code. Returns the block function.
-    fn install(&mut self, r: Compiled, syms: &Syms) -> Result<BlockFn, String> {
+    fn install(&mut self, r: Compiled) -> Result<BlockFn, String> {
         let req = r.request;
         let block = Block {
             func: std::ptr::null(),
@@ -1032,19 +1114,19 @@ impl Jit {
             start: req.phys,
             instrs: req.instrs.len() as u32,
             size: 0,
-            relocs: r.relocs,
             age: 0,
             used: true,
         };
-        let func = match self.add_block(block, &r.machine_code, syms) {
+        let func = match self.add_block(block, &r.machine_code) {
             Ok(f) => f,
             Err(block) => {
                 // The arena is full: drop all compiled code.
                 self.flush();
-                self.add_block(block, &r.machine_code, syms)
+                self.add_block(block, &r.machine_code)
                     .map_err(|_| "JIT block too large")?
             }
         };
+        self.flush_perf_map();
         self.stats.compiled += 1;
         self.stats.compiled_instrs += req.instrs.len() as u64;
         self.stats.compile_time += r.time;
@@ -1052,7 +1134,7 @@ impl Jit {
     }
 
     /// Installs the blocks compiled in the background.
-    fn install_pending(&mut self, code_pages: &mut CodePages, syms: &Syms) -> Result<(), String> {
+    fn install_pending(&mut self, code_pages: &mut CodePages) -> Result<(), String> {
         loop {
             let Some(r) = self.worker.as_ref().and_then(|w| w.rx.try_recv().ok()) else {
                 return Ok(());
@@ -1060,7 +1142,7 @@ impl Jit {
             let r = r?;
             self.pending.remove(&(r.request.vpc, r.request.phys));
             code_pages.mark(r.request.code_ofs);
-            self.install(r, syms)?;
+            self.install(r)?;
         }
     }
 }
@@ -1082,13 +1164,14 @@ struct Request {
 struct Compiled {
     request: Request,
     machine_code: Vec<u8>,
-    relocs: Vec<JitReloc>,
     time: Duration,
 }
 
 /// The Cranelift code generator.
 struct Compiler {
     isa: OwnedTargetIsa,
+    /// The optimizing ISA, created on first use.
+    isa_opt: Option<OwnedTargetIsa>,
     ctx: Context,
     fctx: FunctionBuilderContext,
 }
@@ -1198,10 +1281,15 @@ fn compile_stubs(arena: &mut CodeArena) -> Result<[u64; 3], String> {
 
 /// Returns the code generator for the host.
 fn host_isa() -> Result<OwnedTargetIsa, String> {
+    host_isa_opt(false)
+}
+
+/// Returns the host ISA, with Cranelift's optimizations if optimize is
+/// set. Without them, compiling is several times faster.
+fn host_isa_opt(optimize: bool) -> Result<OwnedTargetIsa, String> {
     let mut flags = settings::builder();
-    // The generated IR is already simple; Cranelift's optimizations
-    // do not make it faster but make compiling slower.
-    flags.set("opt_level", "none").map_err(|e| e.to_string())?;
+    let level = if optimize { "speed" } else { "none" };
+    flags.set("opt_level", level).map_err(|e| e.to_string())?;
     flags
         .set("enable_verifier", "false")
         .map_err(|e| e.to_string())?;
@@ -1219,6 +1307,7 @@ impl Compiler {
     fn new() -> Result<Compiler, String> {
         Ok(Compiler {
             isa: host_isa()?,
+            isa_opt: None,
             ctx: Context::new(),
             fctx: FunctionBuilderContext::new(),
         })
@@ -1227,11 +1316,18 @@ impl Compiler {
     /// Compiles the block into machine code.
     fn compile(&mut self, req: Request) -> Result<Compiled, String> {
         let start = Instant::now();
-        let ptr = self.isa.pointer_type();
+        if req.env.optimize && self.isa_opt.is_none() {
+            self.isa_opt = Some(host_isa_opt(true)?);
+        }
+        let isa = match &self.isa_opt {
+            Some(isa) if req.env.optimize => isa,
+            _ => &self.isa,
+        };
+        let ptr = isa.pointer_type();
         self.ctx.clear();
         self.ctx.func.signature = block_signature(ptr);
 
-        let frontend_config = self.isa.frontend_config();
+        let frontend_config = isa.frontend_config();
         {
             let mut b = FunctionBuilder::new(&mut self.ctx.func, &mut self.fctx);
             let mut t = Translator::new(&mut b, ptr, req.env, req.vpc);
@@ -1242,32 +1338,16 @@ impl Compiler {
 
         let compiled = self
             .ctx
-            .compile(&*self.isa, &mut ControlPlane::default())
+            .compile(&**isa, &mut ControlPlane::default())
             .map_err(|e| format!("JIT compile failed at {:x}: {:?}", req.vpc, e.inner))?;
-        let machine_code = compiled.code_buffer().to_vec();
-        let mut relocs = Vec::new();
-        for r in compiled.buffer.relocs() {
-            let FinalizedRelocTarget::ExternalName(ExternalName::User(name)) = r.target else {
-                return Err(format!("JIT: unexpected relocation target {:?}", r.target));
-            };
-            if r.kind != Reloc::Abs8 {
-                return Err(format!("JIT: unexpected relocation {:?}", r.kind));
-            }
-            relocs.push((r.offset, name, r.addend));
+        // The code must be position independent.
+        if let Some(r) = compiled.buffer.relocs().first() {
+            return Err(format!("JIT: unexpected relocation {:?}", r.kind));
         }
-        let names = self.ctx.func.params.user_named_funcs();
-        let relocs = relocs
-            .into_iter()
-            .map(|(offset, name, addend)| JitReloc {
-                offset,
-                sym: names[name].index as u8,
-                addend,
-            })
-            .collect();
+        let machine_code = compiled.code_buffer().to_vec();
         Ok(Compiled {
             request: req,
             machine_code,
-            relocs,
             time: start.elapsed(),
         })
     }
@@ -1302,6 +1382,10 @@ impl Worker {
 #[derive(Clone, Copy)]
 struct CodegenEnv {
     inline_stores: bool,
+    /// Compile with Cranelift's optimizations. Optimized and
+    /// unoptimized code are interchangeable, so this is not part of the
+    /// code cache fingerprint.
+    optimize: bool,
 }
 
 /// Host addresses used by the generated code. The code refers to them
@@ -1316,33 +1400,11 @@ enum Sym {
     JCache,
 }
 
-const NUM_SYMS: usize = 5;
+pub(super) const NUM_SYMS: usize = 5;
 
 /// Values of the symbols, indexed by Sym.
-type Syms = [u64; NUM_SYMS];
-
-/// A relocation in the generated code: the 8 bytes at offset are set
-/// to the symbol value plus addend.
-#[derive(Clone, Copy, Debug)]
-struct JitReloc {
-    offset: u32,
-    sym: u8,
-    addend: i64,
-}
-
-/// Patches the relocations of the code at ptr.
-///
-/// # Safety
-/// The code at ptr must be writable and contain the relocated
-/// locations.
-unsafe fn apply_relocs(ptr: *mut u8, relocs: &[JitReloc], syms: &Syms) {
-    for r in relocs {
-        let v = (syms[r.sym as usize] as i64).wrapping_add(r.addend);
-        std::ptr::write_unaligned(ptr.add(r.offset as usize) as *mut i64, v);
-    }
-}
-
 const OFS_X: i32 = offset_of!(Cpu, x) as i32;
+const OFS_ADDRS: i32 = offset_of!(Cpu, jit_addrs) as i32;
 const OFS_F: i32 = offset_of!(Cpu, f) as i32;
 const OFS_MSTATUS: i32 = offset_of!(Cpu, mstatus) as i32;
 const OFS_PC: i32 = offset_of!(Cpu, pc) as i32;
@@ -1376,6 +1438,12 @@ struct Translator<'a, 'b> {
     cpu: Value,
     /// Loop header following the register loads.
     header: cranelift_codegen::ir::Block,
+    /// Blocks of the guest PCs that jumps can target inside the
+    /// function: the start, and in regions the branch and jump targets.
+    leaders: HashMap<u64, cranelift_codegen::ir::Block>,
+    /// Leaders whose code has been started; jumps to them are
+    /// backward jumps.
+    visited: HashSet<u64>,
     /// Instructions executed by the completed loop iterations.
     count: Variable,
     start_vpc: u64,
@@ -1384,7 +1452,6 @@ struct Translator<'a, 'b> {
     /// depend on the virtual address of the guest code.
     entry_pc: Value,
     vars: [Option<Variable>; 32],
-    syms: [Option<GlobalValue>; NUM_SYMS],
     /// TLB key for data accesses, which compiled code cannot change.
     data_key: Value,
     /// Shared exit blocks.
@@ -1416,11 +1483,12 @@ impl<'a, 'b> Translator<'a, 'b> {
             env,
             cpu,
             header,
+            leaders: HashMap::from([(start_vpc, header)]),
+            visited: HashSet::new(),
             count,
             start_vpc,
             entry_pc,
             vars: [None; 32],
-            syms: [None; NUM_SYMS],
             data_key,
             exit_blk: None,
             chain_blk: None,
@@ -1430,26 +1498,13 @@ impl<'a, 'b> Translator<'a, 'b> {
         }
     }
 
-    /// Returns the host address of the symbol.
+    /// Returns the host address of the symbol, which the CPU state
+    /// holds so that the code is position independent.
     fn sym(&mut self, s: Sym) -> Value {
-        let gv = match self.syms[s as usize] {
-            Some(gv) => gv,
-            None => {
-                let name = self
-                    .b
-                    .func
-                    .declare_imported_user_function(UserExternalName::new(0, s as u32));
-                let gv = self.b.create_global_value(GlobalValueData::Symbol {
-                    name: ExternalName::user(name),
-                    offset: Imm64::new(0),
-                    colocated: false,
-                    tls: false,
-                });
-                self.syms[s as usize] = Some(gv);
-                gv
-            }
-        };
-        self.b.ins().symbol_value(self.ptr, gv)
+        let f = MemFlagsData::trusted().with_readonly().with_can_move();
+        self.b
+            .ins()
+            .load(self.ptr, f, self.cpu, OFS_ADDRS + 8 * s as i32)
     }
 
     fn flags() -> MemFlagsData {
@@ -1622,28 +1677,97 @@ impl<'a, 'b> Translator<'a, 'b> {
     }
 
     /// Jumps to the guest PC target after n instructions of the
-    /// current iteration. A jump to the block start loops in native
-    /// code until the loop limit is reached.
+    /// current basic block. Jumps to the block start, and in regions
+    /// to the region's branch targets, stay in native code; backward
+    /// jumps loop until the loop limit is reached.
     fn jump_to(&mut self, target: u64, n: u64) {
         let pcv = self.pc_value(target);
-        if target != self.start_vpc {
+        let Some(&blk) = self.leaders.get(&target) else {
             self.chain_exit(pcv, n);
             return;
-        }
+        };
         let total = self.total(n);
         self.b.def_var(self.count, total);
+        if !self.visited.contains(&target) {
+            self.b.ins().jump(blk, &[]);
+            return;
+        }
         let more = self
             .b
             .ins()
             .icmp_imm_s(IntCC::SignedLessThan, total, LOOP_LIMIT);
         let out = self.b.create_block();
-        self.b.ins().brif(more, self.header, &[], out, &[]);
+        self.b.ins().brif(more, blk, &[], out, &[]);
         self.b.switch_to_block(out);
         self.exit_with(pcv, total, EXIT_OK);
     }
 
+    /// Translates a region from decode_region. The instructions are
+    /// in address order and each basic block starts at a leader.
+    fn translate_region(&mut self, instrs: &[BlockInstr]) {
+        for bi in instrs {
+            if !bi.last {
+                continue;
+            }
+            let target = bi.pc.wrapping_add(bi.instr.imm as i64 as u64);
+            let next = bi.pc.wrapping_add(bi.size);
+            let succ: &[u64] = match bi.instr.op {
+                Op::Jalr => &[],
+                Op::Jal => &[target],
+                _ => &[target, next],
+            };
+            for &t in succ {
+                if instrs.binary_search_by_key(&t, |b| b.pc).is_ok()
+                    && !self.leaders.contains_key(&t)
+                {
+                    let blk = self.b.create_block();
+                    self.leaders.insert(t, blk);
+                }
+            }
+        }
+        self.b.ins().jump(self.header, &[]);
+        // Instructions of the current basic block, or None if the
+        // previous instruction ended it.
+        let mut k: Option<u64> = None;
+        for (i, bi) in instrs.iter().enumerate() {
+            if let Some(&blk) = self.leaders.get(&bi.pc) {
+                if let Some(n) = k {
+                    self.jump_to(bi.pc, n);
+                }
+                self.b.switch_to_block(blk);
+                self.visited.insert(bi.pc);
+                k = Some(0);
+            }
+            let Some(n) = k else {
+                // Not reachable by fall-through or a jump.
+                continue;
+            };
+            if self.instr(n, bi) {
+                k = None;
+                continue;
+            }
+            let next = bi.pc.wrapping_add(bi.size);
+            if instrs.get(i + 1).is_some_and(|b| b.pc == next) {
+                k = Some(n + 1);
+            } else {
+                self.jump_to(next, n + 1);
+                k = None;
+            }
+        }
+        if let Some(n) = k {
+            let last = instrs.last().unwrap();
+            self.jump_to(last.pc.wrapping_add(last.size), n);
+        }
+        self.finish();
+    }
+
     fn translate(&mut self, instrs: &[BlockInstr]) {
         self.load_regs(instrs);
+        if self.env.optimize {
+            self.translate_region(instrs);
+            return;
+        }
+        self.visited.insert(self.start_vpc);
 
         self.b.ins().jump(self.header, &[]);
         self.b.switch_to_block(self.header);
@@ -1675,9 +1799,16 @@ impl<'a, 'b> Translator<'a, 'b> {
         self.b.ins().uextend(types::I64, c)
     }
 
-    /// Computes the inline TLB hit condition and the host address of
-    /// a size byte access with the required PTE flags.
-    fn tlb_fast(&mut self, addr: Value, size: i64, need: u8) -> (Value, Value) {
+    /// Emits the inline TLB lookup of a size byte access that needs the
+    /// host flag bit. Continues at slow on a miss, otherwise returns the
+    /// host address in a new current block.
+    fn tlb_fast(
+        &mut self,
+        addr: Value,
+        size: i64,
+        need: u8,
+        slow: cranelift_codegen::ir::Block,
+    ) -> Value {
         let f = Self::flags();
         let vpn = self.b.ins().ushr_imm_s(addr, 12);
         let idx = self.b.ins().band_imm_s(vpn, 0xfff);
@@ -1697,15 +1828,19 @@ impl<'a, 'b> Translator<'a, 'b> {
         let tag = self.b.ins().bor(tag, self.data_key);
         let e_tag = self.b.ins().load(types::I64, f, ent, TLB_TAG);
         let ok = self.b.ins().icmp(IntCC::Equal, e_tag, tag);
+        let hit = self.b.create_block();
+        self.b.ins().brif(ok, hit, &[], slow, &[]);
 
+        // Separate branches are shorter than combining the conditions.
+        self.b.switch_to_block(hit);
         let e_flags = self.b.ins().uload8(types::I32, f, ent, TLB_HOST_FLAGS);
-        let masked = self.b.ins().band_imm_s(e_flags, need as i64);
-        let c_flags = self.b.ins().icmp_imm_s(IntCC::Equal, masked, need as i64);
-        let ok = self.b.ins().band(ok, c_flags);
+        let allowed = self.b.ins().band_imm_s(e_flags, need as i64);
+        let fast = self.b.create_block();
+        self.b.ins().brif(allowed, fast, &[], slow, &[]);
 
+        self.b.switch_to_block(fast);
         let delta = self.b.ins().load(types::I64, f, ent, TLB_HOST_DELTA);
-        let host = self.b.ins().iadd(addr, delta);
-        (ok, host)
+        self.b.ins().iadd(addr, delta)
     }
 
     /// Returns the signature reference, importing the signature with
@@ -1730,16 +1865,13 @@ impl<'a, 'b> Translator<'a, 'b> {
 
     /// Emits a guest load. Faults exit the block at the instruction.
     fn load(&mut self, k: u64, pc: u64, addr: Value, size: i64, signed: bool) -> Value {
-        let (ok, host) = self.tlb_fast(addr, size, PTE_R);
-        let fast = self.b.create_block();
         let slow = self.b.create_block();
         let done = self.b.create_block();
         self.b.append_block_param(done, types::I64);
         self.b.set_cold_block(slow);
-        self.b.ins().brif(ok, fast, &[], slow, &[]);
 
         // Fast path: direct RAM access.
-        self.b.switch_to_block(fast);
+        let host = self.tlb_fast(addr, size, PTE_R, slow);
         let f = MemFlagsData::new();
         let v = match (size, signed) {
             (1, false) => self.b.ins().uload8(types::I64, f, host, 0),
@@ -1791,11 +1923,8 @@ impl<'a, 'b> Translator<'a, 'b> {
             // Pages with compiled code have no direct write permission,
             // so stores to them take the slow path, which invalidates
             // the code.
-            let (ok, host) = self.tlb_fast(addr, size, PTE_W | PTE_D);
-            let fast = self.b.create_block();
-            self.b.ins().brif(ok, fast, &[], slow, &[]);
-
-            self.b.switch_to_block(fast);
+            // PTE_W in host_flags implies PTE_D.
+            let host = self.tlb_fast(addr, size, PTE_W, slow);
             let f = MemFlagsData::new();
             match size {
                 1 => {
@@ -2464,11 +2593,12 @@ impl Cpu {
     /// background thread if background is set.
     pub fn enable_jit(&mut self, hot_threshold: u16, background: bool) -> Result<(), String> {
         self.jit = Some(Box::new(Jit::new(hot_threshold, background)?));
+        self.jit_addrs = self.jit_addresses();
         Ok(())
     }
 
     /// Returns the host addresses the generated code refers to.
-    fn jit_syms(&self) -> Syms {
+    fn jit_addresses(&self) -> [u64; NUM_SYMS] {
         let mut syms = [0; NUM_SYMS];
         syms[Sym::Tlb as usize] = self.tlb.as_ptr() as u64;
         let stubs = self.jit.as_ref().map_or([0; 3], |j| j.stubs);
@@ -2556,9 +2686,8 @@ impl Cpu {
         if !jit.pending.is_empty() {
             jit.poll = jit.poll.wrapping_add(1);
             if jit.poll % 64 == 0 {
-                let syms = self.jit_syms();
                 let jit = self.jit.as_mut().unwrap();
-                jit.install_pending(code_pages!(self), &syms)
+                jit.install_pending(code_pages!(self))
                     .map_err(Exception::fatal)?;
             }
         }
@@ -2600,7 +2729,6 @@ impl Cpu {
         let Some(req) = Jit::request(self, pc, phys, epoch) else {
             return Ok(None);
         };
-        let syms = self.jit_syms();
         let jit = self.jit.as_mut().unwrap();
         if let Some(worker) = jit.worker.as_ref() {
             worker
@@ -2617,9 +2745,7 @@ impl Cpu {
             .compile(req)
             .map_err(Exception::fatal)?;
         code_pages!(self).mark(compiled.request.code_ofs);
-        jit.install(compiled, &syms)
-            .map(Some)
-            .map_err(Exception::fatal)
+        jit.install(compiled).map(Some).map_err(Exception::fatal)
     }
 
     /// Runs the compiled block. Returns Ok(true) if the block executed
@@ -2667,7 +2793,7 @@ impl Cpu {
 }
 
 /// Code cache file format version.
-const CACHE_VERSION: u32 = 5;
+const CACHE_VERSION: u32 = 6;
 const CACHE_MAGIC: &[u8; 8] = b"RSEMUJIT";
 /// Blocks loaded from the cache but not used in this many runs are
 /// dropped from the cache.
@@ -2686,19 +2812,22 @@ fn cache_fingerprint(env: CodegenEnv) -> Result<u64, String> {
 }
 
 /// Returns the fingerprint of the emulator binary and the host CPU.
+/// The binary is identified by its file identity and modification
+/// time, which change when it is rebuilt, so that starting does not
+/// need to read it.
 fn host_fingerprint() -> Result<u64, String> {
-    let exe = std::fs::read("/proc/self/exe")
-        .or_else(|_| std::env::current_exe().and_then(std::fs::read))
+    use std::os::unix::fs::MetadataExt;
+    let exe = std::fs::metadata("/proc/self/exe")
+        .or_else(|_| std::env::current_exe().and_then(std::fs::metadata))
         .map_err(|e| format!("failed to read the emulator binary: {}", e))?;
     let isa = host_isa()?;
     let mut h = FxHasher::default();
     h.write_u64(CACHE_VERSION as u64);
-    h.write_u64(exe.len() as u64);
-    for c in exe.chunks(8) {
-        let mut w = [0u8; 8];
-        w[..c.len()].copy_from_slice(c);
-        h.write_u64(u64::from_le_bytes(w));
+    for v in [exe.dev(), exe.ino(), exe.size()] {
+        h.write_u64(v);
     }
+    h.write_i64(exe.mtime());
+    h.write_i64(exe.mtime_nsec());
     h.write(isa.flags().to_string().as_bytes());
     for v in isa.isa_flags() {
         h.write(v.to_string().as_bytes());
@@ -2739,18 +2868,77 @@ impl<'a> Reader<'a> {
     }
 }
 
+/// A read-only executable mapping of a code cache file. Blocks loaded
+/// from the file run in place.
+struct Mapping {
+    ptr: *mut u8,
+    len: usize,
+}
+
+impl Mapping {
+    fn new(file: &std::fs::File) -> Result<Mapping, String> {
+        use std::os::fd::AsRawFd;
+        let len = file.metadata().map_err(|e| e.to_string())?.len() as usize;
+        if len == 0 {
+            return Err("truncated file".to_string());
+        }
+        // SAFETY: maps the file privately; the code cache is replaced
+        // by renaming a new file, never written in place.
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_EXEC,
+                libc::MAP_PRIVATE,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            return Err(format!("mmap: {}", std::io::Error::last_os_error()));
+        }
+        Ok(Mapping {
+            ptr: ptr as *mut u8,
+            len,
+        })
+    }
+
+    fn data(&self) -> &[u8] {
+        // SAFETY: the mapping is readable and len bytes long.
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+
+impl Drop for Mapping {
+    fn drop(&mut self) {
+        // SAFETY: unmaps the mapping created in new().
+        unsafe {
+            libc::munmap(self.ptr as *mut libc::c_void, self.len);
+        }
+    }
+}
+
+/// Alignment of the machine code in the code cache file.
+const CACHE_CODE_ALIGN: usize = 16;
+
+// Code cache file format, little endian:
+//
+//   magic, version u32, fingerprint u64, block count u32,
+//   code area offset u64 (page aligned)
+//   per block: vpc u64, start u64, phys u64, instrs u32, age u8,
+//              guest code length u32 and bytes,
+//              machine code offset u64 (in the code area) and length u32
+//   code area: the machine code of the blocks
+
 impl Jit {
-    /// Loads the blocks of the code cache file. The blocks are
-    /// validated against the guest code before they first run.
-    fn load_cache(
-        &mut self,
-        path: &Path,
-        fingerprint: u64,
-        mem_size: u64,
-        syms: &Syms,
-    ) -> Result<(), String> {
-        let data = std::fs::read(path).map_err(|e| e.to_string())?;
-        let mut r = Reader { data: &data };
+    /// Loads the blocks of the code cache file. The file is mapped
+    /// and the blocks run in place. They are validated against the
+    /// guest code before they first run.
+    fn load_cache(&mut self, path: &Path, fingerprint: u64, mem_size: u64) -> Result<(), String> {
+        let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+        let map = Mapping::new(&file)?;
+        let data = map.data();
+        let mut r = Reader { data };
         if r.bytes(8)? != CACHE_MAGIC || r.u32()? != CACHE_VERSION {
             return Err("not a JIT code cache".to_string());
         }
@@ -2758,6 +2946,12 @@ impl Jit {
             return Err("built by a different emulator binary or host CPU, ignoring".to_string());
         }
         let count = r.u32()?;
+        let code_area = r.u64()? as usize;
+        if code_area > data.len() || !code_area.is_multiple_of(PAGE_SIZE as usize) {
+            return Err("invalid code area".to_string());
+        }
+        let code_len = data.len() - code_area;
+        let mut blocks = Vec::with_capacity(count.min(1 << 20) as usize);
         for _ in 0..count {
             let vpc = r.u64()?;
             let start = r.u64()?;
@@ -2765,22 +2959,14 @@ impl Jit {
             let instrs = r.u32()?;
             let age = r.u8()?;
             let code = r.vec()?.to_vec();
-            let machine_code = r.vec()?;
-            let nrelocs = r.u32()?;
-            let mut relocs = Vec::with_capacity(nrelocs.min(1024) as usize);
-            for _ in 0..nrelocs {
-                let offset = r.u32()?;
-                let sym = r.u8()?;
-                let addend = r.u64()? as i64;
-                if sym as usize >= NUM_SYMS || offset as usize + 8 > machine_code.len() {
-                    return Err("invalid relocation".to_string());
-                }
-                relocs.push(JitReloc {
-                    offset,
-                    sym,
-                    addend,
-                });
+            let mc_ofs = r.u64()? as usize;
+            let mc_len = r.u32()? as usize;
+            if mc_ofs.checked_add(mc_len).is_none_or(|end| end > code_len) {
+                return Err("invalid machine code range".to_string());
             }
+            blocks.push((vpc, start, code_ofs, instrs, age, code, mc_ofs, mc_len));
+        }
+        for (vpc, start, code_ofs, instrs, age, code, mc_ofs, mc_len) in blocks {
             // Skip blocks outside the guest RAM.
             if start >= mem_size || code_ofs.saturating_add(code.len() as u64) > mem_size {
                 continue;
@@ -2794,28 +2980,22 @@ impl Jit {
                 start,
                 instrs,
                 size: 0,
-                relocs,
                 age,
                 used: false,
             };
-            if self.add_block(block, machine_code, syms).is_err() {
-                break;
-            }
+            // SAFETY: the range is inside the mapping.
+            let entry = unsafe { map.ptr.add(code_area + mc_ofs) };
+            self.add_code(block, entry, mc_len);
             self.stats.loaded += 1;
         }
+        self.mapped.push(map);
+        self.flush_perf_map();
         Ok(())
     }
 
     /// Writes the valid blocks to the code cache file. Returns the
     /// number of saved blocks and the file size.
     fn save_cache(&mut self, path: &Path, fingerprint: u64) -> Result<(usize, usize), String> {
-        let mut out = Vec::new();
-        out.extend_from_slice(CACHE_MAGIC);
-        out.extend_from_slice(&CACHE_VERSION.to_le_bytes());
-        out.extend_from_slice(&fingerprint.to_le_bytes());
-        let count_pos = out.len();
-        out.extend_from_slice(&0u32.to_le_bytes());
-
         // Blocks used in this run first, so that they win over unused
         // blocks for the same code.
         let mut blocks: Vec<(u8, u32)> = self
@@ -2830,6 +3010,8 @@ impl Jit {
             .collect();
         blocks.sort_unstable();
         let mut seen = HashSet::new();
+        let mut meta = Vec::new();
+        let mut code = Vec::new();
         let mut count = 0u32;
         for (age, idx) in blocks {
             let b = &self.blocks[idx as usize];
@@ -2837,29 +3019,37 @@ impl Jit {
             if !seen.insert((b.code_key(), b.phys & (PAGE_SIZE - 1), &b.code)) {
                 continue;
             }
-            // SAFETY: the block's machine code is in the arena.
+            // SAFETY: the block's machine code is in the arena or in a
+            // mapped cache file.
             let machine_code = unsafe { std::slice::from_raw_parts(b.func, b.size as usize) };
-            out.extend_from_slice(&b.vpc.to_le_bytes());
-            out.extend_from_slice(&b.start.to_le_bytes());
-            out.extend_from_slice(&b.phys.to_le_bytes());
-            out.extend_from_slice(&b.instrs.to_le_bytes());
-            out.push(age);
-            out.extend_from_slice(&(b.code.len() as u32).to_le_bytes());
-            out.extend_from_slice(&b.code);
-            out.extend_from_slice(&(machine_code.len() as u32).to_le_bytes());
-            out.extend_from_slice(machine_code);
-            out.extend_from_slice(&(b.relocs.len() as u32).to_le_bytes());
-            for r in &b.relocs {
-                out.extend_from_slice(&r.offset.to_le_bytes());
-                out.push(r.sym);
-                out.extend_from_slice(&r.addend.to_le_bytes());
-            }
+            code.resize(code.len().next_multiple_of(CACHE_CODE_ALIGN), 0);
+            meta.extend_from_slice(&b.vpc.to_le_bytes());
+            meta.extend_from_slice(&b.start.to_le_bytes());
+            meta.extend_from_slice(&b.phys.to_le_bytes());
+            meta.extend_from_slice(&b.instrs.to_le_bytes());
+            meta.push(age);
+            meta.extend_from_slice(&(b.code.len() as u32).to_le_bytes());
+            meta.extend_from_slice(&b.code);
+            meta.extend_from_slice(&(code.len() as u64).to_le_bytes());
+            meta.extend_from_slice(&(machine_code.len() as u32).to_le_bytes());
+            code.extend_from_slice(machine_code);
             count += 1;
         }
-        out[count_pos..count_pos + 4].copy_from_slice(&count.to_le_bytes());
+        let mut out = Vec::with_capacity(meta.len() + code.len() + 2 * PAGE_SIZE as usize);
+        out.extend_from_slice(CACHE_MAGIC);
+        out.extend_from_slice(&CACHE_VERSION.to_le_bytes());
+        out.extend_from_slice(&fingerprint.to_le_bytes());
+        out.extend_from_slice(&count.to_le_bytes());
+        let header = out.len() + 8;
+        let code_area = (header + meta.len()).next_multiple_of(PAGE_SIZE as usize);
+        out.extend_from_slice(&(code_area as u64).to_le_bytes());
+        out.extend_from_slice(&meta);
+        out.resize(code_area, 0);
+        out.extend_from_slice(&code);
 
         // Write atomically so that a concurrent run never sees a
-        // partial file.
+        // partial file, and the files that runs have mapped stay
+        // unchanged.
         let mut tmp = path.as_os_str().to_owned();
         tmp.push(format!(".tmp{}", std::process::id()));
         let tmp = PathBuf::from(tmp);
@@ -2873,7 +3063,7 @@ impl Jit {
 
     /// Waits for the background compiler to finish the pending
     /// blocks.
-    fn drain_pending(&mut self, code_pages: &mut CodePages, syms: &Syms) -> Result<(), String> {
+    fn drain_pending(&mut self, code_pages: &mut CodePages) -> Result<(), String> {
         // Do not delay the exit much for a long queue.
         let deadline = Instant::now() + Duration::from_secs(2);
         while !self.pending.is_empty() {
@@ -2887,7 +3077,7 @@ impl Jit {
             let r = r?;
             self.pending.remove(&(r.request.vpc, r.request.phys));
             code_pages.mark(r.request.code_ofs);
-            self.install(r, syms)?;
+            self.install(r)?;
         }
         Ok(())
     }
@@ -2905,6 +3095,16 @@ impl Cpu {
     fn jit_env(&self) -> CodegenEnv {
         CodegenEnv {
             inline_stores: self.overlay.is_none(),
+            optimize: self.jit.as_ref().is_some_and(|j| j.optimize),
+        }
+    }
+
+    /// Compiles blocks with Cranelift's optimizations, which makes
+    /// compiling several times slower and the code faster. Meant for
+    /// building a code cache ahead of time.
+    pub fn set_jit_optimize(&mut self, on: bool) {
+        if let Some(jit) = self.jit.as_mut() {
+            jit.optimize = on;
         }
     }
 
@@ -2931,14 +3131,20 @@ impl Cpu {
             ));
             return;
         }
-        let syms = self.jit_syms();
         let mem_size = self.mem.size();
-        let r = cache_fingerprint(self.jit_env()).and_then(|fp| {
-            self.jit
-                .as_mut()
-                .unwrap()
-                .load_cache(&path, fp, mem_size, &syms)
-        });
+        let start = Instant::now();
+        let r = cache_fingerprint(self.jit_env())
+            .and_then(|fp| self.jit.as_mut().unwrap().load_cache(&path, fp, mem_size));
+        if r.is_ok() {
+            let jit = self.jit.as_mut().unwrap();
+            let note = format!(
+                "JIT cache: loaded {} blocks from {} in {:.0?}",
+                jit.stats.loaded,
+                path.display(),
+                start.elapsed()
+            );
+            jit.cache_notes.push(note);
+        }
         if let Err(e) = r {
             let jit = self.jit.as_mut().unwrap();
             jit.flush();
@@ -2953,11 +3159,10 @@ impl Cpu {
         let Some(path) = self.jit.as_ref().and_then(|j| j.cache_path.clone()) else {
             return;
         };
-        let syms = self.jit_syms();
         let env = self.jit_env();
         let jit = self.jit.as_mut().unwrap();
         let r = jit
-            .drain_pending(code_pages!(self), &syms)
+            .drain_pending(code_pages!(self))
             .and_then(|_| cache_fingerprint(env))
             .and_then(|fp| jit.save_cache(&path, fp));
         jit.cache_notes.push(match r {

@@ -177,8 +177,9 @@ pub struct TlbEntry {
     pub host_delta: u64,
     /// Effective PTE flags.
     pub flags: u8,
-    /// The flags for direct host memory access: equal to flags for
-    /// pages in RAM, zero otherwise.
+    /// The flags for direct host memory access by compiled code:
+    /// flags for pages in RAM, zero otherwise. PTE_W is only set for
+    /// dirty pages without compiled code.
     pub host_flags: u8,
 }
 

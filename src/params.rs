@@ -23,6 +23,8 @@ pub struct Params {
     pub jit_sync: bool,
     /// File for saving and loading JIT compiled code.
     pub jit_cache: String,
+    /// Compiles with Cranelift's optimizations.
+    pub jit_opt: bool,
 }
 
 impl Params {

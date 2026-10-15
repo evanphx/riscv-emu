@@ -51,6 +51,9 @@ enum Exec<'a> {
     Interp,
     /// JIT compile every block on first use.
     Jit,
+    /// JIT compile every block on first use, with optimizations.
+    #[allow(dead_code)]
+    JitOpt,
     /// JIT with the code cache file.
     #[allow(dead_code)]
     JitCache(&'a Path),
@@ -100,7 +103,7 @@ fn run_test(file: &Path, exec: Exec) -> Result<Option<u64>, String> {
     cpu.overlay = Some(Box::new(htif));
     cpu.pc = f.entry;
 
-    if let Exec::Jit | Exec::JitCache(_) = exec {
+    if let Exec::Jit | Exec::JitOpt | Exec::JitCache(_) = exec {
         enable_jit(&mut cpu, exec)?;
         cpu.instret_limit = MAX_INSTRUCTIONS;
         cpu.run()?;
@@ -128,8 +131,10 @@ fn run_test(file: &Path, exec: Exec) -> Result<Option<u64>, String> {
 #[cfg(feature = "jit")]
 fn enable_jit(cpu: &mut Cpu, exec: Exec) -> Result<(), String> {
     cpu.enable_jit(1, false)?;
-    if let Exec::JitCache(path) = exec {
-        cpu.set_jit_cache(path);
+    match exec {
+        Exec::JitCache(path) => cpu.set_jit_cache(path),
+        Exec::JitOpt => cpu.set_jit_optimize(true),
+        _ => {}
     }
     Ok(())
 }
@@ -183,6 +188,7 @@ fn report(dir: &str, exec: Exec, filter: impl Fn(&str) -> bool) {
         match exec {
             Exec::Interp => "",
             Exec::Jit => " (JIT)",
+            Exec::JitOpt => " (optimizing JIT)",
             Exec::JitCache(_) => " (JIT cache)",
         },
         count,
@@ -216,6 +222,12 @@ fn isa_tests_jit() {
 #[test]
 fn vpu_tests_jit() {
     report("testdata/vpu", Exec::Jit, all);
+}
+
+#[cfg(feature = "jit")]
+#[test]
+fn isa_tests_jit_opt() {
+    report("testdata/isa", Exec::JitOpt, all);
 }
 
 /// Runs tests twice with a shared JIT code cache. All tests load their

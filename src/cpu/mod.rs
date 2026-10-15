@@ -109,6 +109,7 @@ pub fn configure_jit(cpu: &mut Cpu, params: &crate::Params) -> Result<(), String
             params.jit_threshold
         };
         cpu.enable_jit(threshold, !params.jit_sync)?;
+        cpu.set_jit_optimize(params.jit_opt);
         if !params.jit_cache.is_empty() {
             cpu.set_jit_cache(&params.jit_cache);
         }
@@ -230,6 +231,9 @@ pub struct Cpu {
     /// Value loaded by the JIT load helper.
     #[cfg(feature = "jit")]
     jit_value: u64,
+    /// Host addresses used by the JIT compiled code.
+    #[cfg(feature = "jit")]
+    jit_addrs: [u64; jit::NUM_SYMS],
 }
 
 /// The kind of result of executing one instruction.
@@ -301,6 +305,8 @@ impl Cpu {
             jit_fault: 0,
             #[cfg(feature = "jit")]
             jit_value: 0,
+            #[cfg(feature = "jit")]
+            jit_addrs: [0; jit::NUM_SYMS],
         };
         cpu.sync_mmu_state();
         cpu
