@@ -232,7 +232,13 @@ fn main() {
         return;
     }
 
-    // Linux userspace emulation.
+    // Linux userspace emulation. Like the guest program would, die
+    // on SIGPIPE when the output pipe closes.
+    // SAFETY: restoring the default disposition of a signal has no
+    // memory safety requirements.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     let envp: Vec<String> = std::env::vars().map(|(k, v)| format!("{}={}", k, v)).collect();
     if flags.args.is_empty() {
         usage();
