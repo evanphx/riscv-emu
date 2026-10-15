@@ -158,7 +158,20 @@ impl Cpu {
     #[cfg(feature = "jit")]
     pub(super) fn jit_probe_range(&mut self, lo: u64, hi: u64, write: bool) -> bool {
         if lo >> 12 != hi >> 12 {
-            return false;
+            // The range is accessible directly if both pages are, and
+            // they are adjacent in the host RAM mapping.
+            if hi - lo >= PAGE_SIZE {
+                return false;
+            }
+            let hi_page = hi & !0xfff;
+            if !self.jit_probe_range(lo, hi_page - 1, write)
+                || !self.jit_probe_range(hi_page, hi, write)
+            {
+                return false;
+            }
+            let d_lo = self.jtlb[((lo >> 12) & 0xfff) as usize].delta;
+            let d_hi = self.jtlb[((hi >> 12) & 0xfff) as usize].delta;
+            return d_lo == d_hi && self.jtlb_host(lo, 1, write).is_some();
         }
         if self.jtlb_host(lo, hi - lo + 1, write).is_some() {
             return true;
