@@ -1516,8 +1516,8 @@ impl<'a, 'b> Translator<'a, 'b> {
         let tlb = self.sym(Sym::Tlb);
         let ent = self.b.ins().iadd(tlb, eofs);
 
-        let key = self.b.ins().uload8(types::I64, f, self.cpu, OFS_DATA_KEY);
-        let tag = self.b.ins().ishl_imm_s(vpn, 4);
+        let key = self.b.ins().uload16(types::I64, f, self.cpu, OFS_DATA_KEY);
+        let tag = self.b.ins().band_imm_s(addr, !0xfff);
         let tag = self.b.ins().bor(tag, key);
         let e_tag = self.b.ins().load(types::I64, f, ent, TLB_TAG);
         let mut ok = self.b.ins().icmp(IntCC::Equal, e_tag, tag);
@@ -2466,7 +2466,7 @@ impl Cpu {
 }
 
 /// Code cache file format version.
-const CACHE_VERSION: u32 = 2;
+const CACHE_VERSION: u32 = 3;
 const CACHE_MAGIC: &[u8; 8] = b"RSEMUJIT";
 /// Blocks loaded from the cache but not used in this many runs are
 /// dropped from the cache.

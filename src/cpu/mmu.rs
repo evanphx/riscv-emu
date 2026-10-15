@@ -21,16 +21,25 @@ impl Cpu {
 
     /// Flushes the TLB.
     pub fn flush_tlb(&mut self) {
-        for e in self.tlb.iter_mut() {
-            e.tag = u64::MAX;
+        // Flushing changes the generation in the TLB keys. The entries
+        // are cleared only when the generation wraps around. The
+        // generation never reaches 0xff, so a tag is never u64::MAX,
+        // which marks unused entries.
+        self.tlb_gen += 1;
+        if self.tlb_gen == 0xff {
+            self.tlb_gen = 0;
+            for e in self.tlb.iter_mut() {
+                e.tag = u64::MAX;
+            }
         }
+        self.sync_mmu_state();
         self.new_jit_gen();
     }
 
     /// Invalidates the JIT jump cache entries.
     pub(super) fn new_jit_gen(&mut self) {
         self.jit_gen += 1;
-        self.jit_jkey = self.jit_gen << 8 | self.fetch_key as u64;
+        self.jit_jkey = self.jit_gen << 16 | self.fetch_key as u64;
     }
 
     /// Recomputes the cached translation state after changes to the
@@ -42,10 +51,10 @@ impl Cpu {
         } else {
             self.mode
         };
-        let bits = ((ms.sum() as u8) << 2) | ((ms.mxr() as u8) << 3);
-        self.data_key = self.data_mode as u8 | bits;
-        self.fetch_key = self.mode as u8 | bits;
-        self.jit_jkey = self.jit_gen << 8 | self.fetch_key as u64;
+        let bits = ((ms.sum() as u16) << 2) | ((ms.mxr() as u16) << 3) | (self.tlb_gen << 4);
+        self.data_key = self.data_mode as u16 | bits;
+        self.fetch_key = self.mode as u16 | bits;
+        self.jit_jkey = self.jit_gen << 16 | self.fetch_key as u64;
     }
 
     /// Translates the virtual address for the access type. The access
@@ -62,7 +71,7 @@ impl Cpu {
         }
         let vpn = vaddr >> 12;
         let tlb = &self.tlb[(vpn & 0xfff) as usize];
-        if tlb.tag == TlbEntry::tag(vpn, key) {
+        if tlb.tag == TlbEntry::tag(vaddr, key) {
             let need = if access & ACCESS_WRITE != 0 {
                 access | PTE_D
             } else {
@@ -81,7 +90,7 @@ impl Cpu {
         vaddr: u64,
         access: u8,
         mode: Mode,
-        key: u8,
+        key: u16,
     ) -> Result<u64, Exception> {
         let (page, flags, level) = self.walk_sv39(vaddr, access, mode)?;
         let offset_mask = match level {
@@ -99,7 +108,7 @@ impl Cpu {
             (0, 0)
         };
         self.tlb[(vpn & 0xfff) as usize] = TlbEntry {
-            tag: TlbEntry::tag(vpn, key),
+            tag: TlbEntry::tag(vaddr, key),
             page: page4k,
             host_delta,
             flags,

@@ -183,10 +183,11 @@ pub struct TlbEntry {
 }
 
 impl TlbEntry {
-    /// Returns the lookup tag of the virtual page number and key.
+    /// Returns the lookup tag of the virtual address and the key. The
+    /// key fits in the page offset bits; see Cpu::sync_mmu_state.
     #[inline(always)]
-    pub fn tag(vpn: u64, key: u8) -> u64 {
-        vpn << 4 | key as u64
+    pub fn tag(vaddr: u64, key: u16) -> u64 {
+        (vaddr & !0xfff) | key as u64
     }
 }
 

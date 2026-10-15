@@ -183,8 +183,12 @@ pub struct Cpu {
     tlb: Box<[TlbEntry; TLB_SIZE]>,
     /// Effective privilege mode for data accesses (MPRV).
     data_mode: Mode,
-    data_key: u8,
-    fetch_key: u8,
+    /// TLB keys for data accesses and instruction fetches: the TLB
+    /// generation, MXR, SUM, and the privilege mode.
+    data_key: u16,
+    fetch_key: u16,
+    /// TLB generation. Entries with another generation are invalid.
+    tlb_gen: u16,
     /// Generation of the instruction fetch translations and the guest
     /// code. Changes on TLB flushes and JIT code epochs.
     jit_gen: u64,
@@ -269,6 +273,7 @@ impl Cpu {
             data_mode: Mode::M,
             data_key: 0,
             fetch_key: 0,
+            tlb_gen: 0,
             jit_gen: 0,
             jit_jkey: 0,
             code_vpn: INVALID_PAGENUM,
