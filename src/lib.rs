@@ -9,6 +9,7 @@ pub mod dev;
 pub mod emulator;
 pub mod fdt;
 pub mod isa;
+pub mod kernel;
 pub mod logger;
 pub mod memory;
 pub mod mmu;
