@@ -160,8 +160,10 @@ impl fmt::Display for Pte {
 /// Number of TLB entries.
 pub const TLB_SIZE: usize = 4096;
 
-/// A Translation Lookaside Buffer entry.
+/// A Translation Lookaside Buffer entry. The layout is fixed for the
+/// JIT, which inlines TLB lookups.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(C)]
 pub struct TlbEntry {
     /// Virtual page number. `u64::MAX` marks an invalid entry.
     pub vpn: u64,

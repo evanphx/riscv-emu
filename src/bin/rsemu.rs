@@ -39,6 +39,7 @@ const FLAGS: &[FlagSpec] = &[
     FlagSpec { name: "dumpdtb", boolean: false, multi: false, usage: "dump DTB to `file`" },
     FlagSpec { name: "m", boolean: false, multi: false, usage: "guest RAM size" },
     FlagSpec { name: "nographic", boolean: true, multi: false, usage: "disable graphical output" },
+    FlagSpec { name: "jit", boolean: true, multi: false, usage: "enable the Cranelift JIT compiler" },
     FlagSpec { name: "drive", boolean: false, multi: true, usage: "configure drive" },
     FlagSpec { name: "device", boolean: false, multi: true, usage: "configure device" },
     FlagSpec { name: "netdev", boolean: false, multi: true, usage: "configure network device" },
@@ -145,6 +146,7 @@ fn main() {
         color: flags.bool("color"),
         cooked: flags.bool("cooked"),
         fs_root: flags.string("fsroot"),
+        jit: flags.bool("jit"),
     };
 
     if flags.bool("D") {

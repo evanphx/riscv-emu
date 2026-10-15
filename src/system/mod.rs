@@ -111,6 +111,9 @@ pub fn system_emulation(
     let mut cpu = Cpu::new(mem.clone());
     cpu.trace = params.cpu_trace;
     cpu.color = params.color;
+    if params.jit {
+        enable_jit(&mut cpu)?;
+    }
     let signals = cpu.signals.clone();
 
     let plic = Plic::new(vec![signals.clone()], PLIC_BASE);
@@ -316,23 +319,23 @@ pub fn system_emulation(
         u.start_peer();
     }
 
-    let (instret, runtime) = if let Some(g) = gpu {
+    let (instret, runtime, jit_stats) = if let Some(g) = gpu {
         // The display event loop runs on the main thread.
         let handle = std::thread::Builder::new()
             .name("cpu".to_string())
             .spawn(move || {
                 let r = cpu.run();
-                (r, cpu.instret, cpu.runtime)
+                (r, cpu.instret, cpu.runtime, jit_stats(&cpu))
             })
             .map_err(|e| e.to_string())?;
         g.event_loop(signals.clone());
         signals.shutdown();
-        let (r, instret, runtime) = handle.join().map_err(|_| "CPU thread panicked")?;
+        let (r, instret, runtime, stats) = handle.join().map_err(|_| "CPU thread panicked")?;
         r?;
-        (instret, runtime)
+        (instret, runtime, stats)
     } else {
         cpu.run()?;
-        (cpu.instret, cpu.runtime)
+        (cpu.instret, cpu.runtime, jit_stats(&cpu))
     };
 
     let secs = runtime.as_secs_f64();
@@ -346,6 +349,9 @@ pub fn system_emulation(
             0.0
         }
     );
+    if let Some(s) = jit_stats {
+        println!("{}", s);
+    }
     for v in &virtio_devices {
         v.stats();
     }
@@ -356,6 +362,26 @@ pub fn system_emulation(
         }
     }
     Ok(())
+}
+
+#[cfg(feature = "jit")]
+fn enable_jit(cpu: &mut Cpu) -> Result<(), String> {
+    cpu.enable_jit(crate::cpu::DEFAULT_HOT_THRESHOLD)
+}
+
+#[cfg(not(feature = "jit"))]
+fn enable_jit(_cpu: &mut Cpu) -> Result<(), String> {
+    Err("JIT support not compiled in (enable the `jit` feature)".to_string())
+}
+
+#[cfg(feature = "jit")]
+fn jit_stats(cpu: &Cpu) -> Option<String> {
+    cpu.jit_stats().map(|s| s.to_string())
+}
+
+#[cfg(not(feature = "jit"))]
+fn jit_stats(_cpu: &Cpu) -> Option<String> {
+    None
 }
 
 fn load_ram(mem: &Memory, paddr: u64, data: &[u8]) -> Result<(), String> {

@@ -44,7 +44,7 @@ const MAX_INSTRUCTIONS: u64 = 50_000_000;
 
 /// Runs the test ELF file. Returns Ok(None) on success, and
 /// Ok(Some(n)) if test case n failed.
-fn run_test(file: &Path) -> Result<Option<u64>, String> {
+fn run_test(file: &Path, jit: bool) -> Result<Option<u64>, String> {
     let mem = Arc::new(Memory::new(RAM_BASE, 0x200_0000));
     let mut cpu = Cpu::new(mem.clone());
     cpu.set_mode(Mode::M);
@@ -86,11 +86,17 @@ fn run_test(file: &Path) -> Result<Option<u64>, String> {
     cpu.overlay = Some(Box::new(htif));
     cpu.pc = f.entry;
 
-    while !cpu.signals.is_shutdown() {
-        if cpu.instret > MAX_INSTRUCTIONS {
-            return Err("timeout".to_string());
+    if jit {
+        enable_jit(&mut cpu)?;
+        cpu.instret_limit = MAX_INSTRUCTIONS;
+        cpu.run()?;
+    } else {
+        while !cpu.signals.is_shutdown() {
+            if cpu.instret > MAX_INSTRUCTIONS {
+                return Err("timeout".to_string());
+            }
+            cpu.step()?;
         }
-        cpu.step()?;
     }
 
     let status = status.load(Ordering::SeqCst);
@@ -100,7 +106,18 @@ fn run_test(file: &Path) -> Result<Option<u64>, String> {
     Ok(None)
 }
 
-fn test_suite(dir: &str) -> (usize, Vec<String>) {
+/// Enables the JIT so that every block is compiled on first use.
+#[cfg(feature = "jit")]
+fn enable_jit(cpu: &mut Cpu) -> Result<(), String> {
+    cpu.enable_jit(1)
+}
+
+#[cfg(not(feature = "jit"))]
+fn enable_jit(_cpu: &mut Cpu) -> Result<(), String> {
+    Ok(())
+}
+
+fn test_suite(dir: &str, jit: bool) -> (usize, Vec<String>) {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(dir);
     let mut entries: Vec<_> = std::fs::read_dir(&dir)
         .unwrap_or_else(|e| panic!("read_dir {:?}: {}", dir, e))
@@ -116,7 +133,7 @@ fn test_suite(dir: &str) -> (usize, Vec<String>) {
             continue;
         }
         count += 1;
-        match run_test(&path) {
+        match run_test(&path, jit) {
             Ok(None) => {}
             Ok(Some(n)) => failures.push(format!("{}: assertion {}", name, n)),
             Err(e) => failures.push(format!("{}: {}", name, e)),
@@ -125,15 +142,16 @@ fn test_suite(dir: &str) -> (usize, Vec<String>) {
     (count, failures)
 }
 
-fn report(dir: &str) {
+fn report(dir: &str, jit: bool) {
     isa::init_decode_tables();
-    let (count, failures) = test_suite(dir);
+    let (count, failures) = test_suite(dir, jit);
     for f in &failures {
         eprintln!("FAIL {}", f);
     }
     eprintln!(
-        "{}: {} tests, {} success, {} fail",
+        "{}{}: {} tests, {} success, {} fail",
         dir,
+        if jit { " (JIT)" } else { "" },
         count,
         count - failures.len(),
         failures.len()
@@ -143,10 +161,22 @@ fn report(dir: &str) {
 
 #[test]
 fn isa_tests() {
-    report("testdata/isa");
+    report("testdata/isa", false);
 }
 
 #[test]
 fn vpu_tests() {
-    report("testdata/vpu");
+    report("testdata/vpu", false);
+}
+
+#[cfg(feature = "jit")]
+#[test]
+fn isa_tests_jit() {
+    report("testdata/isa", true);
+}
+
+#[cfg(feature = "jit")]
+#[test]
+fn vpu_tests_jit() {
+    report("testdata/vpu", true);
 }

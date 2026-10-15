@@ -13,6 +13,8 @@ pub struct Params {
     pub color: bool,
     pub cooked: bool,
     pub fs_root: String,
+    /// Enables the JIT compiler.
+    pub jit: bool,
 }
 
 impl Params {

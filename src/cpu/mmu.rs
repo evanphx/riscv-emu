@@ -268,6 +268,10 @@ impl Cpu {
                 4 => mem.write_u32(ofs, v as u32),
                 _ => mem.write_u64(ofs, v),
             }
+            #[cfg(feature = "jit")]
+            if !self.jit_code_pages.is_empty() {
+                self.jit_code_write(ofs);
+            }
             if self.overlay.is_some() {
                 return self.overlay_store(paddr, size);
             }

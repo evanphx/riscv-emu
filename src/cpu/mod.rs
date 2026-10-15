@@ -3,6 +3,8 @@
 mod csr;
 mod debug;
 mod fpu;
+#[cfg(feature = "jit")]
+mod jit;
 mod mmu;
 pub mod softfloat;
 mod symtab;
@@ -10,6 +12,8 @@ mod trap;
 mod vpu;
 
 pub use debug::fmt_addr;
+#[cfg(feature = "jit")]
+pub use jit::{JitStats, DEFAULT_HOT_THRESHOLD};
 pub use symtab::{SymEntry, SystemMap};
 pub use vpu::Vpu;
 
@@ -172,6 +176,24 @@ pub struct Cpu {
     pub color: bool,
     last_symbol: Option<usize>,
     reg_trace: Option<Box<debug::RegTrace>>,
+
+    /// CPU time of the next interrupt check.
+    next_irq_check: u64,
+    /// The CPU stops with an error when instret reaches the limit.
+    pub instret_limit: u64,
+
+    #[cfg(feature = "jit")]
+    jit: Option<Box<jit::Jit>>,
+    /// Exception raised by a memory access of JIT compiled code.
+    #[cfg(feature = "jit")]
+    jit_exception: Option<Exception>,
+    /// Set when jit_exception holds an exception.
+    #[cfg(feature = "jit")]
+    jit_fault: u8,
+    /// Bitmap of RAM pages containing compiled code. Empty when the
+    /// JIT is disabled.
+    #[cfg(feature = "jit")]
+    jit_code_pages: Vec<u64>,
 }
 
 /// The kind of result of executing one instruction.
@@ -229,6 +251,16 @@ impl Cpu {
             color: false,
             last_symbol: None,
             reg_trace: None,
+            next_irq_check: 0,
+            instret_limit: u64::MAX,
+            #[cfg(feature = "jit")]
+            jit: None,
+            #[cfg(feature = "jit")]
+            jit_exception: None,
+            #[cfg(feature = "jit")]
+            jit_fault: 0,
+            #[cfg(feature = "jit")]
+            jit_code_pages: Vec::new(),
         };
         cpu.sync_mmu_state();
         cpu
@@ -459,19 +491,37 @@ impl Cpu {
     }
 
     fn run_loop(&mut self) -> Result<(), Exception> {
-        loop {
-            // Ensure monotonic clock.
-            self.time = self.time.wrapping_add(1);
+        #[cfg(feature = "jit")]
+        let use_jit = self.jit.is_some() && !self.debug_trace;
+        #[cfg(feature = "jit")]
+        let mut block_start = true;
 
+        loop {
             // Check interrupts every 64 ticks.
-            if self.time & 0x3f == 0 {
+            if self.time >= self.next_irq_check {
+                self.next_irq_check = (self.time | 0x3f) + 1;
                 if self.check_interrupts() {
+                    #[cfg(feature = "jit")]
+                    {
+                        block_start = true;
+                    }
                     continue;
                 }
                 if self.signals.is_shutdown() {
                     return Ok(());
                 }
+                if self.instret >= self.instret_limit {
+                    return Err(Exception::fatal("instruction limit reached"));
+                }
             }
+
+            #[cfg(feature = "jit")]
+            if use_jit && block_start && self.try_jit()? {
+                continue;
+            }
+
+            // Ensure monotonic clock.
+            self.time = self.time.wrapping_add(1);
 
             let raw = self.fetch()?;
             let instr = self.decode_cached(raw);
@@ -483,8 +533,19 @@ impl Cpu {
 
             let size = if raw & 0b11 == 0b11 { 4 } else { 2 };
             match self.execute(instr, raw, size)? {
-                Flow::Next => self.pc = self.pc.wrapping_add(size),
-                Flow::Jump => {}
+                Flow::Next => {
+                    self.pc = self.pc.wrapping_add(size);
+                    #[cfg(feature = "jit")]
+                    {
+                        block_start = !jit::jitable(instr.op);
+                    }
+                }
+                Flow::Jump => {
+                    #[cfg(feature = "jit")]
+                    {
+                        block_start = true;
+                    }
+                }
             }
         }
     }
@@ -816,6 +877,8 @@ impl Cpu {
 
             Fence | PrefetchI | PrefetchR | PrefetchW | CboInval | CboClean | CboFlush => {}
             FenceI => {
+                #[cfg(feature = "jit")]
+                self.jit_fence_i();
                 self.code_vpn = INVALID_PAGENUM;
                 self.flush_decode_cache();
             }
