@@ -50,6 +50,8 @@ pub trait Mmio: Send {
 /// HTIF tohost/fromhost registers).
 pub trait Overlay: Send {
     fn contains(&self, paddr: u64, size: u64) -> bool;
+    /// Tests if any byte of the range is in the overlay.
+    fn overlaps(&self, paddr: u64, size: u64) -> bool;
     fn store(&mut self, mem: &Memory, paddr: u64) -> Result<(), Exception>;
 }
 
@@ -161,8 +163,7 @@ impl fmt::Display for Pte {
 pub const TLB_SIZE: usize = 4096;
 
 /// A Translation Lookaside Buffer entry. Entries are per 4 KiB virtual
-/// page, also for superpages. The layout is fixed for the JIT, which
-/// inlines TLB lookups.
+/// page, also for superpages.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(C, align(32))]
 pub struct TlbEntry {
@@ -172,15 +173,33 @@ pub struct TlbEntry {
     pub tag: u64,
     /// Physical address of the 4 KiB page.
     pub page: u64,
-    /// Host address of the page minus the virtual page address, for
-    /// pages in RAM.
-    pub host_delta: u64,
     /// Effective PTE flags.
     pub flags: u8,
-    /// The flags for direct host memory access by compiled code:
-    /// flags for pages in RAM, zero otherwise. PTE_W is only set for
-    /// dirty pages without compiled code.
-    pub host_flags: u8,
+}
+
+/// The TLB entry of compiled code, which accesses RAM directly. An
+/// access hits if the tag of its kind equals the tag of the accessed
+/// page, so the permission check is part of the tag compare. The
+/// layout is fixed for the JIT, which inlines the lookups.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(C, align(32))]
+pub struct JitTlbEntry {
+    /// Tag for loads: as TlbEntry::tag for readable pages in RAM,
+    /// `u64::MAX` otherwise.
+    pub tag_r: u64,
+    /// Tag for stores: as TlbEntry::tag for writable, dirty pages in
+    /// RAM without compiled code, `u64::MAX` otherwise.
+    pub tag_w: u64,
+    /// Host address of the page minus the virtual page address.
+    pub delta: u64,
+}
+
+impl JitTlbEntry {
+    pub const INVALID: JitTlbEntry = JitTlbEntry {
+        tag_r: u64::MAX,
+        tag_w: u64::MAX,
+        delta: 0,
+    };
 }
 
 impl TlbEntry {
@@ -197,9 +216,7 @@ impl Default for TlbEntry {
         TlbEntry {
             tag: u64::MAX,
             page: 0,
-            host_delta: 0,
             flags: 0,
-            host_flags: 0,
         }
     }
 }

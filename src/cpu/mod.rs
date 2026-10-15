@@ -19,7 +19,7 @@ pub use vpu::Vpu;
 
 use crate::isa::{self, reg, Exception, Instr, Mode, Mstatus, Op, RegStatus, Trap};
 use crate::memory::{self, Memory, INVALID_PAGENUM};
-use crate::mmu::{Mmio, Overlay, Satp, TlbEntry, TLB_SIZE};
+use crate::mmu::{JitTlbEntry, Mmio, Overlay, Satp, TlbEntry, TLB_SIZE};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -188,6 +188,8 @@ pub struct Cpu {
     /// generation, MXR, SUM, and the privilege mode.
     data_key: u16,
     fetch_key: u16,
+    /// data_key as a 64-bit value for compiled code.
+    jit_data_key: u64,
     /// TLB generation. Entries with another generation are invalid.
     tlb_gen: u16,
     /// Superpages with TLB entries since the last flush.
@@ -234,6 +236,9 @@ pub struct Cpu {
     /// Host addresses used by the JIT compiled code.
     #[cfg(feature = "jit")]
     jit_addrs: [u64; jit::NUM_SYMS],
+    /// TLB of compiled code. It is part of the CPU state, so that
+    /// compiled code addresses it relative to the CPU pointer.
+    jtlb: [JitTlbEntry; TLB_SIZE],
 }
 
 /// The kind of result of executing one instruction.
@@ -278,6 +283,7 @@ impl Cpu {
             data_mode: Mode::M,
             data_key: 0,
             fetch_key: 0,
+            jit_data_key: 0,
             tlb_gen: 0,
             tlb_super: Default::default(),
             jit_gen: 0,
@@ -307,6 +313,7 @@ impl Cpu {
             jit_value: 0,
             #[cfg(feature = "jit")]
             jit_addrs: [0; jit::NUM_SYMS],
+            jtlb: [JitTlbEntry::INVALID; TLB_SIZE],
         };
         cpu.sync_mmu_state();
         cpu

@@ -35,7 +35,7 @@
 use super::Cpu;
 use crate::isa::{self, Exception, Instr, Op};
 use crate::memory::PAGE_SIZE;
-use crate::mmu::{TlbEntry, PTE_R, PTE_W};
+use crate::mmu::JitTlbEntry;
 use cranelift_codegen::control::ControlPlane;
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{
@@ -328,11 +328,11 @@ impl Hasher for FxHasher {
 
 /// The RAM pages that contain compiled code. Stores to them go
 /// through the CPU, which invalidates the code. Compiled code stores
-/// directly through TLB entries with PTE_W in host_flags, so the
-/// entries of code pages lose PTE_W.
+/// directly through the store tags of the JIT TLB, so the entries of
+/// code pages lose their store tags.
 struct CodePages<'a> {
     mem: &'a crate::memory::Memory,
-    tlb: &'a mut [TlbEntry],
+    jtlb: &'a mut [JitTlbEntry],
     /// Host address of RAM offset 0.
     ram: u64,
 }
@@ -344,9 +344,9 @@ impl CodePages<'_> {
             return;
         }
         let host = self.ram + (ofs & !0xfff);
-        for e in self.tlb.iter_mut() {
-            if e.host_flags & PTE_W != 0 && (e.tag & !0xfff).wrapping_add(e.host_delta) == host {
-                e.host_flags &= !PTE_W;
+        for e in self.jtlb.iter_mut() {
+            if e.tag_w != u64::MAX && (e.tag_w & !0xfff).wrapping_add(e.delta) == host {
+                e.tag_w = u64::MAX;
             }
         }
     }
@@ -358,7 +358,7 @@ macro_rules! code_pages {
     ($cpu:expr) => {
         &mut CodePages {
             mem: &$cpu.mem,
-            tlb: &mut $cpu.tlb[..],
+            jtlb: &mut $cpu.jtlb[..],
             ram: $cpu.mem.ptr_at(0) as u64,
         }
     };
@@ -1408,7 +1408,6 @@ const OFS_ADDRS: i32 = offset_of!(Cpu, jit_addrs) as i32;
 const OFS_F: i32 = offset_of!(Cpu, f) as i32;
 const OFS_MSTATUS: i32 = offset_of!(Cpu, mstatus) as i32;
 const OFS_PC: i32 = offset_of!(Cpu, pc) as i32;
-const OFS_DATA_KEY: i32 = offset_of!(Cpu, data_key) as i32;
 const OFS_FAULT: i32 = offset_of!(Cpu, jit_fault) as i32;
 const OFS_RESV: i32 = offset_of!(Cpu, reservation_valid) as i32;
 const OFS_JKEY: i32 = offset_of!(Cpu, jit_jkey) as i32;
@@ -1420,12 +1419,14 @@ const JE_FUNC: i32 = offset_of!(JEntry, func) as i32;
 const JENTRY_SHIFT: i64 = std::mem::size_of::<JEntry>().trailing_zeros() as i64;
 const _: () = assert!(std::mem::size_of::<JEntry>().is_power_of_two());
 
-const TLB_TAG: i32 = offset_of!(TlbEntry, tag) as i32;
-const TLB_HOST_DELTA: i32 = offset_of!(TlbEntry, host_delta) as i32;
-const TLB_HOST_FLAGS: i32 = offset_of!(TlbEntry, host_flags) as i32;
-const TLB_SHIFT: i64 = std::mem::size_of::<TlbEntry>().trailing_zeros() as i64;
+const OFS_JTLB: i32 = offset_of!(Cpu, jtlb) as i32;
+const OFS_JIT_DATA_KEY: i32 = offset_of!(Cpu, jit_data_key) as i32;
+const JTLB_TAG_R: i32 = offset_of!(JitTlbEntry, tag_r) as i32;
+const JTLB_TAG_W: i32 = offset_of!(JitTlbEntry, tag_w) as i32;
+const JTLB_DELTA: i32 = offset_of!(JitTlbEntry, delta) as i32;
+const JTLB_SHIFT: i64 = std::mem::size_of::<JitTlbEntry>().trailing_zeros() as i64;
 
-const _: () = assert!(std::mem::size_of::<TlbEntry>().is_power_of_two());
+const _: () = assert!(std::mem::size_of::<JitTlbEntry>().is_power_of_two());
 
 /// Maximum number of instructions a block may execute in a native
 /// loop before returning to the dispatcher.
@@ -1452,8 +1453,6 @@ struct Translator<'a, 'b> {
     /// depend on the virtual address of the guest code.
     entry_pc: Value,
     vars: [Option<Variable>; 32],
-    /// TLB key for data accesses, which compiled code cannot change.
-    data_key: Value,
     /// Shared exit blocks.
     exit_blk: Option<cranelift_codegen::ir::Block>,
     chain_blk: Option<cranelift_codegen::ir::Block>,
@@ -1471,9 +1470,6 @@ impl<'a, 'b> Translator<'a, 'b> {
         let cpu = b.block_params(entry)[0];
         let count_in = b.block_params(entry)[1];
         let entry_pc = b.ins().load(types::I64, Self::flags(), cpu, OFS_PC);
-        let data_key = b
-            .ins()
-            .uload16(types::I64, Self::flags(), cpu, OFS_DATA_KEY);
         let header = b.create_block();
         let count = b.declare_var(types::I64);
         b.def_var(count, count_in);
@@ -1489,7 +1485,6 @@ impl<'a, 'b> Translator<'a, 'b> {
             start_vpc,
             entry_pc,
             vars: [None; 32],
-            data_key,
             exit_blk: None,
             chain_blk: None,
             load_sig: None,
@@ -1799,47 +1794,50 @@ impl<'a, 'b> Translator<'a, 'b> {
         self.b.ins().uextend(types::I64, c)
     }
 
-    /// Emits the inline TLB lookup of a size byte access that needs the
-    /// host flag bit. Continues at slow on a miss, otherwise returns the
-    /// host address in a new current block.
+    /// Emits the inline TLB lookup of a size byte access, a load if
+    /// write is false, otherwise a store. Continues at slow on a miss,
+    /// otherwise returns the host address in a new current block.
     fn tlb_fast(
         &mut self,
         addr: Value,
         size: i64,
-        need: u8,
+        write: bool,
         slow: cranelift_codegen::ir::Block,
     ) -> Value {
         let f = Self::flags();
-        let vpn = self.b.ins().ushr_imm_s(addr, 12);
-        let idx = self.b.ins().band_imm_s(vpn, 0xfff);
-        let eofs = self.b.ins().ishl_imm_s(idx, TLB_SHIFT);
-        let tlb = self.sym(Sym::Tlb);
-        let ent = self.b.ins().iadd(tlb, eofs);
+        // The JIT TLB is in the CPU state: the entry of the page is at
+        // cpu + OFS_JTLB + ((addr >> 12) & 0xfff) << JTLB_SHIFT.
+        let idx = self.b.ins().ushr_imm_s(addr, 12 - JTLB_SHIFT);
+        let idx = self.b.ins().band_imm_s(idx, 0xfff << JTLB_SHIFT);
+        let ent = self.b.ins().iadd(self.cpu, idx);
 
         // The tag is computed from the last byte of the access and
         // compared with the entry of the first byte, so an access that
-        // crosses a page boundary never matches.
+        // crosses a page boundary never matches. The data key is loaded
+        // at each access rather than kept in a register: it folds into
+        // the or as a memory operand.
         let last = if size > 1 {
             self.b.ins().iadd_imm_s(addr, size - 1)
         } else {
             addr
         };
         let tag = self.b.ins().band_imm_s(last, !0xfff);
-        let tag = self.b.ins().bor(tag, self.data_key);
-        let e_tag = self.b.ins().load(types::I64, f, ent, TLB_TAG);
+        let key = self
+            .b
+            .ins()
+            .load(types::I64, f, self.cpu, OFS_JIT_DATA_KEY);
+        let tag = self.b.ins().bor(tag, key);
+        let tag_ofs = OFS_JTLB + if write { JTLB_TAG_W } else { JTLB_TAG_R };
+        let e_tag = self.b.ins().load(types::I64, f, ent, tag_ofs);
         let ok = self.b.ins().icmp(IntCC::Equal, e_tag, tag);
-        let hit = self.b.create_block();
-        self.b.ins().brif(ok, hit, &[], slow, &[]);
-
-        // Separate branches are shorter than combining the conditions.
-        self.b.switch_to_block(hit);
-        let e_flags = self.b.ins().uload8(types::I32, f, ent, TLB_HOST_FLAGS);
-        let allowed = self.b.ins().band_imm_s(e_flags, need as i64);
         let fast = self.b.create_block();
-        self.b.ins().brif(allowed, fast, &[], slow, &[]);
+        self.b.ins().brif(ok, fast, &[], slow, &[]);
 
         self.b.switch_to_block(fast);
-        let delta = self.b.ins().load(types::I64, f, ent, TLB_HOST_DELTA);
+        let delta = self
+            .b
+            .ins()
+            .load(types::I64, f, ent, OFS_JTLB + JTLB_DELTA);
         self.b.ins().iadd(addr, delta)
     }
 
@@ -1871,7 +1869,7 @@ impl<'a, 'b> Translator<'a, 'b> {
         self.b.set_cold_block(slow);
 
         // Fast path: direct RAM access.
-        let host = self.tlb_fast(addr, size, PTE_R, slow);
+        let host = self.tlb_fast(addr, size, false, slow);
         let f = MemFlagsData::new();
         let v = match (size, signed) {
             (1, false) => self.b.ins().uload8(types::I64, f, host, 0),
@@ -1923,8 +1921,7 @@ impl<'a, 'b> Translator<'a, 'b> {
             // Pages with compiled code have no direct write permission,
             // so stores to them take the slow path, which invalidates
             // the code.
-            // PTE_W in host_flags implies PTE_D.
-            let host = self.tlb_fast(addr, size, PTE_W, slow);
+            let host = self.tlb_fast(addr, size, true, slow);
             let f = MemFlagsData::new();
             match size {
                 1 => {

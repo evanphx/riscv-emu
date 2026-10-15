@@ -38,6 +38,7 @@ impl Cpu {
             for e in self.tlb.iter_mut() {
                 e.tag = u64::MAX;
             }
+            self.jtlb.fill(JitTlbEntry::INVALID);
         }
         self.sync_mmu_state();
         self.new_jit_gen();
@@ -54,10 +55,12 @@ impl Cpu {
             self.flush_tlb();
             return;
         }
-        let e = &mut self.tlb[((vaddr >> 12) & 0xfff) as usize];
+        let idx = ((vaddr >> 12) & 0xfff) as usize;
+        let e = &mut self.tlb[idx];
         if e.tag & !0xfff == vaddr & !0xfff {
             e.tag = u64::MAX;
         }
+        self.jtlb[idx] = JitTlbEntry::INVALID;
         #[cfg(feature = "jit")]
         self.jit_flush_page(vaddr);
     }
@@ -87,6 +90,7 @@ impl Cpu {
         };
         let bits = ((ms.sum() as u16) << 2) | ((ms.mxr() as u16) << 3) | (self.tlb_gen << 4);
         self.data_key = self.data_mode as u16 | bits;
+        self.jit_data_key = self.data_key as u64;
         self.fetch_key = self.mode as u16 | bits;
         self.jit_jkey = self.jit_gen << 16 | self.fetch_key as u64;
     }
@@ -138,27 +142,46 @@ impl Cpu {
             self.tlb_super.insert(super_key(vaddr, level));
         }
         let vpn = vaddr >> 12;
-        let (host_delta, host_flags) = if self.mem.contains_range(page4k, 0x1000) {
-            let ofs = self.mem.offset(page4k);
-            let host = self.mem.ptr_at(ofs) as u64;
-            // Compiled code stores directly only to dirty pages
-            // without compiled code.
-            let mut host_flags = flags;
-            if flags & PTE_D == 0 || self.jit_code_page(ofs) {
-                host_flags &= !PTE_W;
-            }
-            (host.wrapping_sub(vaddr & !0xfff), host_flags)
-        } else {
-            (0, 0)
-        };
         self.tlb[(vpn & 0xfff) as usize] = TlbEntry {
             tag: TlbEntry::tag(vaddr, key),
             page: page4k,
-            host_delta,
             flags,
-            host_flags,
         };
+        self.jit_tlb_fill(vaddr, key, page4k, flags);
         Ok(paddr)
+    }
+
+    /// Fills the compiled code TLB entry of the data address vaddr if
+    /// data accesses are not translated, so that compiled code accesses
+    /// the page directly from then on.
+    pub(super) fn jit_fill_bare(&mut self, vaddr: u64) {
+        if self.data_mode == Mode::M || self.satp.mode() == SATP_MODE_BARE {
+            self.jit_tlb_fill(vaddr, self.data_key, vaddr & !0xfff, PTE_R | PTE_W | PTE_D);
+        }
+    }
+
+    /// Fills the compiled code TLB entry of vaddr, which maps to the
+    /// physical page with the effective flags. Compiled code loads
+    /// directly from readable pages in RAM, and stores directly only to
+    /// dirty pages without compiled code or a store overlay.
+    pub(super) fn jit_tlb_fill(&mut self, vaddr: u64, key: u16, page4k: u64, flags: u8) {
+        let idx = ((vaddr >> 12) & 0xfff) as usize;
+        if !self.mem.contains_range(page4k, 0x1000) {
+            self.jtlb[idx] = JitTlbEntry::INVALID;
+            return;
+        }
+        let tag = TlbEntry::tag(vaddr, key);
+        let ofs = self.mem.offset(page4k);
+        let host = self.mem.ptr_at(ofs) as u64;
+        let writable = flags & PTE_W != 0
+            && flags & PTE_D != 0
+            && !self.jit_code_page(ofs)
+            && !self.overlay.as_ref().is_some_and(|o| o.overlaps(page4k, 0x1000));
+        self.jtlb[idx] = JitTlbEntry {
+            tag_r: if flags & PTE_R != 0 { tag } else { u64::MAX },
+            tag_w: if writable { tag } else { u64::MAX },
+            delta: host.wrapping_sub(vaddr & !0xfff),
+        };
     }
 
     fn page_fault(access: u8, vaddr: u64) -> Exception {
@@ -374,11 +397,43 @@ impl Cpu {
         }
     }
 
+    /// Returns the host address of a size byte access at vaddr that
+    /// the compiled code TLB allows, if it does. The tag of the last
+    /// byte is compared, so that page crossing accesses never match.
+    #[inline(always)]
+    fn jtlb_host(&self, vaddr: u64, size: u64, write: bool) -> Option<*mut u8> {
+        let e = &self.jtlb[((vaddr >> 12) & 0xfff) as usize];
+        let tag = if write { e.tag_w } else { e.tag_r };
+        if tag == TlbEntry::tag(vaddr.wrapping_add(size - 1), self.data_key) {
+            Some(vaddr.wrapping_add(e.delta) as *mut u8)
+        } else {
+            None
+        }
+    }
+
     #[inline(always)]
     fn load_n(&mut self, vaddr: u64, size: u64) -> Result<u64, Exception> {
+        if let Some(p) = self.jtlb_host(vaddr, size, false) {
+            // SAFETY: JIT TLB entries map to RAM pages.
+            return Ok(unsafe {
+                match size {
+                    1 => *p as u64,
+                    2 => (p as *const u16).read_unaligned() as u64,
+                    4 => (p as *const u32).read_unaligned() as u64,
+                    _ => (p as *const u64).read_unaligned(),
+                }
+            });
+        }
+        self.load_slow(vaddr, size)
+    }
+
+    #[inline(never)]
+    fn load_slow(&mut self, vaddr: u64, size: u64) -> Result<u64, Exception> {
         if memory::avail(vaddr, size) {
             let paddr = self.translate(vaddr, ACCESS_READ)?;
-            return self.phys_load(vaddr, paddr, size);
+            let v = self.phys_load(vaddr, paddr, size)?;
+            self.jit_fill_bare(vaddr);
+            return Ok(v);
         }
         self.load_split(vaddr, size)
     }
@@ -398,9 +453,29 @@ impl Cpu {
 
     #[inline(always)]
     fn store_n(&mut self, vaddr: u64, size: u64, v: u64) -> Result<(), Exception> {
+        if let Some(p) = self.jtlb_host(vaddr, size, true) {
+            // SAFETY: JIT TLB store tags map to RAM pages without
+            // compiled code or a store overlay.
+            unsafe {
+                match size {
+                    1 => *p = v as u8,
+                    2 => (p as *mut u16).write_unaligned(v as u16),
+                    4 => (p as *mut u32).write_unaligned(v as u32),
+                    _ => (p as *mut u64).write_unaligned(v),
+                }
+            }
+            return Ok(());
+        }
+        self.store_slow(vaddr, size, v)
+    }
+
+    #[inline(never)]
+    fn store_slow(&mut self, vaddr: u64, size: u64, v: u64) -> Result<(), Exception> {
         if memory::avail(vaddr, size) {
             let paddr = self.translate(vaddr, ACCESS_WRITE)?;
-            return self.phys_store(vaddr, paddr, size, v);
+            self.phys_store(vaddr, paddr, size, v)?;
+            self.jit_fill_bare(vaddr);
+            return Ok(());
         }
         self.store_split(vaddr, size, v)
     }

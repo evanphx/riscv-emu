@@ -37,6 +37,10 @@ impl Overlay for Htif {
         paddr >= self.start && paddr + size <= self.end
     }
 
+    fn overlaps(&self, paddr: u64, size: u64) -> bool {
+        paddr < self.end && self.start < paddr + size
+    }
+
     fn store(&mut self, mem: &Memory, paddr: u64) -> Result<(), Exception> {
         if paddr != self.to_host {
             return Ok(());
