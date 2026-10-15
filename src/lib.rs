@@ -6,10 +6,14 @@
 
 pub mod cpu;
 pub mod dev;
+pub mod emulator;
+pub mod fdt;
 pub mod isa;
 pub mod logger;
 pub mod memory;
 pub mod mmu;
 pub mod params;
+pub mod system;
+pub mod virtio;
 
 pub use params::Params;
