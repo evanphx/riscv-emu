@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# Prepares an Amp orb for rsemu: the Rust toolchain, the tools for
+# building and testing the guest kernel (guest/linux), and the guest
+# images from the upstream GoEMU repository.
+set -euo pipefail
+
+repo=$(pwd)
+workspace=$(dirname "$repo")
+
+# Guest kernel builds (guest/linux/build.sh), eBPF programs
+# (guest/linux/bpftest) and test disks (mke2fs -d, debugfs).
+packages=(
+	gcc-riscv64-linux-gnu binutils-riscv64-linux-gnu libc6-dev-riscv64-cross
+	flex bison bc cpio libssl-dev libelf-dev
+	dwarves clang llvm bpftool libbpf-dev
+	e2fsprogs linux-perf
+)
+missing=()
+for p in "${packages[@]}"; do
+	dpkg-query -W -f='${Status}' "$p" 2>/dev/null | grep -q 'ok installed' || missing+=("$p")
+done
+if [ ${#missing[@]} -gt 0 ]; then
+	sudo apt-get update -q
+	sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q "${missing[@]}"
+fi
+# mke2fs, debugfs and bpftool are in /usr/sbin, which is not on every PATH.
+for t in mke2fs debugfs bpftool; do
+	[ -e /usr/local/bin/$t ] || sudo ln -s /usr/sbin/$t /usr/local/bin/$t
+done
+
+# Rust
+if ! command -v cargo >/dev/null; then
+	curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+fi
+export PATH="$HOME/.cargo/bin:$PATH"
+rustup component add rustfmt clippy
+
+# Guest images (OpenSBI, Linux, buildroot) live in the upstream
+# repository's cmd/goemu directory; rsemu runs from there (see README.md).
+# Link this repository's kernel next to them for
+# configs/buildroot-rsemu-kernel.goemu.
+upstream=$workspace/riscv
+[ -d "$upstream/.git" ] || git clone -q --depth 1 https://github.com/markkurossi/riscv "$upstream"
+ln -sfn "$repo/guest/linux/linux-7.0.11-rsemu" "$upstream/cmd/goemu/linux-7.0.11-rsemu"
+
+# Scratch files stay out of git.
+grep -qx '/.amp/in/' .git/info/exclude 2>/dev/null || echo '/.amp/in/' >> .git/info/exclude
+
+# Warm the build cache.
+cargo build --release --locked
