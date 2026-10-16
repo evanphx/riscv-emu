@@ -12,9 +12,13 @@ It needs gcc >= 14 for riscv64 (the function tracer needs
 `-fmin-function-alignment`); without `CROSS_COMPILE` it downloads
 kernel.org's gcc 15.2. BTF needs pahole >= 1.22 (dwarves).
 
-`configs/buildroot-rsemu-kernel.goemu` boots buildroot with it; copy
-`OUTDIR/obj/arch/riscv/boot/Image` and `OUTDIR/obj/System.map` to
-`linux-7.0.11-rsemu/` next to the other guest images.
+`configs/buildroot-rsemu-kernel.goemu` boots buildroot with it from
+`linux-7.0.11-rsemu/` next to the other guest images. A build of this
+directory's sources is in [linux-7.0.11-rsemu](linux-7.0.11-rsemu);
+copy or link it there, or copy `OUTDIR/obj/arch/riscv/boot/Image` and
+`OUTDIR/obj/System.map` from your own build:
+
+    ln -s /path/to/riscv-rs/guest/linux/linux-7.0.11-rsemu riscv/cmd/goemu/
 
 ## Configuration
 
