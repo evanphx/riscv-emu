@@ -52,12 +52,14 @@ use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// Compiled block entry point. Blocks use Cranelift's tail calling
-/// convention with the arguments (cpu: *mut Cpu, count: u64), where
-/// count is the number of instructions executed by the chained blocks
-/// before this one. A block returns the total number of executed
-/// instructions in the low 32 bits and the exit status in the high
-/// bits. The dispatcher enters blocks through the enter trampoline.
+mod direct;
+
+/// Compiled block entry point. Cranelift uses its tail convention with
+/// (cpu: *mut Cpu, count: u64); direct uses the ABI in direct.rs. Count
+/// includes the instructions executed by preceding chained blocks.
+/// A block returns the total instruction count in the low 32 bits and
+/// the exit status in the high bits. The dispatcher enters blocks
+/// through the backend's enter trampoline.
 type BlockFn = *const u8;
 
 /// Trampoline that calls the block with the system calling convention.
@@ -94,6 +96,18 @@ const EXIT_FAULT: u64 = 1;
 const CACHE_BITS: u32 = 18;
 const CACHE_SIZE: usize = 1 << CACHE_BITS;
 const MAX_BLOCK_INSTRS: usize = 200;
+const LOAD_PROFILE_SIZE: usize = 16384;
+const LOAD_PROFILE_MIN_SAMPLES: u16 = 8;
+
+/// Bounded interpreter observations, used only as guarded codegen hints.
+#[derive(Clone, Copy, Default)]
+struct LoadProfile {
+    phys: u64,
+    raw: u32,
+    tlb_slot: u16,
+    samples: u16,
+    polymorphic: bool,
+}
 
 /// Maximum number of instructions in an optimized region.
 const MAX_REGION_INSTRS: usize = 128;
@@ -129,6 +143,17 @@ pub struct JitStats {
     pub compiled: u64,
     pub compiled_instrs: u64,
     pub compile_time: Duration,
+    /// Adjacent guest instruction pairs combined by the direct emitter.
+    pub fused_pairs: u64,
+    /// Successful, aligned interpreter RAM reads observed during training.
+    pub load_profile_samples: u64,
+    /// Resident profile-table sites with at least eight observations.
+    pub stable_load_sites: u64,
+    pub polymorphic_load_sites: u64,
+    /// Fixed-slot TLB lookups emitted by the direct backend.
+    pub specialized_loads: u64,
+    /// Direct loops emitted with a translation guard outside the backedge.
+    pub hoisted_read_loops: u64,
     pub invalidated: u64,
     /// Calls from the dispatcher into compiled code.
     pub dispatches: u64,
@@ -157,6 +182,22 @@ impl std::fmt::Display for JitStats {
         )?;
         if self.reused > 0 {
             write!(f, ", {} reused at other addresses", self.reused)?;
+        }
+        if self.fused_pairs > 0 {
+            write!(f, ", {} fused pairs", self.fused_pairs)?;
+        }
+        if self.hoisted_read_loops > 0 {
+            write!(f, ", {} hoisted read loops", self.hoisted_read_loops)?;
+        }
+        if self.load_profile_samples > 0 {
+            write!(
+                f,
+                ", {} load samples, {} stable / {} polymorphic load sites, {} fixed-slot lookups",
+                self.load_profile_samples,
+                self.stable_load_sites,
+                self.polymorphic_load_sites,
+                self.specialized_loads
+            )?;
         }
         if self.loaded > 0 {
             write!(
@@ -312,12 +353,14 @@ pub struct Jit {
     /// Bitmap filter of the by_code keys.
     code_filter: Box<[u64]>,
     hot: Box<[u16]>,
+    load_profiles: Box<[LoadProfile]>,
     hot_threshold: u16,
     /// Lower the hot threshold while the background compiler has
     /// little work.
     adaptive: bool,
     /// Compile with Cranelift's optimizations.
     optimize: bool,
+    direct: bool,
     epoch: u64,
     pub stats: JitStats,
     /// Persistent code cache file.
@@ -968,6 +1011,7 @@ struct BlockInstr {
     size: u64,
     /// The instruction ends the block.
     last: bool,
+    load_slot: Option<u16>,
 }
 
 impl Jit {
@@ -1008,6 +1052,7 @@ impl Jit {
             by_code: HashMap::default(),
             code_filter: vec![0u64; CODE_FILTER_WORDS].into_boxed_slice(),
             hot: vec![0u16; CACHE_SIZE].into_boxed_slice(),
+            load_profiles: Box::default(),
             hot_threshold: if hot_threshold == 0 {
                 DEFAULT_HOT_THRESHOLD
             } else {
@@ -1015,6 +1060,7 @@ impl Jit {
             },
             adaptive: hot_threshold == 0 && threads > 0,
             optimize: false,
+            direct: false,
             epoch: 0,
             stats: JitStats::default(),
             cache_path: None,
@@ -1078,6 +1124,12 @@ impl Jit {
             return self.hot_threshold;
         }
         let t = MIN_HOT_THRESHOLD + self.pending.len() * PENDING_THRESHOLD_STEP;
+        // Allow real interpreter observations before compiling direct code.
+        let t = if self.direct {
+            t.max(LOAD_PROFILE_MIN_SAMPLES as usize + 1)
+        } else {
+            t
+        };
         t.min(self.hot_threshold as usize) as u16
     }
 
@@ -1090,10 +1142,9 @@ impl Jit {
     }
 
     /// Looks for a compiled block for the same code at another
-    /// address. The generated code depends only on the code bytes and
-    /// their page offset, so a block whose code matches the code at
-    /// vpc / phys can run there too. Returns the block function for
-    /// the new location.
+    /// address. Profiled slots are guarded hints, not address bindings,
+    /// so a block whose code and page offset match vpc / phys can run
+    /// there too. Returns the block function for the new location.
     fn reuse(
         &mut self,
         mem: &crate::memory::Memory,
@@ -1175,6 +1226,7 @@ impl Jit {
                 raw,
                 size,
                 last: false,
+                load_slot: None,
             });
             match instr.op {
                 Op::Jalr => break,
@@ -1267,6 +1319,7 @@ impl Jit {
                     raw,
                     size,
                     last: is_terminator(instr.op),
+                    load_slot: None,
                 },
             );
         }
@@ -1283,13 +1336,26 @@ impl Jit {
         let page_base = phys & !(PAGE_SIZE - 1);
         let mut page = vec![0u8; PAGE_SIZE as usize];
         cpu.mem.read_bytes(page_base, &mut page);
-        let instrs = if cpu.jit_env().optimize {
+        let mut instrs = if cpu.jit_env().optimize {
             Self::decode_region(&page, vpc)
         } else {
             Self::decode_block(&page, vpc)
         };
         if instrs.is_empty() {
             return None;
+        }
+        if let Some(jit) = cpu.jit.as_ref().filter(|j| j.direct) {
+            for bi in &mut instrs {
+                let phys = page_base + (bi.pc & (PAGE_SIZE - 1));
+                let p = &jit.load_profiles[slot(phys) & (LOAD_PROFILE_SIZE - 1)];
+                if p.phys == phys
+                    && p.raw == bi.raw
+                    && p.samples >= LOAD_PROFILE_MIN_SAMPLES
+                    && !p.polymorphic
+                {
+                    bi.load_slot = Some(p.tlb_slot);
+                }
+            }
         }
         let lo = instrs.iter().map(|b| b.pc & (PAGE_SIZE - 1)).min().unwrap();
         let hi = instrs
@@ -1391,6 +1457,9 @@ impl Jit {
         self.stats.compiled += 1;
         self.stats.compiled_instrs += req.instrs.len() as u64;
         self.stats.compile_time += r.time;
+        self.stats.fused_pairs += r.fused_pairs;
+        self.stats.specialized_loads += r.specialized_loads;
+        self.stats.hoisted_read_loops += r.hoisted_read_loops;
         Ok(func)
     }
 
@@ -1425,6 +1494,9 @@ struct Request {
 struct Compiled {
     request: Request,
     machine_code: Vec<u8>,
+    fused_pairs: u64,
+    specialized_loads: u64,
+    hoisted_read_loops: u64,
     time: Duration,
 }
 
@@ -1576,6 +1648,18 @@ impl Compiler {
     /// Compiles the block into machine code.
     fn compile(&mut self, req: Request) -> Result<Compiled, String> {
         let start = Instant::now();
+        if req.env.direct {
+            let (machine_code, fused_pairs, specialized_loads, hoisted_read_loops) =
+                direct::compile(&req);
+            return Ok(Compiled {
+                request: req,
+                machine_code,
+                fused_pairs,
+                specialized_loads,
+                hoisted_read_loops,
+                time: start.elapsed(),
+            });
+        }
         if req.env.optimize && self.isa_opt.is_none() {
             self.isa_opt = Some(host_isa_opt(true)?);
         }
@@ -1608,6 +1692,9 @@ impl Compiler {
         Ok(Compiled {
             request: req,
             machine_code,
+            fused_pairs: 0,
+            specialized_loads: 0,
+            hoisted_read_loops: 0,
             time: start.elapsed(),
         })
     }
@@ -1649,6 +1736,7 @@ impl Worker {
 #[derive(Clone, Copy)]
 struct CodegenEnv {
     inline_stores: bool,
+    direct: bool,
     /// Compile with Cranelift's optimizations. Optimized and
     /// unoptimized code are interchangeable, so this is not part of the
     /// code cache fingerprint.
@@ -1664,6 +1752,7 @@ enum Sym {
     Exec,
     JCache,
     Probe,
+    DirectMem,
     Mem,
 }
 
@@ -3144,6 +3233,7 @@ impl Cpu {
         syms[Sym::Exec as usize] = stubs[HELPER_EXEC];
         syms[Sym::Probe as usize] = stubs[HELPER_PROBE];
         syms[Sym::JCache as usize] = self.jit.as_ref().map_or(0, |j| j.jcache.as_ptr() as u64);
+        syms[Sym::DirectMem as usize] = jit_mem as *const () as u64;
         for kind in 0..MEM_KINDS {
             syms[Sym::Mem as usize + kind as usize] =
                 rsemu_jit_mem_stubs as *const () as u64 + kind * MEM_STUB_STRIDE;
@@ -3153,7 +3243,50 @@ impl Cpu {
 
     /// Returns the JIT statistics if the JIT is enabled.
     pub fn jit_stats(&self) -> Option<JitStats> {
-        self.jit.as_ref().map(|j| j.stats)
+        self.jit.as_ref().map(|j| {
+            let mut stats = j.stats;
+            for p in &j.load_profiles {
+                if p.samples >= LOAD_PROFILE_MIN_SAMPLES {
+                    if p.polymorphic {
+                        stats.polymorphic_load_sites += 1;
+                    } else {
+                        stats.stable_load_sites += 1;
+                    }
+                }
+            }
+            stats
+        })
+    }
+
+    /// Observe only completed interpreter reads, without re-reading data
+    /// or probing future accesses. Never record host pointers or values.
+    #[inline]
+    pub(super) fn jit_observe_load(&mut self, raw: u32, addr: u64, size: u64) {
+        let Some(jit) = self.jit.as_mut().filter(|j| j.direct) else {
+            return;
+        };
+        let tlb_slot = ((addr >> 12) & 0xfff) as usize;
+        if addr & (size - 1) != 0
+            || self.code_vpn != crate::memory::page(self.pc)
+            || self.jtlb[self.jbank + tlb_slot].tag_r != addr.wrapping_add(size - 1) & !0xfff
+        {
+            return;
+        }
+        let phys = self.code_ofs + crate::memory::page_offset(self.pc);
+        let p = &mut jit.load_profiles[slot(phys) & (LOAD_PROFILE_SIZE - 1)];
+        if p.samples == 0 || p.phys != phys || p.raw != raw {
+            *p = LoadProfile {
+                phys,
+                raw,
+                tlb_slot: tlb_slot as u16,
+                samples: 1,
+                polymorphic: false,
+            };
+        } else {
+            p.samples = p.samples.saturating_add(1);
+            p.polymorphic |= p.tlb_slot as usize != tlb_slot;
+        }
+        jit.stats.load_profile_samples += 1;
     }
 
     /// Handles a write to compiled code: the code is revalidated
@@ -3351,6 +3484,7 @@ fn cache_fingerprint(env: CodegenEnv) -> Result<u64, String> {
     let fp = FINGERPRINT.get_or_init(host_fingerprint).clone()?;
     let mut h = FxHasher(fp);
     h.write_u64(env.inline_stores as u64);
+    h.write_u64(env.direct as u64);
     Ok(h.finish())
 }
 
@@ -3638,8 +3772,39 @@ impl Cpu {
     fn jit_env(&self) -> CodegenEnv {
         CodegenEnv {
             inline_stores: self.overlay.is_none(),
+            direct: self.jit.as_ref().is_some_and(|j| j.direct),
             optimize: self.jit.as_ref().is_some_and(|j| j.optimize),
         }
+    }
+
+    /// Selects a backend before the CPU starts. Backend ABIs and disk
+    /// cache fingerprints are deliberately separate.
+    pub fn set_jit_backend(&mut self, backend: &str) -> Result<(), String> {
+        let direct = match backend {
+            "" | "cranelift" => false,
+            "direct" => true,
+            _ => return Err(format!("unknown JIT backend: {backend}")),
+        };
+        if let Some(jit) = self.jit.as_mut() {
+            if jit.direct == direct {
+                return Ok(());
+            }
+            if !jit.blocks.is_empty() || !jit.pending.is_empty() {
+                return Err("select the JIT backend before running the CPU".into());
+            }
+            jit.direct = direct;
+            jit.load_profiles = if direct {
+                vec![LoadProfile::default(); LOAD_PROFILE_SIZE].into_boxed_slice()
+            } else {
+                Box::default()
+            };
+            jit.enter = if direct {
+                direct::enter()
+            } else {
+                compile_enter(&mut jit._enter_arena)?
+            };
+        }
+        Ok(())
     }
 
     /// Compiles blocks with Cranelift's optimizations, which makes

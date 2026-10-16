@@ -98,6 +98,7 @@ Main flags:
 | `-gpu id=gpu0,width=1024,height=768` | add a VirtIO GPU with keyboard and pointer |
 | `-nographic` | ignore GPU devices |
 | `-jit` | enable the JIT compiler |
+| `-jit-backend cranelift\|direct` | select the compiler; `direct` is an experimental x86-64 emitter (implies `-jit`) |
 | `-jit-threshold n` | executions before a block is compiled (default: 50 to 1000, depending on the compiler backlog; implies `-jit`) |
 | `-jit-threads n` | background compiler threads (default: half the host's hardware threads, at most 4; implies `-jit`) |
 | `-jit-sync` | compile blocks synchronously, for deterministic runs (implies `-jit`) |
@@ -476,6 +477,256 @@ $ rsemu -jit-cache linux.jit configs/buildroot.goemu   # later runs load the cod
   been used in 4 runs is dropped.
 - The cache is written when the CPU stops (guest poweroff or program
   exit).
+
+### Experimental direct x86-64 backend
+
+`-jit-backend direct` selects a handwritten RV64-to-x86-64 compiler;
+Cranelift remains the default. The same option is available on
+`rsemu-server`. It uses the existing decoder, background compilation,
+TLB, guarded block chaining, code invalidation and persistent cache.
+Use separate cache files (or server state directories) for the two
+backends: their ABIs are different, and a cache from the other backend
+is ignored and replaced, not executed.
+
+The emitter assigns six guest registers to fixed host registers using
+operand-use counts, weighting instructions inside internal backward-edge
+ranges 32 times higher than straight-line/exit instructions. This static
+loop heuristic keeps hot counters ahead of cold exit temporaries. Writes
+stay in registers until exits or helper calls. Conditional branches fall
+through to the next emitted successor when possible, with side exits and
+guarded backedges emitted out of line; loop-limit checks are preserved.
+Memory fast paths keep the TLB base in callee-saved RBP, fold address
+additions into indexed x86 memory operands, and fall through on hits.
+Helper paths are out of line. A typical standalone integer load uses
+13 emitted host instructions instead of 17, and a store 14 instead of
+18, including the instruction-count update but excluding block entry.
+Interpreter-observed stable loads can predict a fixed TLB slot, reducing
+the predicted-hit load path to 10 instructions. This is a guarded hint:
+the actual address must match the live read tag, and a prediction miss
+tries the generic inline TLB lookup before calling a helper.
+Straight-line reads of an unchanged base can share one checked RAM-page
+translation, including across nonfaulting integer arithmetic. Stores,
+helpers, base writes and branch entries end a group. A failed range guard
+returns before the first read, preserving individual read/fault order in
+the interpreter. MMIO and cross-page groups do not use this fast path.
+Single-entry read-only loops whose reads all use one invariant base can
+also hoist that guard and translation above their backedge. Conditional
+branches and side exits are allowed, but stores, helpers, CSRs, fences and
+external entries into the middle reject hoisting. The translated base
+stays in RDI without reducing the six cached guest registers. Actual
+reads still occur on every iteration. Re-entry and the existing 4096-guest-
+instruction timeslice limit run the guard again; a guard miss interprets
+from the header instead of raising a speculative fault.
+It emits integer arithmetic, branches, memory accesses and FP loads,
+stores and moves directly; other supported instructions call the same
+interpreter/soft-float helpers as the Cranelift backend. No Cranelift
+IR, optimization or register allocation is used for direct guest code.
+The build still includes Cranelift for the baseline and helper glue.
+`-jit-opt` selects multi-block regions for direct too, without a separate
+optimizing compiler pass.
+
+Peepholes combine `lui/auipc + addi/addiw` into constants or PC-relative
+addressing, `slli + add` and `addi + slli` into scaled x86 `lea`, and
+matching shift pairs into sign/zero extension. The intermediate result
+must be overwritten, and the second instruction must not be a branch
+target. Memory operations are not folded across fault boundaries:
+`addi a0,a0,8; ld a0,0(a0)`, for example, must expose the updated a0 if
+the load faults. Guest instruction counts still include both fused
+instructions; JIT statistics report the number of compiled fused pairs.
+
+Reproduce the Linux/Node comparison (run from this repository):
+
+```shell
+cargo build --release --no-default-features --features jit
+python3 scripts/jit-bench.py --workdir /path/to/riscv/cmd/goemu \
+    --config configs/vmagent.goemu --repetitions 3 --repeats 1 \
+    --warmup '' --output jit-bench.json
+```
+
+The harness alternates backend order, starts each trial with a fresh
+cache, checks all Node outputs against independent expected results,
+and reports raw measurements and medians. Startup is Linux/agent
+readiness plus base snapshot/cache saving, not just kernel init.
+Command totals include VM restore and snapshot overhead. The integer
+loop also reports host wall time between streamed markers around a
+300-million-iteration loop after a 1-million-iteration warmup, to separate
+hot execution from Node startup. Guest clocks are not used for timing.
+
+An initial x86-64 orb experiment with Node 26.11.1 gave these medians
+of three trials, using the command above and the default (non-`-jit-opt`)
+Cranelift backend as the baseline:
+
+| Workload | Cranelift | Direct |
+|----------|----------:|-------:|
+| Linux/agent startup, empty JIT cache | 1.668 s | 0.759 s |
+| Fresh Node startup, including restore/snapshot | 2.591 s | 2.420 s |
+| Fresh Node crypto/JSON, including restore/snapshot | 3.758 s | 3.226 s |
+| Node integer loop body, fresh VM restore | 0.421 s | 0.511 s |
+| Node integer loop body, continued VM restore | 0.438 s | 0.528 s |
+
+This demonstrates a startup/end-to-end benefit, **not** a general win in
+generated-code execution speed: the isolated loop is about 22% slower.
+Host OS caches were not flushed; the host is shared, and three trials
+are exploratory rather than a statistical performance guarantee.
+Continued runs start a new Node process in the previous VM state.
+
+A follow-up measured the two loop optimizations separately, first after
+each change and then with all variants interleaved. To reduce marker
+overhead, each hot window called the same 300-million-iteration function
+ten times after the same warmup. Medians of three interleaved trials:
+
+| Backend/step | Hot window, fresh restore | Hot window, continued restore |
+|--------------|--------------------------:|------------------------------:|
+| Direct, before loop optimizations | 5.067 s | 5.255 s |
+| Direct, loop-weighted register allocation | 4.658 s | 4.845 s |
+| Direct, plus branch fallthrough/layout | 4.502 s | 4.535 s |
+| Cranelift control | 4.080 s | 4.361 s |
+
+The combined improvement was about 11% fresh and 14% continued, but
+direct still did not beat Cranelift. Individual trials were noisy on
+the shared host; these are exploratory measurements, not a guarantee.
+Each variant used isolated state and an empty initial JIT cache, and
+all Node outputs were checked against the loop's closed-form sum.
+
+A separate memory-path experiment compared four versus six cached
+guest registers and the revised memory scheduling/layout, with three
+interleaved trials per variant. Fresh-restore hot-window medians:
+
+| Variant | Integer loop, 10 × 300M iterations | Typed-array reads, 3 × 100M iterations |
+|---------|----------------------------------:|--------------------------------------:|
+| Previous memory path, six cached registers | 4.393 s | 1.289 s |
+| Previous memory path, four cached registers | 5.168 s | 1.363 s |
+| Revised memory path, six cached registers | 4.356 s | 1.122 s |
+| Revised memory path, four cached registers | 4.985 s | 1.321 s |
+
+Six cached registers were retained. The revised path improved typed-array
+reads by 13% fresh and 6% continued (1.253 s to 1.183 s). The integer
+loop was essentially unchanged fresh and 10% faster continued (4.777 s
+to 4.321 s). Timings remain subject to shared-host noise; hardware
+stall counters were unavailable, so these are not direct stall measurements.
+The typed-array workload cyclically sums a 16384-element `Uint32Array`
+initialized with `(i * 17) ^ 0x12345`; all results were independently checked.
+
+Further TLB experiments used three rotating-order trials per variant,
+with isolated caches/state, Linux startup, and fresh/continued Node
+processes. Smaller split read/write tables lost badly on address conflicts:
+eight pages spaced 1 MiB apart took 0.554 s with 256 entries and 0.297 s
+with 1024, versus 0.128 s originally. The 4096-entry split layout took
+0.133 s and did not improve the small-array test either; it was discarded.
+Split entries were 16-byte `{tag, delta}` records, with separate read/write
+halves per privilege bank; the interpreter's ordinary TLB stayed at 4096.
+
+Keeping the original table and dedicating RBP to its base produced mixed
+results, not an overall win. Adding translation reuse improved the
+four-field object-read test versus RBP alone by 6% fresh / 13% continued.
+The final comparison against the original memory path was also mixed:
+
+| Workload | Original fresh / continued | RBP + reuse fresh / continued |
+|----------|---------------------------:|------------------------------:|
+| Linux/agent readiness (startup only) | 0.713 s | 0.811 s |
+| Node startup (whole request) | 1.733 / 1.759 s | 1.784 / 1.629 s |
+| Integer loop, 300M iterations (hot) | 0.414 / 0.414 s | 0.435 / 0.428 s |
+| Crypto/JSON (whole request) | 3.030 / 2.473 s | 2.792 / 2.322 s |
+| Small-array reads, 30M (hot) | 0.125 / 0.126 s | 0.119 / 0.114 s |
+| Conflict reads, 30M (hot) | 0.137 / 0.139 s | 0.133 / 0.135 s |
+| 2048-page reads, 30M (hot) | 0.261 / 0.258 s | 0.247 / 0.264 s |
+| Array read/modify/write, 30M (hot) | 0.176 / 0.175 s | 0.168 / 0.165 s |
+| Four-field object reads, 30M (hot) | 0.349 / 0.353 s | 0.331 / 0.335 s |
+
+The combined version remains experimental: lower memory-path instruction
+counts did **not** improve the original integer loop or Linux startup.
+These are shared-host wall times, not hardware-counter measurements.
+Readiness includes Linux, agent and base snapshot; whole requests include
+restore/snapshot overhead. Hot times are streamed-marker intervals after
+1M warmup iterations. All 444 Node executions across 30 VM launches
+checked exact output against independent oracles. Raw per-trial results
+and JavaScript commands are in `.amp/in/artifacts/tlb-{size,register,reuse,final}-experiment.json`.
+
+### Profile-guided fixed-slot read experiment
+
+The direct backend records successful aligned integer RAM reads during
+interpretation, without extra memory accesses. A bounded 16,384-entry
+profile table keys observations by physical instruction address and raw
+instruction. After eight observations of the same TLB slot, compilation
+can embed that slot's displacement instead of computing the index on
+every read. Sites observed using different slots remain generic. The
+adaptive direct hot threshold has a floor of nine to permit training;
+explicit thresholds and Cranelift are unchanged.
+
+Generated code still checks the actual page/alignment tag and reads the
+current translation delta. It embeds neither host pointers nor permission
+assumptions. Address changes, slot collisions and invalidations therefore
+retain the normal TLB checks and fault behavior. Stores are unchanged.
+Grouped reads retain their generic range guard: predicting only one slot
+would not prove that both ends of the group's range share a page.
+
+Three interleaved baseline/specialized trials with longer timing windows
+gave these median hot times (baseline is the preceding RBP + reuse path):
+
+| Node workload | Baseline fresh / continued | Fixed-slot fresh / continued |
+|---------------|---------------------------:|-----------------------------:|
+| Integer loop, 10 × 300M | 4.206 / 4.057 s | 4.171 / 3.856 s |
+| Array reads, 3 × 100M | 1.065 / 1.120 s | 1.111 / 1.088 s |
+| Four-field reads, 3 × 100M | 3.222 / 3.095 s | 3.156 / 3.054 s |
+
+This is a modest, mixed result, not a decisive overall speedup: integer
+reads improved about 1% fresh / 5% continued, array reads regressed 4%
+fresh / improved 3% continued, and field reads improved 2% / 1%.
+These are shared-host wall times without hardware counters; the larger
+gains in the short-window sweep did not hold consistently. Linux/agent
+readiness in the longer batch was 0.710 → 0.657 s, but startup is noisy.
+The final short and long cohorts used 15 fresh boot/cache trials and
+checked exact output for 180 Node commands. Raw trials, workload commands
+and the profile-only control are in
+`.amp/in/artifacts/load-slot-experiment.json` and
+`.amp/in/artifacts/load-slot-long-experiment.json`.
+
+A separate diagnostic warm run recorded 16,214,420 interpreter training
+samples, 806 stable and 740 polymorphic resident sites, and 27,712 emitted
+fixed-slot lookups. These are not dynamic specialization hit rates or
+whole-program unique-site counts; loaded cached code is not counted as
+new emission. See `.amp/in/artifacts/load-profile-after.txt`.
+
+### Loop-invariant translation experiment
+
+The first version accepted only straight-line loops. It improved a
+two-load invariant-base microbenchmark but emitted no hoisted loops in
+the Linux/Node diagnostic run. Allowing conditional branches and side
+exits, while still requiring the entry guard to dominate every read,
+made the pass apply to Node. Diagnostic runs emitted five hoisted loops
+for Node startup and seven for the integer workload; these are static
+emission counts, not runtime hit counts. Linux boot emitted none.
+
+Three interleaved baseline/hoisted trials used fresh, isolated caches and
+the preceding fixed-slot direct backend as the baseline. Hot workloads
+use the same longer timing windows as the fixed-slot experiment:
+
+| Workload | Baseline fresh / continued | Hoisted fresh / continued |
+|----------|---------------------------:|--------------------------:|
+| Linux/agent readiness (startup only) | 0.715 s | 0.707 s |
+| Node startup (whole request) | 1.783 / 1.663 s | 1.744 / 1.827 s |
+| Crypto/JSON (whole request) | 3.287 / 2.460 s | 3.648 / 2.354 s |
+| Integer loop, 10 × 300M (hot) | 3.801 / 3.886 s | 3.665 / 3.637 s |
+| Array reads, 3 × 100M (hot) | 1.053 / 1.047 s | 1.039 / 1.063 s |
+| Four-field reads, 3 × 100M (hot) | 3.237 / 3.062 s | 3.162 / 3.344 s |
+
+The integer workload improved about 4% fresh / 6% continued. The other
+workloads remain mixed, including slower continued Node startup and
+field reads: this is not an overall speedup. Shared-host wall times and
+three samples per case do not establish hardware-level causality.
+All 60 final Node commands checked exact output across six fresh
+boot/cache trials. `.amp/in/artifacts/loop-hoist-experiment.json` contains
+the commands, individual timings and binary hashes; the rejected
+straight-line-only version is in `loop-hoist-straight-experiment.json`.
+
+A separate user-mode RV64 microbenchmark performed 600M iterations with
+two invariant reads per iteration and checked the final sum independently.
+Median whole-process time improved 0.966 → 0.758 s (22%) over three
+interleaved trials. This measures the intended case, not Linux or Node.
+Its source and raw results are in
+`.amp/in/artifacts/loop-hoist-microbenchmark.json`. Static diagnostic
+summaries are in `.amp/in/artifacts/loop-hoist-diagnostics.txt`; temporary
+checkpoint logging was removed before the timed runs.
 
 ### Precompiling the kernel
 

@@ -58,6 +58,7 @@ struct Server {
     snapshots: PathBuf,
     runs: PathBuf,
     jit: bool,
+    jit_backend: String,
     default_timeout: Duration,
     next_run: AtomicU64,
     /// Most warm VMs kept, and how long they are kept.
@@ -127,6 +128,7 @@ struct Options {
     config: PathBuf,
     rsemu: PathBuf,
     jit: bool,
+    jit_backend: String,
     timeout: u64,
     warm: usize,
     warm_ttl: f64,
@@ -137,7 +139,7 @@ fn usage() -> ! {
     eprintln!(
         "usage: rsemu-server -config FILE.goemu [-listen ADDR] [-state DIR] [-rsemu PATH]
                     [-timeout SECONDS] [-warm N] [-warm-ttl SECONDS]
-                    [-warmup COMMAND] [-nojit]
+                    [-warmup COMMAND] [-nojit] [-jit-backend cranelift|direct]
 
   -config   system configuration with the vmagent initramfs
             (configs/vmagent.goemu); relative paths in it are relative
@@ -167,6 +169,7 @@ fn main() {
             .expect("current executable")
             .with_file_name("rsemu"),
         jit: true,
+        jit_backend: "cranelift".into(),
         timeout: 600,
         warm: 4,
         warm_ttl: 60.0,
@@ -179,6 +182,12 @@ fn main() {
             "state" => opts.state = PathBuf::from(value()),
             "config" => opts.config = PathBuf::from(value()),
             "rsemu" => opts.rsemu = PathBuf::from(value()),
+            "jit-backend" => {
+                opts.jit_backend = value();
+                if !matches!(opts.jit_backend.as_str(), "cranelift" | "direct") {
+                    usage();
+                }
+            }
             "timeout" => opts.timeout = value().parse().unwrap_or_else(|_| usage()),
             "warm" => opts.warm = value().parse().unwrap_or_else(|_| usage()),
             "warm-ttl" => {
@@ -214,6 +223,7 @@ fn run(opts: Options) -> Result<(), String> {
         snapshots: state.join("snapshots"),
         runs: state.join("runs"),
         jit: opts.jit,
+        jit_backend: opts.jit_backend,
         default_timeout: Duration::from_secs(opts.timeout),
         next_run: AtomicU64::new(0),
         warm_max: opts.warm,
@@ -463,6 +473,7 @@ impl Server {
             .stderr(log);
         if self.jit {
             cmd.arg("-jit-cache").arg(&self.jit_cache);
+            cmd.arg("-jit-backend").arg(&self.jit_backend);
         }
         cmd.arg("-cooked").arg("-control").arg(&control_path);
         match restore {

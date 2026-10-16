@@ -152,6 +152,12 @@ const FLAGS: &[FlagSpec] = &[
         usage: "enable the Cranelift JIT compiler",
     },
     FlagSpec {
+        name: "jit-backend",
+        boolean: false,
+        multi: false,
+        usage: "JIT backend: cranelift (default) or direct (experimental; implies -jit)",
+    },
+    FlagSpec {
         name: "jit-threshold",
         boolean: false,
         multi: false,
@@ -333,12 +339,14 @@ fn main() {
         jit: flags.bool("jit")
             || flags.bool("jit-sync")
             || flags.bool("jit-opt")
+            || !flags.string("jit-backend").is_empty()
             || !flags.string("jit-threshold").is_empty()
             || !flags.string("jit-threads").is_empty()
             || !flags.string("jit-cache").is_empty(),
         jit_cache: flags.string("jit-cache"),
         jit_sync: flags.bool("jit-sync"),
         jit_opt: flags.bool("jit-opt"),
+        jit_backend: flags.string("jit-backend"),
         jit_threshold: {
             let v = flags.string("jit-threshold");
             if v.is_empty() {

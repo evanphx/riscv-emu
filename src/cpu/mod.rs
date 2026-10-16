@@ -132,6 +132,7 @@ pub fn configure_jit(cpu: &mut Cpu, params: &crate::Params) -> Result<(), String
             params.jit_threads
         };
         cpu.enable_jit(params.jit_threshold, threads)?;
+        cpu.set_jit_backend(&params.jit_backend)?;
         cpu.set_jit_optimize(params.jit_opt);
         if !params.jit_cache.is_empty() {
             cpu.set_jit_cache(&params.jit_cache);
@@ -921,31 +922,52 @@ impl Cpu {
             }
 
             Lb => {
-                let v = self.load8(self.addr(&i))?;
+                let addr = self.addr(&i);
+                let v = self.load8(addr)?;
+                #[cfg(feature = "jit")]
+                self.jit_observe_load(raw, addr, 1);
                 self.set_x(rd, v as i8 as i64 as u64)
             }
             Lh => {
-                let v = self.load16(self.addr(&i))?;
+                let addr = self.addr(&i);
+                let v = self.load16(addr)?;
+                #[cfg(feature = "jit")]
+                self.jit_observe_load(raw, addr, 2);
                 self.set_x(rd, v as i16 as i64 as u64)
             }
             Lw => {
-                let v = self.load32(self.addr(&i))?;
+                let addr = self.addr(&i);
+                let v = self.load32(addr)?;
+                #[cfg(feature = "jit")]
+                self.jit_observe_load(raw, addr, 4);
                 self.set_x(rd, v as i32 as i64 as u64)
             }
             Ld => {
-                let v = self.load64(self.addr(&i))?;
+                let addr = self.addr(&i);
+                let v = self.load64(addr)?;
+                #[cfg(feature = "jit")]
+                self.jit_observe_load(raw, addr, 8);
                 self.set_x(rd, v)
             }
             Lbu => {
-                let v = self.load8(self.addr(&i))?;
+                let addr = self.addr(&i);
+                let v = self.load8(addr)?;
+                #[cfg(feature = "jit")]
+                self.jit_observe_load(raw, addr, 1);
                 self.set_x(rd, v as u64)
             }
             Lhu => {
-                let v = self.load16(self.addr(&i))?;
+                let addr = self.addr(&i);
+                let v = self.load16(addr)?;
+                #[cfg(feature = "jit")]
+                self.jit_observe_load(raw, addr, 2);
                 self.set_x(rd, v as u64)
             }
             Lwu => {
-                let v = self.load32(self.addr(&i))?;
+                let addr = self.addr(&i);
+                let v = self.load32(addr)?;
+                #[cfg(feature = "jit")]
+                self.jit_observe_load(raw, addr, 4);
                 self.set_x(rd, v as u64)
             }
 

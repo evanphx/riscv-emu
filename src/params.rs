@@ -27,6 +27,8 @@ pub struct Params {
     pub jit_cache: String,
     /// Compiles with Cranelift's optimizations.
     pub jit_opt: bool,
+    /// JIT backend: empty or "cranelift", or experimental "direct".
+    pub jit_backend: String,
 }
 
 impl Params {
