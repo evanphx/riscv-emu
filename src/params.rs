@@ -16,8 +16,10 @@ pub struct Params {
     /// Enables the JIT compiler.
     pub jit: bool,
     /// Number of executions before a block is compiled; 0 selects the
-    /// default.
+    /// default, which adapts to the backlog of the compiler threads.
     pub jit_threshold: u16,
+    /// Number of background compiler threads; 0 selects the default.
+    pub jit_threads: usize,
     /// Compiles blocks synchronously instead of on a background
     /// thread, which makes runs deterministic.
     pub jit_sync: bool,

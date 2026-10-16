@@ -49,7 +49,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{BuildHasherDefault, Hasher};
 use std::mem::offset_of;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Compiled block entry point. Blocks use Cranelift's tail calling
@@ -64,7 +64,7 @@ type BlockFn = *const u8;
 type EnterFn = unsafe extern "C" fn(*mut Cpu, BlockFn) -> u64;
 
 /// Number of entries in the jump cache.
-const JCACHE_SIZE: usize = 16384;
+const JCACHE_SIZE: usize = 65536;
 
 /// Jump cache entry. Blocks jump directly to the next block through
 /// the jump cache, which maps a guest virtual PC to its block. An entry
@@ -91,7 +91,7 @@ const EXIT_OK: u64 = 0;
 /// in `Cpu::jit_exception`; PC holds the faulting instruction.
 const EXIT_FAULT: u64 = 1;
 
-const CACHE_BITS: u32 = 16;
+const CACHE_BITS: u32 = 18;
 const CACHE_SIZE: usize = 1 << CACHE_BITS;
 const MAX_BLOCK_INSTRS: usize = 200;
 
@@ -101,6 +101,27 @@ const MAX_REGION_INSTRS: usize = 128;
 /// Default number of times the interpreter must reach a block start
 /// before the block is compiled.
 pub const DEFAULT_HOT_THRESHOLD: u16 = 1000;
+
+/// With the adaptive threshold, the hot threshold when no blocks are
+/// waiting for the background compiler, and its increase for each
+/// waiting block, up to DEFAULT_HOT_THRESHOLD. Compiling costs about
+/// 15 µs per guest instruction, so code that runs a few dozen times
+/// is worth compiling only when the compiler threads have nothing
+/// hotter to do.
+const MIN_HOT_THRESHOLD: usize = 50;
+const PENDING_THRESHOLD_STEP: usize = 4;
+
+/// Maximum number of background compiler threads.
+const MAX_JIT_THREADS: usize = 4;
+
+/// Returns the default number of background compiler threads: half
+/// the host's hardware threads, so that the compiler threads and the
+/// CPU threads of a few VMs do not compete for cores, up to
+/// MAX_JIT_THREADS.
+pub fn default_jit_threads() -> usize {
+    let n = std::thread::available_parallelism().map_or(1, |n| n.get());
+    (n / 2).clamp(1, MAX_JIT_THREADS)
+}
 
 /// JIT statistics.
 #[derive(Clone, Copy, Debug, Default)]
@@ -292,6 +313,9 @@ pub struct Jit {
     code_filter: Box<[u64]>,
     hot: Box<[u16]>,
     hot_threshold: u16,
+    /// Lower the hot threshold while the background compiler has
+    /// little work.
+    adaptive: bool,
     /// Compile with Cranelift's optimizations.
     optimize: bool,
     epoch: u64,
@@ -947,16 +971,17 @@ struct BlockInstr {
 }
 
 impl Jit {
-    /// Creates a new JIT. With background compilation, hot blocks
-    /// are compiled on a separate thread while the interpreter
-    /// continues; otherwise they are compiled immediately.
-    pub fn new(hot_threshold: u16, background: bool) -> Result<Jit, String> {
+    /// Creates a new JIT. With background compiler threads, hot
+    /// blocks are compiled while the interpreter continues; with 0
+    /// threads, they are compiled immediately. A hot_threshold of 0
+    /// selects the default, adaptive with background threads.
+    pub fn new(hot_threshold: u16, threads: usize) -> Result<Jit, String> {
         // The code arena relies on coherent instruction caches.
         if !cfg!(target_arch = "x86_64") {
             return Err("the JIT supports x86-64 hosts only".to_string());
         }
-        let (compiler, worker) = if background {
-            (None, Some(Worker::start()?))
+        let (compiler, worker) = if threads > 0 {
+            (None, Some(Worker::start(threads)?))
         } else {
             (Some(Compiler::new()?), None)
         };
@@ -983,7 +1008,12 @@ impl Jit {
             by_code: HashMap::default(),
             code_filter: vec![0u64; CODE_FILTER_WORDS].into_boxed_slice(),
             hot: vec![0u16; CACHE_SIZE].into_boxed_slice(),
-            hot_threshold: hot_threshold.max(1),
+            hot_threshold: if hot_threshold == 0 {
+                DEFAULT_HOT_THRESHOLD
+            } else {
+                hot_threshold
+            },
+            adaptive: hot_threshold == 0 && threads > 0,
             optimize: false,
             epoch: 0,
             stats: JitStats::default(),
@@ -1039,6 +1069,16 @@ impl Jit {
             b.epoch = self.epoch;
         }
         Some(b.func)
+    }
+
+    /// Returns the current hot threshold.
+    #[inline]
+    fn threshold(&self) -> u16 {
+        if !self.adaptive {
+            return self.hot_threshold;
+        }
+        let t = MIN_HOT_THRESHOLD + self.pending.len() * PENDING_THRESHOLD_STEP;
+        t.min(self.hot_threshold as usize) as u16
     }
 
     /// Counts a visit to the block start. Returns the number of
@@ -1573,27 +1613,34 @@ impl Compiler {
     }
 }
 
-/// Background compiler thread.
+/// Background compiler threads.
 struct Worker {
     tx: mpsc::Sender<Request>,
     rx: mpsc::Receiver<Result<Compiled, String>>,
 }
 
 impl Worker {
-    fn start() -> Result<Worker, String> {
-        let mut compiler = Compiler::new()?;
+    fn start(threads: usize) -> Result<Worker, String> {
         let (tx, req_rx) = mpsc::channel::<Request>();
         let (res_tx, rx) = mpsc::channel();
-        std::thread::Builder::new()
-            .name("jit".to_string())
-            .spawn(move || {
-                for req in req_rx {
+        // The threads take turns waiting for the next request.
+        let req_rx = Arc::new(Mutex::new(req_rx));
+        for i in 0..threads {
+            let mut compiler = Compiler::new()?;
+            let req_rx = req_rx.clone();
+            let res_tx = res_tx.clone();
+            std::thread::Builder::new()
+                .name(format!("jit{}", i))
+                .spawn(move || loop {
+                    let Ok(req) = req_rx.lock().unwrap().recv() else {
+                        return;
+                    };
                     if res_tx.send(compiler.compile(req)).is_err() {
                         return;
                     }
-                }
-            })
-            .map_err(|e| e.to_string())?;
+                })
+                .map_err(|e| e.to_string())?;
+        }
         Ok(Worker { tx, rx })
     }
 }
@@ -3079,10 +3126,12 @@ impl<'a, 'b> Translator<'a, 'b> {
 
 impl Cpu {
     /// Enables the JIT compiler. Blocks are compiled after the
-    /// interpreter has reached them hot_threshold times, on a
-    /// background thread if background is set.
-    pub fn enable_jit(&mut self, hot_threshold: u16, background: bool) -> Result<(), String> {
-        self.jit = Some(Box::new(Jit::new(hot_threshold, background)?));
+    /// interpreter has reached them hot_threshold times, on threads
+    /// background compiler threads, or before they run if threads is
+    /// 0. A hot_threshold of 0 selects the default: with background
+    /// threads, a threshold that adapts to the compiler's backlog.
+    pub fn enable_jit(&mut self, hot_threshold: u16, threads: usize) -> Result<(), String> {
+        self.jit = Some(Box::new(Jit::new(hot_threshold, threads)?));
         self.jit_addrs = self.jit_addresses();
         Ok(())
     }
@@ -3192,7 +3241,8 @@ impl Cpu {
                     return Ok(false);
                 }
                 let visits = jit.bump(phys);
-                let reused = if visits == 1 || visits >= jit.hot_threshold {
+                let threshold = jit.threshold();
+                let reused = if visits == 1 || visits >= threshold {
                     jit.reuse(&self.mem, code_pages!(self), pc, phys)
                 } else {
                     None
@@ -3200,7 +3250,7 @@ impl Cpu {
                 if let Some(f) = reused {
                     f
                 } else {
-                    if visits < jit.hot_threshold {
+                    if visits < threshold {
                         return Ok(false);
                     }
                     jit.hot[slot(phys)] = 0;

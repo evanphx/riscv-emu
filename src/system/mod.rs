@@ -1,8 +1,10 @@
 //! Full system emulation: memory map, devices, device tree, and boot.
 
 pub mod config;
+mod control;
 
 pub use config::*;
+pub use control::Control;
 
 use crate::cpu::Cpu;
 use crate::dev::{self, Clint, GoldfishRtc, Htif, Plic, Syscon, Uart, UartConsole, UartNmea};
@@ -131,26 +133,41 @@ struct VirtioNode {
 
 /// Runs the full system emulation. The `args` are additional disk
 /// image files attached as virtio-blk devices. With `suspend`, Ctrl-A
-/// s at the console or SIGUSR1 suspends the system to the file.
+/// s at the console or SIGUSR1 suspends the system to the file. With
+/// `control`, the system takes checkpoint commands on that Unix socket
+/// (see [`Control`]).
 pub fn system_emulation(
     htif: bool,
     params: &Params,
     cfg: &SystemConfig,
     args: &[String],
     suspend: Option<&Path>,
+    control: Option<&str>,
 ) -> Result<(), String> {
-    run(htif, params, cfg, args, None, suspend)
+    run(htif, params, cfg, args, None, suspend, control)
 }
 
 /// Restores the system from the snapshot file and runs it. The system
-/// is suspended to `suspend`, or to the snapshot file by default.
+/// is suspended to `suspend`, or to the snapshot file by default. With
+/// `vsock_uds`, the vsock device listens on that Unix socket instead of
+/// the one of the suspended system.
 pub fn restore_emulation(
     params: &Params,
     snapshot: &Path,
     suspend: Option<&Path>,
+    vsock_uds: Option<&str>,
+    control: Option<&str>,
 ) -> Result<(), String> {
     let snap = Snapshot::open(snapshot)?;
-    let (cfg, args) = (snap.meta.config.clone(), snap.meta.args.clone());
+    let (mut cfg, args) = (snap.meta.config.clone(), snap.meta.args.clone());
+    if let Some(uds) = vsock_uds {
+        let vsock = cfg
+            .devices
+            .iter_mut()
+            .find(|d| d.typ == "virtio-vsock-device")
+            .ok_or("the snapshot has no virtio-vsock-device")?;
+        vsock.uds = uds.to_string();
+    }
     run(
         false,
         params,
@@ -158,6 +175,7 @@ pub fn restore_emulation(
         &args,
         Some(&snap),
         Some(suspend.unwrap_or(snapshot)),
+        control,
     )
 }
 
@@ -171,9 +189,10 @@ fn run(
     args: &[String],
     restore: Option<&Snapshot>,
     suspend: Option<&Path>,
+    control: Option<&str>,
 ) -> Result<(), String> {
     let start = Instant::now();
-    if suspend.is_some() {
+    if suspend.is_some() || control.is_some() {
         if htif {
             return Err("suspend is not supported with HTIF".to_string());
         }
@@ -280,6 +299,15 @@ fn run(
                 virtio::Net::create(virtio_ram, plic.clone(), virtio_irq, mem.clone(), netdev)
                     .map_err(|e| format!("failed to create virtio-net-device: {}", e))?
             }
+            "virtio-vsock-device" => virtio::Vsock::create(
+                virtio_ram,
+                plic.clone(),
+                virtio_irq,
+                mem.clone(),
+                if d.cid == 0 { 3 } else { d.cid },
+                &d.uds,
+            )
+            .map_err(|e| format!("failed to create virtio-vsock-device: {}", e))?,
             "virtio-gpu-device" => {
                 if cfg.nographic {
                     continue;
@@ -389,6 +417,10 @@ fn run(
     for u in &uarts {
         u.start_peer();
     }
+    let control = match control {
+        Some(path) => Some(Control::start(path, signals.clone())?),
+        None => None,
+    };
     if suspend.is_some() {
         let s = signals.clone();
         std::thread::Builder::new()
@@ -413,20 +445,36 @@ fn run(
         (instret, runtime, stats)
     } else {
         let mut saved = None;
-        cpu.run_with(|cpu| {
-            let Some(path) = suspend else {
-                return Ok(());
-            };
-            let meta = snapshot::Meta {
+        let meta = || -> Result<snapshot::Meta, String> {
+            Ok(snapshot::Meta {
                 config: cfg.clone(),
                 args: args.to_vec(),
                 disks: disks
                     .iter()
                     .map(|f| DiskInfo::of(f))
                     .collect::<Result<_, _>>()?,
+            })
+        };
+        cpu.run_with(|cpu| {
+            if let Some(control) = &control {
+                if let Some(cp) = control.take() {
+                    // A checkpoint: save, then keep the CPU stopped
+                    // until it is resumed.
+                    let r = meta().and_then(|m| snapshot::save(&cp.path, cpu, &m, restore));
+                    if let Some(bus) = cpu.bus.as_mut() {
+                        bus.resume();
+                    }
+                    let ok = r.is_ok();
+                    cp.reply(r.map(|stats| stats.to_string()));
+                    let quit = ok && control.wait_resume();
+                    return Ok(quit);
+                }
+            }
+            let Some(path) = suspend else {
+                return Ok(true);
             };
-            saved = Some(snapshot::save(path, cpu, &meta, restore)?);
-            Ok(())
+            saved = Some(snapshot::save(path, cpu, &meta()?, restore)?);
+            Ok(true)
         })?;
         if let (Some(stats), Some(path)) = (saved, suspend) {
             println!("Suspended to {}: {}", path.display(), stats);
@@ -662,14 +710,21 @@ fn make_dtb(
     fdt.prop_u32s("reg", &[0, 0]);
     fdt.prop_str("compatible", "riscv");
     fdt.prop_u32("clock-frequency", 100_000_000);
-    fdt.prop_str("riscv,isa", "rv64gcv_sstc");
+    // The vector unit implements a small subset of the V extension;
+    // novector hides it from software that uses V when it finds it.
+    let (isa, v) = if cfg.novector {
+        ("rv64gc_sstc", None)
+    } else {
+        ("rv64gcv_sstc", Some("v"))
+    };
+    fdt.prop_str("riscv,isa", isa);
     fdt.prop_str("riscv,isa-base", "rv64i");
-    fdt.prop_strs(
-        "riscv,isa-extensions",
-        &[
-            "i", "m", "a", "f", "d", "c", "v", "zicsr", "zifencei", "zicntr", "zihpm", "sstc",
-        ],
-    );
+    let extensions: Vec<&str> = ["i", "m", "a", "f", "d", "c"]
+        .into_iter()
+        .chain(v)
+        .chain(["zicsr", "zifencei", "zicntr", "zihpm", "sstc"])
+        .collect();
+    fdt.prop_strs("riscv,isa-extensions", &extensions);
     fdt.prop_str("mmu-type", "riscv,sv39");
 
     // CPU local interrupt controller.

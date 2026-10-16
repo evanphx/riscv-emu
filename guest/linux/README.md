@@ -31,7 +31,7 @@ copy or link it there, or copy `OUTDIR/obj/arch/riscv/boot/Image` and
   nonportable), debug options, kexec, suspend, cpufreq and cpuidle,
   EFI and ACPI.
 - Devices. Only what the emulator has: virtio over MMIO (block, net,
-  rng, console, balloon, GPU, input), the 16550 UARTs, the PLIC, the
+  rng, console, balloon, GPU, input, vsock), the 16550 UARTs, the PLIC, the
   goldfish RTC and syscon power-off. No PCI, USB, sound, MMC, SCSI,
   SoC platforms or other network drivers.
 - Containers. Namespaces (user and time included), cgroup v2 with all

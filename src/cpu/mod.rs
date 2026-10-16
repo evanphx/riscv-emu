@@ -124,12 +124,14 @@ pub fn configure_jit(cpu: &mut Cpu, params: &crate::Params) -> Result<(), String
     }
     #[cfg(feature = "jit")]
     {
-        let threshold = if params.jit_threshold == 0 {
-            DEFAULT_HOT_THRESHOLD
+        let threads = if params.jit_sync {
+            0
+        } else if params.jit_threads == 0 {
+            jit::default_jit_threads()
         } else {
-            params.jit_threshold
+            params.jit_threads
         };
-        cpu.enable_jit(threshold, !params.jit_sync)?;
+        cpu.enable_jit(params.jit_threshold, threads)?;
         cpu.set_jit_optimize(params.jit_opt);
         if !params.jit_cache.is_empty() {
             cpu.set_jit_cache(&params.jit_cache);
@@ -475,15 +477,16 @@ impl Cpu {
 
     /// Runs the CPU until shutdown.
     pub fn run(&mut self) -> Result<(), String> {
-        self.run_with(|_| Ok(()))
+        self.run_with(|_| Ok(true))
     }
 
     /// Runs the CPU until shutdown. On a suspend request, the stopped
-    /// CPU calls `suspend`, which saves the system. If it fails, the
-    /// devices resume and the CPU continues.
+    /// CPU calls `suspend`, which saves the system and returns whether
+    /// the CPU stops or continues. If it fails, the devices resume and
+    /// the CPU continues.
     pub fn run_with<F>(&mut self, mut suspend: F) -> Result<(), String>
     where
-        F: FnMut(&mut Cpu) -> Result<(), String>,
+        F: FnMut(&mut Cpu) -> Result<bool, String>,
     {
         #[cfg(feature = "jit")]
         self.jit_cache_load();
@@ -493,13 +496,20 @@ impl Cpu {
         let result = loop {
             if self.signals.is_shutdown() {
                 if self.signals.is_suspend() {
-                    if let Err(e) = suspend(self) {
-                        eprint!("suspend failed: {}\r\n", e);
-                        self.signals.cancel_suspend();
-                        if let Some(bus) = self.bus.as_mut() {
-                            bus.resume();
+                    match suspend(self) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            self.signals.cancel_suspend();
+                            continue;
                         }
-                        continue;
+                        Err(e) => {
+                            eprint!("suspend failed: {}\r\n", e);
+                            self.signals.cancel_suspend();
+                            if let Some(bus) = self.bus.as_mut() {
+                                bus.resume();
+                            }
+                            continue;
+                        }
                     }
                 }
                 break Ok(());

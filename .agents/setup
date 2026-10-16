@@ -13,7 +13,7 @@ packages=(
 	gcc-riscv64-linux-gnu binutils-riscv64-linux-gnu libc6-dev-riscv64-cross
 	flex bison bc cpio libssl-dev libelf-dev
 	dwarves clang llvm bpftool libbpf-dev
-	e2fsprogs linux-perf
+	e2fsprogs linux-perf fakeroot jq
 )
 missing=()
 for p in "${packages[@]}"; do
@@ -42,6 +42,12 @@ rustup component add rustfmt clippy
 upstream=$workspace/riscv
 [ -d "$upstream/.git" ] || git clone -q --depth 1 https://github.com/markkurossi/riscv "$upstream"
 ln -sfn "$repo/guest/linux/linux-7.0.11-rsemu" "$upstream/cmd/goemu/linux-7.0.11-rsemu"
+# The guest agent of rsemu-server (configs/vmagent.goemu).
+make -s -C "$repo/guest/vmagent"
+ln -sfn "$repo/guest/vmagent" "$upstream/cmd/goemu/vmagent"
+# The default rsemu-server disk: Debian with Node.js.
+[ -f "$repo/guest/rootfs/build/node.ext4" ] || "$repo/guest/rootfs/mkimage.sh" >/dev/null
+ln -sfn "$repo/guest/rootfs/build" "$upstream/cmd/goemu/rootfs"
 
 # Scratch files stay out of git.
 grep -qx '/.amp/in/' .git/info/exclude 2>/dev/null || echo '/.amp/in/' >> .git/info/exclude

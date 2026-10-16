@@ -20,6 +20,9 @@ pub struct SystemConfig {
     pub memory: String,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub nographic: bool,
+    /// Do not advertise the V extension in the device tree.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub novector: bool,
     pub drives: Vec<Drive>,
     pub netdevs: Vec<Netdev>,
     pub gpus: Vec<Gpu>,
@@ -83,6 +86,16 @@ pub struct Device {
     pub gpu: String,
     pub id: String,
     pub serial: String,
+    /// The guest CID of a virtio-vsock-device.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub cid: u64,
+    /// The host Unix socket of a virtio-vsock-device.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub uds: String,
+}
+
+fn is_zero(v: &u64) -> bool {
+    *v == 0
 }
 
 fn parse_bool(v: &str) -> Result<bool, String> {
@@ -187,6 +200,8 @@ pub fn parse_device(args: &str) -> Result<Device, String> {
             "gpu" => dev.gpu = v,
             "id" => dev.id = v,
             "serial" => dev.serial = v,
+            "cid" => dev.cid = v.parse().map_err(|e| format!("invalid cid {}: {}", v, e))?,
+            "uds" => dev.uds = v,
             _ => return Err(format!("invalid argument: {}", arg)),
         }
     }
@@ -241,6 +256,9 @@ impl SystemConfig {
         set(&mut self.memory, o.memory);
         if o.nographic {
             self.nographic = true;
+        }
+        if o.novector {
+            self.novector = true;
         }
         self.drives.extend(o.drives);
         self.netdevs.extend(o.netdevs);
@@ -310,5 +328,7 @@ mod tests {
         assert!(parse_drive("id").is_err());
         assert!(parse_drive("bogus=1").is_err());
         assert!(parse_device("type=x").is_err());
+        let v = parse_device("virtio-vsock-device,cid=3,uds=/tmp/v.sock").unwrap();
+        assert_eq!((v.cid, v.uds.as_str()), (3, "/tmp/v.sock"));
     }
 }

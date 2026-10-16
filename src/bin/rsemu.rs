@@ -134,6 +134,12 @@ const FLAGS: &[FlagSpec] = &[
         usage: "guest RAM size",
     },
     FlagSpec {
+        name: "novector",
+        boolean: true,
+        multi: false,
+        usage: "do not advertise the V extension, which is only partly implemented",
+    },
+    FlagSpec {
         name: "nographic",
         boolean: true,
         multi: false,
@@ -149,7 +155,13 @@ const FLAGS: &[FlagSpec] = &[
         name: "jit-threshold",
         boolean: false,
         multi: false,
-        usage: "executions before a block is JIT compiled (default 1000, implies -jit)",
+        usage: "executions before a block is JIT compiled (default: 50 to 1000 depending on the compiler backlog; implies -jit)",
+    },
+    FlagSpec {
+        name: "jit-threads",
+        boolean: false,
+        multi: false,
+        usage: "background JIT compiler threads (default: half the host threads, at most 4; implies -jit)",
     },
     FlagSpec {
         name: "jit-sync",
@@ -180,6 +192,18 @@ const FLAGS: &[FlagSpec] = &[
         boolean: false,
         multi: false,
         usage: "restore the system from the snapshot `file`",
+    },
+    FlagSpec {
+        name: "vsock-uds",
+        boolean: false,
+        multi: false,
+        usage: "with -restore, the host Unix socket `path` of the virtio-vsock-device",
+    },
+    FlagSpec {
+        name: "control",
+        boolean: false,
+        multi: false,
+        usage: "take checkpoint and resume commands on the Unix socket `path`",
     },
     FlagSpec {
         name: "drive",
@@ -310,6 +334,7 @@ fn main() {
             || flags.bool("jit-sync")
             || flags.bool("jit-opt")
             || !flags.string("jit-threshold").is_empty()
+            || !flags.string("jit-threads").is_empty()
             || !flags.string("jit-cache").is_empty(),
         jit_cache: flags.string("jit-cache"),
         jit_sync: flags.bool("jit-sync"),
@@ -321,6 +346,17 @@ fn main() {
             } else {
                 v.parse()
                     .unwrap_or_else(|_| fatal(format!("invalid -jit-threshold: {}", v)))
+            }
+        },
+        jit_threads: {
+            let v = flags.string("jit-threads");
+            if v.is_empty() {
+                0
+            } else {
+                v.parse()
+                    .ok()
+                    .filter(|&n| n > 0)
+                    .unwrap_or_else(|| fatal(format!("invalid -jit-threads: {}", v)))
             }
         },
     };
@@ -343,6 +379,7 @@ fn main() {
         initrd: flags.string("initrd"),
         dumpdtb: flags.string("dumpdtb"),
         nographic: flags.bool("nographic"),
+        novector: flags.bool("novector"),
         ..Default::default()
     };
     for d in flags.list("drive") {
@@ -405,20 +442,29 @@ fn main() {
 
     let suspend = flags.string("suspend");
     let suspend = (!suspend.is_empty()).then(|| std::path::Path::new(&suspend));
+    let control = flags.string("control");
+    let control = (!control.is_empty()).then_some(control.as_str());
     let restore = flags.string("restore");
     if !restore.is_empty() {
         if cfg.defined() || !rest.is_empty() || !flags.string("m").is_empty() {
             fatal("-restore uses the configuration of the snapshot");
         }
-        if let Err(e) = system::restore_emulation(&params, std::path::Path::new(&restore), suspend)
-        {
+        let uds = flags.string("vsock-uds");
+        if let Err(e) = system::restore_emulation(
+            &params,
+            std::path::Path::new(&restore),
+            suspend,
+            (!uds.is_empty()).then_some(uds.as_str()),
+            control,
+        ) {
             fatal(e);
         }
         return;
     }
 
     if cfg.defined() {
-        if let Err(e) = system::system_emulation(flags.bool("htif"), &params, &cfg, &rest, suspend)
+        if let Err(e) =
+            system::system_emulation(flags.bool("htif"), &params, &cfg, &rest, suspend, control)
         {
             fatal(e);
         }

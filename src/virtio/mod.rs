@@ -6,6 +6,7 @@ mod input;
 mod mmio;
 mod net;
 mod rng;
+mod vsock;
 #[cfg(feature = "gui")]
 mod window;
 
@@ -15,3 +16,4 @@ pub use input::*;
 pub use mmio::*;
 pub use net::*;
 pub use rng::*;
+pub use vsock::*;

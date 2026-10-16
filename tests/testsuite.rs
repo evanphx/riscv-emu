@@ -130,7 +130,7 @@ fn run_test(file: &Path, exec: Exec) -> Result<Option<u64>, String> {
 /// Enables the JIT so that every block is compiled on first use.
 #[cfg(feature = "jit")]
 fn enable_jit(cpu: &mut Cpu, exec: Exec) -> Result<(), String> {
-    cpu.enable_jit(1, false)?;
+    cpu.enable_jit(1, 0)?;
     match exec {
         Exec::JitCache(path) => cpu.set_jit_cache(path),
         Exec::JitOpt => cpu.set_jit_optimize(true),

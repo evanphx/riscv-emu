@@ -22,7 +22,9 @@ OpenSBI → U-Boot
 - Devices: NS16550A UARTs (console and an NMEA GPS clock), PLIC, CLINT
   (ACLINT MSWI/MTIMER), Goldfish RTC, syscon poweroff/reboot, HTIF
 - VirtIO MMIO devices: block, entropy, network (TUN, built-in DHCP
-  server), GPU and input
+  server), GPU, input and sockets (vsock)
+- An HTTP API that runs shell commands in VMs and continues them from
+  snapshots (`rsemu-server`)
 - Linux userspace emulation for static and dynamic RISC-V binaries
 - Cranelift JIT (`-jit`) for hot guest code
 - `riscv-objdump` ELF disassembler
@@ -33,7 +35,8 @@ OpenSBI → U-Boot
 $ cargo build --release
 ```
 
-This builds `target/release/rsemu` and `target/release/riscv-objdump`.
+This builds `target/release/rsemu`, `target/release/rsemu-server` and
+`target/release/riscv-objdump`.
 The JIT is the default `jit` cargo feature; build with
 `--no-default-features` for an interpreter-only binary.
 
@@ -95,7 +98,8 @@ Main flags:
 | `-gpu id=gpu0,width=1024,height=768` | add a VirtIO GPU with keyboard and pointer |
 | `-nographic` | ignore GPU devices |
 | `-jit` | enable the JIT compiler |
-| `-jit-threshold n` | executions before a block is compiled (default 1000; implies `-jit`) |
+| `-jit-threshold n` | executions before a block is compiled (default: 50 to 1000, depending on the compiler backlog; implies `-jit`) |
+| `-jit-threads n` | background compiler threads (default: half the host's hardware threads, at most 4; implies `-jit`) |
 | `-jit-sync` | compile blocks synchronously, for deterministic runs (implies `-jit`) |
 | `-jit-cache file` | load and save JIT compiled code in `file` (implies `-jit`) |
 | `-jit-opt` | compile slower, optimized code, e.g. to build a `-jit-cache` (implies `-jit`) |
@@ -168,6 +172,171 @@ refuses a disk whose size changed and warns about one modified after
 the snapshot was taken. The guest clock continues from where it
 stopped. The VirtIO GPU and the HTIF test device are not supported.
 
+### Checkpoints
+
+`-control path` makes the emulator take commands on the Unix socket
+`path`, one per line, each answered with `OK [details]` or
+`ERR message`:
+
+- `checkpoint FILE` stops the CPU, saves the system to the snapshot
+  `FILE` like `-suspend` does, and leaves the CPU stopped, so that the
+  process holds the system in exactly the saved state. The devices
+  keep running.
+- `resume` continues the stopped CPU.
+- `quit` stops the system like a power-off, so that the emulator saves
+  its `-jit-cache` and exits.
+
+## Sockets (vsock)
+
+`-device virtio-vsock-device,cid=3,uds=PATH` adds a VirtIO socket
+device. Host programs reach the guest's `AF_VSOCK` sockets through the
+Unix socket `PATH`, in the style of Firecracker: a host program
+connects to it and writes `CONNECT <port>\n`; the emulator answers
+`OK <host port>\n` when a guest program accepts the connection on
+that port, or closes the socket if none listens, and the socket then
+carries the stream. A guest connection to port P of the host (CID 2)
+is forwarded to the Unix socket `PATH_P`.
+
+Connections end when the system is suspended. A restored system
+sends the guest a transport reset event, which resets the guest's
+connected sockets; listening sockets stay. Restoring with
+`-vsock-uds PATH` makes the device listen on another socket than the
+one of the suspended system, so that several VMs restored from one
+snapshot do not collide.
+
+## Shell API with continuations
+
+`rsemu-server` runs shell commands in VMs over HTTP and streams their
+output back. Each command ends with a snapshot of its VM, and its id,
+the continuation, restores that VM for the next command, which runs in
+the same shell:
+
+```shell
+$ make -C /path/to/riscv-rs/guest/vmagent
+$ /path/to/riscv-rs/guest/rootfs/mkimage.sh
+$ ln -s /path/to/riscv-rs/guest/vmagent riscv/cmd/goemu/
+$ ln -s /path/to/riscv-rs/guest/rootfs/build riscv/cmd/goemu/rootfs
+$ cd riscv/cmd/goemu
+$ /path/to/rsemu-server -config /path/to/riscv-rs/configs/vmagent.goemu \
+      -warmup "$(cat /path/to/riscv-rs/configs/vmagent-warmup.sh)"
+rsemu-server: booting the base VM
+rsemu-server: warmup in 7.9s
+rsemu-server: base snapshot rsemu-server/snapshots/base.snap in 8.8s
+rsemu-server: listening on http://127.0.0.1:8080
+
+$ curl -N localhost:8080/v1/exec -d '{"command": "cd /tmp; X=42; node --version; ls nope"}'
+{"data":"v26.11.1","type":"stdout"}
+{"data":"\n","type":"stdout"}
+{"data":"ls: ","type":"stderr"}
+{"data":"cannot access 'nope': No such file or directory\n","type":"stderr"}
+{"code":2,"type":"exit"}
+{"id":"c8b081182ef1fb32290a9df206fd2271","type":"continuation"}
+
+$ curl -N localhost:8080/v1/exec -d '{"command": "echo $X in $(pwd)",
+                                     "continuation": "c8b081182ef1fb32290a9df206fd2271"}'
+{"data":"42 in /tmp\n","type":"stdout"}
+{"code":0,"type":"exit"}
+{"id":"8c36e3efcae3ac3f7fd35ea497c10243","type":"continuation"}
+```
+
+- `POST /v1/exec` takes `command`, an optional `continuation` and an
+  optional `timeout` in seconds (default `-timeout`, 600). Without a
+  continuation the command runs in a fresh VM restored from the base
+  snapshot, which the server boots once and keeps in `-state`. The
+  response is `application/x-ndjson`, streamed as the command runs:
+  `stdout` and `stderr` events with the output in `data`, or in
+  `data_base64` if it is not UTF-8; an `exit` event with the status;
+  and a `continuation` event with the new id once the snapshot is
+  saved. If the command times out, the client disconnects or the VM
+  stops, the stream ends with an `error` event (or just ends) and no
+  continuation is made.
+- An unknown continuation id is an error: `404` with
+  `{"error": "unknown continuation id: ..."}`.
+- Continuations are immutable: continuing one makes a new one, and the
+  same one can be continued any number of times, also concurrently,
+  each time from the same state. `DELETE /v1/continuations/<id>`
+  removes one.
+- Each VM is its own `rsemu` process, started with `-control`. After
+  a command, the server checkpoints the VM to the new snapshot file
+  and keeps it warm: paused, with its RAM in memory, for `-warm-ttl`
+  seconds (default 60). A request for that continuation resumes the
+  warm VM (2-5 ms) instead of restoring the snapshot in a new process
+  (about 12 ms; the RAM is mapped copy-on-write). At most `-warm` VMs
+  (default 4) are kept; the one idle the longest is stopped to make
+  room. A paused VM does not run, so its guest clock stands still and
+  it continues exactly from the snapshot. The snapshot stays, so a
+  continuation whose VM is busy, evicted or expired is restored from
+  it, and two requests for one continuation get one warm VM and one
+  restored VM. `-warm 0` turns this off. With warm VMs, a command
+  takes about 65 ms end to end; with a restore, about 125 ms; most of
+  either is writing the snapshot. `GET /v1/health` reports the number
+  of warm VMs.
+
+### The default image
+
+[configs/vmagent.goemu](configs/vmagent.goemu) boots a Debian trixie
+(slim) disk with Node.js 26, npm and Python 3.13, and 2 GiB of RAM.
+[guest/rootfs/mkimage.sh](guest/rootfs/mkimage.sh) makes it,
+`node.ext4`, from the riscv64 image of `debian:trixie-slim` on Docker
+Hub, a Node.js build for riscv64, CPython from python-build-standalone
+and Debian's libatomic, which it needs, all pinned by digest; it needs
+fakeroot and no root. Node.js publishes no official riscv64 builds,
+and its unofficial builds stopped at v26.0.0, so the image uses the
+builds Cloud-V makes natively on RISC-V hardware. The disk has no
+network access, so commands cannot install from the npm registry:
+copy dependencies into the guest (for example with a `node_modules`
+tarball, base64-encoded in the command) or add them to the image.
+[configs/vmagent-buildroot.goemu](configs/vmagent-buildroot.goemu)
+uses the buildroot disk instead.
+
+Both configurations set `"novector": true` (`-novector`): the device
+tree then does not advertise the V extension, of which the emulator
+implements a few instructions only. Software that finds V uses it;
+OpenSSL in Node.js, for example, crashes npm with an illegal
+instruction otherwise.
+
+`-warmup` runs a command in the base VM before its snapshot. With the
+JIT, the server gives all VMs the JIT code cache `jit.cache` in the
+state directory, and the base VM saves the code it compiled there
+before it exits, so that the code the warmup ran starts compiled in
+every VM. The base VM runs with `-jit-opt`: its code compiles about
+twice as slowly but runs faster in all the other VMs. [configs/vmagent-warmup.sh](configs/vmagent-warmup.sh) runs
+node, its test runner, npm and python. Node.js is slow in the emulator
+all the same: a bare `npm --version` executes 500 million guest
+instructions. Measured through the API (medians of 3, 4-core host):
+
+| Command | Time |
+|---------|-----:|
+| `node -e '...'` | 0.7 s |
+| `npm --version` | 2.1 s |
+| `node --test` with 3 small tests (crypto, an HTTP server on localhost, fetch) | 3.2 s |
+| `python3 -c 'print(1)'` | 0.5 s |
+| Python: a 3M-iteration loop, SHA-256 of 10 MB, JSON of 100k objects | 5.1 s |
+
+The guest clock advances with the instructions executed (one tick of
+the 100 MHz timebase per instruction), not with the host clock, so
+times measured in the guest, such as Python's `time.perf_counter()`,
+are not wall-clock times: a JIT-compiled loop runs more than 100
+million instructions per second and the guest clock runs fast.
+
+The guest side is [guest/vmagent](guest/vmagent), a static program
+started as `/init` of an initramfs (`vmagent.cpio`). It makes the root
+an overlay of a tmpfs on the read-only disk, so all file changes are
+in RAM and in the snapshot. Then it adds itself to `/etc/inittab` and
+starts the disk's init (a busybox init), or, with `vmagent.init=none`
+on the kernel command line as for the Debian disk, which has no init,
+it stays PID 1: it mounts `/proc`, `/sys`, `/dev/pts`, `/dev/shm` and
+`/run`, brings up the loopback interface, starts the agent and reaps
+orphaned processes. Started by init, it listens
+on vsock port 1024 and keeps one `/bin/sh` running. A command is
+written to a file and sourced in that shell with stdin from
+`/dev/null`, so its working directory, variables, functions and
+background jobs are there for the next command. A script with a
+syntax error is rejected (`sh -n`) without running; a command that
+ends the shell (`exit 3`) reports its status, and the next command
+gets a new shell. The guest clock continues from the time the snapshot
+was taken.
+
 ## Networking
 
 A `virtio-net-device` connects the guest to a host TUN interface. The
@@ -216,9 +385,15 @@ such as `riscv64-linux-gnu-gcc`.
 
 ## The JIT
 
-With `-jit`, guest code that has run `-jit-threshold` times (1000 by
-default) is compiled to native code with Cranelift on a background
-thread while the interpreter keeps running:
+With `-jit`, hot guest code is compiled to native code with Cranelift
+on background threads (`-jit-threads`) while the interpreter keeps
+running. Code becomes hot when the interpreter has reached it 50 times
+plus 4 for each block waiting for the compiler, at most 1000 times, so
+that the compiler takes lukewarm code when it is idle and only the
+hottest code when it has a backlog; `-jit-threshold` fixes the count.
+Compiling costs about 15 µs per guest instruction, mostly in
+Cranelift's register allocator, so a large program such as Node.js
+keeps the compiler threads busy for its first seconds:
 
 - A compiled unit is a trace: it starts at a guest PC and follows
   not-taken conditional branches and direct jumps within the guest
