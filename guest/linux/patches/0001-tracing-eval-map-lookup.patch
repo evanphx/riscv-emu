@@ -1,0 +1,334 @@
+tracing: Update trace event formats with a lookup of the eval maps
+
+At boot, trace_event_update_all() replaces the enum and sizeof names
+in every event's print format with their values. For each event it
+scans the whole format once per eval map of the event's system, and
+sanitizes every field type once per map, and each replacement moves
+the rest of the format. With defconfig on riscv64 (1366 maps, 1315
+events) that is about 131M bytes of scanning, most of it for nfs4:
+213 maps, 120 events with formats of about 4 KB. It takes about a
+billion instructions and blocks boot until late_initcall_sync.
+
+Hash the maps of each system by eval_string, scan each format once,
+looking up each identifier, and compact the format in place behind
+the scan. Sanitize field types once per event, and compare maps only
+with events that have an array sized by a name. The maps are still
+applied in order, so the formats come out the same: all 1315 format
+files read back through tracefs are byte-identical. Boot to init
+under an emulator went from 13.07 s to 1.16 s of guest time.
+
+The old code remains for len <= 0 and when the tables cannot be
+allocated.
+
+--- a/kernel/trace/trace_events.c
++++ b/kernel/trace/trace_events.c
+@@ -22,6 +22,7 @@
+ #include <linux/sort.h>
+ #include <linux/slab.h>
+ #include <linux/delay.h>
++#include <linux/stringhash.h>
+ 
+ #include <trace/events/sched.h>
+ #include <trace/syscall.h>
+@@ -3550,11 +3551,301 @@
+ 	}
+ }
+ 
++/*
++ * The eval maps of one trace system, looked up by eval_string. With
++ * it, each event's print format and fields are scanned once for all
++ * the maps of its system, rather than once per map: the kernel and
++ * modules define over a thousand maps, and some systems (nfs4) define
++ * hundreds of maps for events with formats several KB long.
++ */
++struct eval_lookup {
++	/* The maps of the system, in the order they are applied. */
++	struct trace_eval_map	**maps;
++	int			nr;
++	/* Open-addressed hash of the maps whose eval_string is an identifier. */
++	struct trace_eval_map	**slots;
++	unsigned int		mask;
++	/* Number of slots allocated. */
++	unsigned int		size;
++	/* Some eval_string is not an identifier, such as "sizeof(x)". */
++	bool			has_other;
++};
++
++static bool eval_is_ident(const char *s)
++{
++	if (!isalpha(*s) && *s != '_')
++		return false;
++	while (*++s)
++		if (!isalnum(*s) && *s != '_')
++			return false;
++	return true;
++}
++
++static bool eval_lookup_alloc(struct eval_lookup *el, int len)
++{
++	el->size = roundup_pow_of_two(2 * len);
++	el->maps = kmalloc_array(len, sizeof(*el->maps), GFP_KERNEL);
++	el->slots = kmalloc_array(el->size, sizeof(*el->slots), GFP_KERNEL);
++	if (!el->maps || !el->slots) {
++		kfree(el->maps);
++		kfree(el->slots);
++		return false;
++	}
++	return true;
++}
++
++static void eval_lookup_free(struct eval_lookup *el)
++{
++	kfree(el->maps);
++	kfree(el->slots);
++}
++
++/* Collects the maps of @system from @map, in order, and hashes them. */
++static void eval_lookup_build(struct eval_lookup *el, struct trace_eval_map **map,
++			      int len, const char *system)
++{
++	struct trace_eval_map *m;
++	unsigned int h, size;
++	int i, n;
++
++	el->nr = 0;
++	el->has_other = false;
++	for (i = 0; i < len; i++)
++		if (map[i]->system == system)
++			el->maps[el->nr++] = map[i];
++	if (!el->nr)
++		return;
++
++	size = roundup_pow_of_two(2 * el->nr);
++	el->mask = size - 1;
++	memset(el->slots, 0, size * sizeof(*el->slots));
++	for (i = 0; i < el->nr; i++) {
++		m = el->maps[i];
++		if (!eval_is_ident(m->eval_string)) {
++			el->has_other = true;
++			continue;
++		}
++		n = strlen(m->eval_string);
++		h = full_name_hash(NULL, m->eval_string, n) & el->mask;
++		/* The first map with a given string is the one that applies. */
++		while (el->slots[h] && strcmp(el->slots[h]->eval_string, m->eval_string))
++			h = (h + 1) & el->mask;
++		if (!el->slots[h])
++			el->slots[h] = m;
++	}
++}
++
++/*
++ * Returns the map whose eval_string is at @ptr, which starts an
++ * identifier, and sets @len to the length of the eval_string.
++ */
++static struct trace_eval_map *eval_lookup_find(struct eval_lookup *el,
++					       const char *ptr, int *len)
++{
++	struct trace_eval_map *m;
++	unsigned int h;
++	int i, n;
++
++	if (el->has_other) {
++		for (i = 0; i < el->nr; i++) {
++			m = el->maps[i];
++			if (eval_is_ident(m->eval_string))
++				continue;
++			n = strlen(m->eval_string);
++			if (strncmp(m->eval_string, ptr, n) == 0 &&
++			    !isalnum(ptr[n]) && ptr[n] != '_') {
++				*len = n;
++				return m;
++			}
++		}
++	}
++
++	for (n = 1; isalnum(ptr[n]) || ptr[n] == '_'; n++)
++		;
++	h = full_name_hash(NULL, ptr, n) & el->mask;
++	while ((m = el->slots[h])) {
++		if (strncmp(m->eval_string, ptr, n) == 0 && !m->eval_string[n]) {
++			*len = n;
++			return m;
++		}
++		h = (h + 1) & el->mask;
++	}
++	return NULL;
++}
++
++/*
++ * update_event_printk() for all the maps of @el in one pass. Values
++ * are never longer than the strings they replace, so the format is
++ * compacted in place behind the scan: the text from @seg up to the
++ * scan position moves to @w at each replacement, and the remainder at
++ * the end, rather than moving the whole remainder each time.
++ */
++static void update_event_printk_all(struct trace_event_call *call,
++				    struct eval_lookup *el)
++{
++	struct trace_eval_map *map;
++	char *ptr, *w = NULL, *seg = NULL;
++	char val[24];
++	int quote = 0;
++	int len, vlen;
++
++	for (ptr = call->print_fmt; *ptr; ptr++) {
++		if (*ptr == '\\') {
++			ptr++;
++			/* paranoid */
++			if (!*ptr)
++				break;
++			continue;
++		}
++		if (*ptr == '"') {
++			quote ^= 1;
++			continue;
++		}
++		if (quote)
++			continue;
++		if (isdigit(*ptr)) {
++			/* skip numbers */
++			do {
++				ptr++;
++				/* Check for alpha chars like ULL */
++			} while (isalnum(*ptr));
++			if (!*ptr)
++				break;
++			/*
++			 * A number must have some kind of delimiter after
++			 * it, and we can ignore that too.
++			 */
++			continue;
++		}
++		if (isalpha(*ptr) || *ptr == '_') {
++			map = eval_lookup_find(el, ptr, &len);
++			if (map) {
++				vlen = snprintf(val, sizeof(val), "%ld", map->eval_value);
++				/* enum/sizeof string smaller than value */
++				if (!WARN_ON_ONCE(vlen > len)) {
++					if (!w) {
++						w = ptr;
++					} else {
++						memmove(w, seg, ptr - seg);
++						w += ptr - seg;
++					}
++					memcpy(w, val, vlen);
++					w += vlen;
++					seg = ptr + len;
++					/*
++					 * As in update_event_printk(), the
++					 * delimiter after the value is skipped.
++					 */
++					ptr += len;
++					if (!*ptr)
++						break;
++					continue;
++				}
++			}
++		skip_more:
++			do {
++				ptr++;
++			} while (isalnum(*ptr) || *ptr == '_');
++			if (!*ptr)
++				break;
++			/*
++			 * If what comes after this variable is a '.' or
++			 * '->' then we can continue to ignore that string.
++			 */
++			if (*ptr == '.' || (ptr[0] == '-' && ptr[1] == '>')) {
++				ptr += *ptr == '.' ? 1 : 2;
++				if (!*ptr)
++					break;
++				goto skip_more;
++			}
++			/*
++			 * Once again, we can skip the delimiter that came
++			 * after the string.
++			 */
++			continue;
++		}
++	}
++	if (w)
++		memmove(w, seg, strlen(seg) + 1);
++}
++
++/* Returns whether a field of @call is an array sized by a name. */
++static bool event_has_eval_field(struct trace_event_call *call)
++{
++	struct ftrace_event_field *field;
++	const char *ptr;
++
++	list_for_each_entry(field, trace_get_fields(call), link) {
++		ptr = strchr(field->type, '[');
++		if (ptr && (isalpha(ptr[1]) || ptr[1] == '_'))
++			return true;
++	}
++	return false;
++}
++
++/*
++ * update_event_fields() for all the maps of @el. The fields are
++ * sanitized once; few events have arrays sized by a name, and only
++ * those are compared with each map.
++ */
++static void update_event_fields_all(struct trace_event_call *call,
++				    struct eval_lookup *el)
++{
++	struct ftrace_event_field *field;
++	struct trace_eval_map *map;
++	int i;
++
++	update_event_fields(call, NULL);
++	if (!el->nr || (call->flags & TRACE_EVENT_FL_DYNAMIC) ||
++	    !event_has_eval_field(call))
++		return;
++
++	for (i = 0; i < el->nr; i++) {
++		map = el->maps[i];
++		list_for_each_entry(field, trace_get_fields(call), link) {
++			if (find_replacable_eval(field->type, map->eval_string,
++						 strlen(map->eval_string))) {
++				update_event_fields(call, map);
++				break;
++			}
++		}
++	}
++}
++
++static void trace_event_update_all_slow(struct trace_eval_map **map, int len);
++
+ /* Update all events for replacing eval and sanitizing */
+ void trace_event_update_all(struct trace_eval_map **map, int len)
+ {
+ 	struct trace_event_call *call, *p;
+ 	const char *last_system = NULL;
++	struct eval_lookup el = {};
++
++	if (len <= 0 || !eval_lookup_alloc(&el, len)) {
++		trace_event_update_all_slow(map, len);
++		return;
++	}
++
++	down_write(&trace_event_sem);
++	list_for_each_entry_safe(call, p, &ftrace_events, list) {
++		if (call->class->system != last_system) {
++			last_system = call->class->system;
++			eval_lookup_build(&el, map, len, last_system);
++		}
++		if (el.nr)
++			update_event_printk_all(call, &el);
++		update_event_fields_all(call, &el);
++		cond_resched();
++	}
++	up_write(&trace_event_sem);
++	eval_lookup_free(&el);
++}
++
++/* Applies the maps one at a time: with no maps, or if memory is short. */
++static void trace_event_update_all_slow(struct trace_eval_map **map, int len)
++{
++	struct trace_event_call *call, *p;
++	const char *last_system = NULL;
+ 	bool first = false;
+ 	bool updated;
+ 	int last_i;

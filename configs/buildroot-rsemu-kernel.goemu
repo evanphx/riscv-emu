@@ -1,0 +1,20 @@
+{
+  "bios":    "opensbi/fw_jump.bin",
+  "kernel":  "linux-7.0.11-rsemu/Image",
+  "symbols": "linux-7.0.11-rsemu/System.map",
+  "append":  "earlycon=sbi console=ttyS0,115200 root=/dev/vda ro rootwait",
+  "drives": [
+    {
+      "id":     "hd0",
+      "format": "raw",
+      "file":   "buildroot-2026.02/rootfs.ext2",
+      "readonly": true
+    }
+  ],
+  "devices": [
+    {
+      "type":  "virtio-blk-device",
+      "drive": "hd0"
+    }
+  ]
+}

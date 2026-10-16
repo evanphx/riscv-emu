@@ -1,0 +1,249 @@
+{
+ "ociVersion": "1.0.2",
+ "process": {
+  "terminal": false,
+  "user": {
+   "uid": 0,
+   "gid": 0
+  },
+  "args": [
+   "/bin/sh",
+   "-c",
+   "\necho \"== inside: hostname=$(hostname) pid=$$ uid=$(id -u)\"\necho \"uid_map: $(cat /proc/self/uid_map | tr -s ' ')\"\necho \"cgroup: $(cat /proc/self/cgroup)\"\necho \"memory.max=$(cat /sys/fs/cgroup/memory.max) pids.max=$(cat /sys/fs/cgroup/pids.max) cpu.max=$(cat /sys/fs/cgroup/cpu.max)\"\necho \"procs visible: $(ls /proc | grep -c '^[0-9]')\"\necho \"links: $(ls /sys/class/net | tr '\\n' ' ')\"\nmkdir /seccomp-test 2>/dev/null && echo \"seccomp: NOT blocked\" || echo \"seccomp: mkdir blocked\"\nmknod /tmp/blk b 254 0 && (head -c 1 /tmp/blk >/dev/null 2>&1 && echo \"devices: NOT blocked\" || echo \"devices: vda read blocked\")\nsh -c 'i=0; while [ $i -lt 20 ]; do sleep 1 & i=$((i+1)); done' 2>&1 | head -1\necho \"pids: peak $(cat /sys/fs/cgroup/pids.peak) with pids.max=8, $(grep max /sys/fs/cgroup/pids.events)\"\necho overlay-write > /written && echo \"rootfs write: ok ($(cat /written))\"\n"
+  ],
+  "env": [
+   "PATH=/usr/sbin:/usr/bin:/sbin:/bin"
+  ],
+  "cwd": "/",
+  "capabilities": {
+   "bounding": [
+    "CAP_CHOWN",
+    "CAP_DAC_OVERRIDE",
+    "CAP_FOWNER",
+    "CAP_KILL",
+    "CAP_SETUID",
+    "CAP_SETGID",
+    "CAP_MKNOD",
+    "CAP_NET_BIND_SERVICE",
+    "CAP_SYS_CHROOT"
+   ],
+   "effective": [
+    "CAP_CHOWN",
+    "CAP_DAC_OVERRIDE",
+    "CAP_FOWNER",
+    "CAP_KILL",
+    "CAP_SETUID",
+    "CAP_SETGID",
+    "CAP_MKNOD",
+    "CAP_NET_BIND_SERVICE",
+    "CAP_SYS_CHROOT"
+   ],
+   "permitted": [
+    "CAP_CHOWN",
+    "CAP_DAC_OVERRIDE",
+    "CAP_FOWNER",
+    "CAP_KILL",
+    "CAP_SETUID",
+    "CAP_SETGID",
+    "CAP_MKNOD",
+    "CAP_NET_BIND_SERVICE",
+    "CAP_SYS_CHROOT"
+   ]
+  },
+  "noNewPrivileges": true
+ },
+ "root": {
+  "path": "rootfs",
+  "readonly": false
+ },
+ "hostname": "ct",
+ "mounts": [
+  {
+   "destination": "/proc",
+   "type": "proc",
+   "source": "proc"
+  },
+  {
+   "destination": "/dev",
+   "type": "tmpfs",
+   "source": "tmpfs",
+   "options": [
+    "nosuid",
+    "strictatime",
+    "mode=755",
+    "size=65536k"
+   ]
+  },
+  {
+   "destination": "/dev/pts",
+   "type": "devpts",
+   "source": "devpts",
+   "options": [
+    "nosuid",
+    "noexec",
+    "newinstance",
+    "ptmxmode=0666",
+    "mode=0620"
+   ]
+  },
+  {
+   "destination": "/dev/shm",
+   "type": "tmpfs",
+   "source": "shm",
+   "options": [
+    "nosuid",
+    "noexec",
+    "nodev",
+    "mode=1777",
+    "size=65536k"
+   ]
+  },
+  {
+   "destination": "/dev/mqueue",
+   "type": "mqueue",
+   "source": "mqueue",
+   "options": [
+    "nosuid",
+    "noexec",
+    "nodev"
+   ]
+  },
+  {
+   "destination": "/sys",
+   "type": "sysfs",
+   "source": "sysfs",
+   "options": [
+    "nosuid",
+    "noexec",
+    "nodev",
+    "ro"
+   ]
+  },
+  {
+   "destination": "/sys/fs/cgroup",
+   "type": "cgroup",
+   "source": "cgroup",
+   "options": [
+    "nosuid",
+    "noexec",
+    "nodev",
+    "relatime",
+    "rw"
+   ]
+  },
+  {
+   "destination": "/tmp",
+   "type": "tmpfs",
+   "source": "tmpfs",
+   "options": [
+    "nosuid",
+    "nodev",
+    "mode=1777"
+   ]
+  }
+ ],
+ "linux": {
+  "namespaces": [
+   {
+    "type": "pid"
+   },
+   {
+    "type": "network"
+   },
+   {
+    "type": "ipc"
+   },
+   {
+    "type": "uts"
+   },
+   {
+    "type": "mount"
+   },
+   {
+    "type": "cgroup"
+   }
+  ],
+  "resources": {
+   "devices": [
+    {
+     "allow": false,
+     "access": "rwm"
+    },
+    {
+     "allow": true,
+     "type": "c",
+     "major": 1,
+     "minor": 3,
+     "access": "rwm"
+    },
+    {
+     "allow": true,
+     "type": "c",
+     "major": 1,
+     "minor": 5,
+     "access": "rwm"
+    },
+    {
+     "allow": true,
+     "type": "c",
+     "major": 1,
+     "minor": 8,
+     "access": "rwm"
+    },
+    {
+     "allow": true,
+     "type": "c",
+     "major": 1,
+     "minor": 9,
+     "access": "rwm"
+    },
+    {
+     "allow": true,
+     "type": "c",
+     "major": 5,
+     "minor": 0,
+     "access": "rwm"
+    },
+    {
+     "allow": true,
+     "type": "c",
+     "major": 136,
+     "access": "rwm"
+    }
+   ],
+   "memory": {
+    "limit": 33554432
+   },
+   "pids": {
+    "limit": 8
+   },
+   "cpu": {
+    "quota": 50000,
+    "period": 100000
+   }
+  },
+  "seccomp": {
+   "defaultAction": "SCMP_ACT_ALLOW",
+   "architectures": [
+    "SCMP_ARCH_RISCV64"
+   ],
+   "syscalls": [
+    {
+     "names": [
+      "mkdirat"
+     ],
+     "action": "SCMP_ACT_ERRNO",
+     "errnoRet": 1
+    }
+   ]
+  },
+  "maskedPaths": [
+   "/proc/kcore",
+   "/proc/keys"
+  ],
+  "readonlyPaths": [
+   "/proc/sys",
+   "/proc/sysrq-trigger"
+  ]
+ }
+}
