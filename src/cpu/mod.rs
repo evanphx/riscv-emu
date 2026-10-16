@@ -20,6 +20,7 @@ pub use vpu::Vpu;
 use crate::isa::{self, reg, Exception, Instr, Mode, Mstatus, Op, RegStatus, Trap};
 use crate::memory::{self, Memory, INVALID_PAGENUM};
 use crate::mmu::{JitTlbEntry, Mmio, Overlay, Satp, TlbEntry, TLB_SIZE};
+use crate::snapshot::{StateReader, StateWriter};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -32,6 +33,7 @@ const INT_NUMS: [u64; 6] = [11, 9, 7, 5, 3, 1];
 pub struct HartSignals {
     mip: AtomicU64,
     shutdown: AtomicBool,
+    suspend: AtomicBool,
     lock: Mutex<()>,
     cond: Condvar,
 }
@@ -47,6 +49,7 @@ impl HartSignals {
         HartSignals {
             mip: AtomicU64::new(0),
             shutdown: AtomicBool::new(false),
+            suspend: AtomicBool::new(false),
             lock: Mutex::new(()),
             cond: Condvar::new(),
         }
@@ -82,6 +85,24 @@ impl HartSignals {
     pub fn shutdown(&self) {
         self.shutdown.store(true, Ordering::SeqCst);
         self.wake();
+    }
+
+    /// Requests the hart to stop for suspending the system.
+    pub fn suspend(&self) {
+        self.suspend.store(true, Ordering::SeqCst);
+        self.shutdown();
+    }
+
+    /// Cancels the suspend request, after the system could not be
+    /// saved.
+    pub fn cancel_suspend(&self) {
+        self.suspend.store(false, Ordering::SeqCst);
+        self.shutdown.store(false, Ordering::SeqCst);
+    }
+
+    /// Tests if suspend has been requested.
+    pub fn is_suspend(&self) -> bool {
+        self.suspend.load(Ordering::SeqCst)
     }
 
     /// Tests if shutdown has been requested.
@@ -219,7 +240,9 @@ pub struct Cpu {
     pub trace: bool,
     /// Instruction level debug trace (CSR 0x800).
     pub debug_trace: bool,
-    pub symtab: Option<SystemMap>,
+    /// The kernel symbol table, loaded from symtab_path on first use.
+    symtab: std::sync::OnceLock<SystemMap>,
+    symtab_path: String,
     pub color: bool,
     last_symbol: Option<usize>,
     reg_trace: Option<Box<debug::RegTrace>>,
@@ -314,7 +337,8 @@ impl Cpu {
             trap_handler: None,
             trace: false,
             debug_trace: false,
-            symtab: None,
+            symtab: std::sync::OnceLock::new(),
+            symtab_path: String::new(),
             color: false,
             last_symbol: None,
             reg_trace: None,
@@ -337,6 +361,26 @@ impl Cpu {
         };
         cpu.sync_mmu_state();
         cpu
+    }
+
+    /// Sets the kernel System.map file for traces. The file is loaded
+    /// when the symbols are first needed.
+    pub fn set_symbols(&mut self, path: &str) {
+        self.symtab = std::sync::OnceLock::new();
+        self.symtab_path = path.to_string();
+    }
+
+    /// Returns the kernel symbol table if one is set.
+    pub fn symtab(&self) -> Option<&SystemMap> {
+        if self.symtab_path.is_empty() {
+            return None;
+        }
+        Some(self.symtab.get_or_init(|| {
+            SystemMap::load(&self.symtab_path).unwrap_or_else(|e| {
+                eprintln!("{}", e);
+                SystemMap::default()
+            })
+        }))
     }
 
     /// Returns the current privilege mode.
@@ -431,6 +475,16 @@ impl Cpu {
 
     /// Runs the CPU until shutdown.
     pub fn run(&mut self) -> Result<(), String> {
+        self.run_with(|_| Ok(()))
+    }
+
+    /// Runs the CPU until shutdown. On a suspend request, the stopped
+    /// CPU calls `suspend`, which saves the system. If it fails, the
+    /// devices resume and the CPU continues.
+    pub fn run_with<F>(&mut self, mut suspend: F) -> Result<(), String>
+    where
+        F: FnMut(&mut Cpu) -> Result<(), String>,
+    {
         #[cfg(feature = "jit")]
         self.jit_cache_load();
         let start = Instant::now();
@@ -438,6 +492,16 @@ impl Cpu {
 
         let result = loop {
             if self.signals.is_shutdown() {
+                if self.signals.is_suspend() {
+                    if let Err(e) = suspend(self) {
+                        eprint!("suspend failed: {}\r\n", e);
+                        self.signals.cancel_suspend();
+                        if let Some(bus) = self.bus.as_mut() {
+                            bus.resume();
+                        }
+                        continue;
+                    }
+                }
                 break Ok(());
             }
             match self.run_loop() {
@@ -1392,6 +1456,93 @@ impl Cpu {
         self.mstatus.set_sd(dirty);
     }
 
+    /// Saves the architectural state of the stopped hart into a
+    /// snapshot.
+    pub fn save_state(&self, w: &mut StateWriter) {
+        for v in self.x.iter().chain(&self.f) {
+            w.u64(*v);
+        }
+        w.u64(self.pc);
+        w.u8(self.mode as u8);
+        w.u64(self.mstatus.0);
+        w.u64(self.satp.0);
+        w.u64(self.signals.mip());
+        w.u32(self.fflags);
+        w.u32(self.frm);
+        w.u64(self.reservation);
+        w.bool(self.reservation_valid);
+        w.u64(self.time);
+        w.u64(self.instret);
+        let mut csrs = Vec::with_capacity(self.csr.len() * 8);
+        for v in self.csr.iter() {
+            csrs.extend_from_slice(&v.to_le_bytes());
+        }
+        w.bytes(&csrs);
+        let v = &self.vpu;
+        w.u64(v.vlen);
+        w.bytes(&v.vregs);
+        w.u64(v.vtype.0);
+        w.u64(v.vl);
+        w.u64(v.vstart);
+        w.u8(v.vxrm);
+        w.bool(v.vxsat);
+    }
+
+    /// Restores the hart state saved by save_state. The translation
+    /// and code caches start empty.
+    pub fn load_state(&mut self, r: &mut StateReader) -> Result<(), String> {
+        for i in 0..64 {
+            let v = r.u64()?;
+            if i < 32 {
+                self.x[i] = v;
+            } else {
+                self.f[i - 32] = v;
+            }
+        }
+        self.x[0] = 0;
+        self.pc = r.u64()?;
+        let mode = Mode::from_bits(r.u8()? as u64);
+        self.mstatus = Mstatus(r.u64()?);
+        self.satp = Satp(r.u64()?);
+        self.signals.set_mip(r.u64()?);
+        self.fflags = r.u32()?;
+        self.frm = r.u32()?;
+        self.reservation = r.u64()?;
+        self.reservation_valid = r.bool()?;
+        self.time = r.u64()?;
+        self.instret = r.u64()?;
+        let csrs = r.bytes()?;
+        if csrs.len() != self.csr.len() * 8 {
+            return Err("invalid CSR state".to_string());
+        }
+        for (v, b) in self.csr.iter_mut().zip(csrs.as_chunks::<8>().0) {
+            *v = u64::from_le_bytes(*b);
+        }
+        let v = &mut self.vpu;
+        if r.u64()? != v.vlen {
+            return Err("vector register length differs".to_string());
+        }
+        let vregs = r.bytes()?;
+        if vregs.len() != v.vregs.len() {
+            return Err("invalid vector register state".to_string());
+        }
+        v.vregs.copy_from_slice(vregs);
+        v.vtype = isa::VType(r.u64()?);
+        v.vl = r.u64()?;
+        v.vstart = r.u64()?;
+        v.vxrm = r.u8()?;
+        v.vxsat = r.bool()?;
+
+        self.mode = mode;
+        self.debug_trace = self.csr[isa::CSR_GOEMU_DEBUG as usize] & 1 != 0;
+        self.flush_tlb();
+        self.flush_decode_cache();
+        self.code_vpn = INVALID_PAGENUM;
+        self.next_irq_check = 0;
+        self.sync_mmu_state();
+        Ok(())
+    }
+
     /// Prints the CPU registers.
     pub fn dump(&self, epc: u64) {
         print!("{}", self.dump_string(epc));
@@ -1406,7 +1557,7 @@ impl Cpu {
             "CPU: 0 Mode: {} IC: {} Mstatus: {:x}\r\n",
             self.mode, self.instret, self.mstatus.0
         );
-        if let Some(sym) = &self.symtab {
+        if let Some(sym) = self.symtab() {
             if let Some((e, mapped)) = sym.func_name(epc) {
                 let _ = write!(s, "epc : {}+0x{:x}\r\n", e.name, mapped - e.start);
             }

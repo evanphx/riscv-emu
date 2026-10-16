@@ -170,6 +170,18 @@ const FLAGS: &[FlagSpec] = &[
         usage: "compile slower, optimized code, e.g. to build a -jit-cache (implies -jit)",
     },
     FlagSpec {
+        name: "suspend",
+        boolean: false,
+        multi: false,
+        usage: "suspend the system to `file` on Ctrl-A s or SIGUSR1",
+    },
+    FlagSpec {
+        name: "restore",
+        boolean: false,
+        multi: false,
+        usage: "restore the system from the snapshot `file`",
+    },
+    FlagSpec {
         name: "drive",
         boolean: false,
         multi: true,
@@ -391,8 +403,23 @@ fn main() {
         cfg.gpus.push(g);
     }
 
+    let suspend = flags.string("suspend");
+    let suspend = (!suspend.is_empty()).then(|| std::path::Path::new(&suspend));
+    let restore = flags.string("restore");
+    if !restore.is_empty() {
+        if cfg.defined() || !rest.is_empty() || !flags.string("m").is_empty() {
+            fatal("-restore uses the configuration of the snapshot");
+        }
+        if let Err(e) = system::restore_emulation(&params, std::path::Path::new(&restore), suspend)
+        {
+            fatal(e);
+        }
+        return;
+    }
+
     if cfg.defined() {
-        if let Err(e) = system::system_emulation(flags.bool("htif"), &params, &cfg, &rest) {
+        if let Err(e) = system::system_emulation(flags.bool("htif"), &params, &cfg, &rest, suspend)
+        {
             fatal(e);
         }
         return;

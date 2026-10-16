@@ -4,17 +4,20 @@ pub mod config;
 
 pub use config::*;
 
-use crate::cpu::{Cpu, SystemMap};
+use crate::cpu::Cpu;
 use crate::dev::{self, Clint, GoldfishRtc, Htif, Plic, Syscon, Uart, UartConsole, UartNmea};
 use crate::fdt::Fdt;
 use crate::isa::{elf, reg, Exception, Mode};
 use crate::memory::{Memory, RAM_BASE};
 use crate::mmu::Mmio;
+use crate::snapshot::{self, DiskInfo, Snapshot, StateReader, StateWriter};
 use crate::virtio::{self, VirtioMmio};
 use crate::Params;
 use std::fs::OpenOptions;
+use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::Instant;
 
 pub const OFS_BIOS: u64 = 0x8000_0000;
 pub const OFS_KERNEL: u64 = 0x8020_0000;
@@ -87,6 +90,35 @@ impl Mmio for Bus {
         }
         Ok(())
     }
+
+    fn quiesce(&mut self) -> Result<(), String> {
+        self.segments.iter_mut().try_for_each(|s| s.quiesce())
+    }
+
+    fn resume(&mut self) {
+        self.segments.iter_mut().for_each(|s| s.resume())
+    }
+
+    // The bus of a restored system is built from the same
+    // configuration, so the devices are in the same order.
+
+    fn save_state(&mut self, w: &mut StateWriter) -> Result<(), String> {
+        w.u32(self.segments.len() as u32);
+        for seg in self.segments.iter_mut() {
+            w.section("device", |w| seg.save_state(w))?;
+        }
+        Ok(())
+    }
+
+    fn load_state(&mut self, r: &mut StateReader) -> Result<(), String> {
+        if r.u32()? as usize != self.segments.len() {
+            return Err("the snapshot has different devices".to_string());
+        }
+        for seg in self.segments.iter_mut() {
+            r.section("device", |r| seg.load_state(r))?;
+        }
+        Ok(())
+    }
 }
 
 /// A virtio device node for the device tree.
@@ -98,15 +130,69 @@ struct VirtioNode {
 }
 
 /// Runs the full system emulation. The `args` are additional disk
-/// image files attached as virtio-blk devices.
+/// image files attached as virtio-blk devices. With `suspend`, Ctrl-A
+/// s at the console or SIGUSR1 suspends the system to the file.
 pub fn system_emulation(
     htif: bool,
     params: &Params,
     cfg: &SystemConfig,
     args: &[String],
+    suspend: Option<&Path>,
 ) -> Result<(), String> {
+    run(htif, params, cfg, args, None, suspend)
+}
+
+/// Restores the system from the snapshot file and runs it. The system
+/// is suspended to `suspend`, or to the snapshot file by default.
+pub fn restore_emulation(
+    params: &Params,
+    snapshot: &Path,
+    suspend: Option<&Path>,
+) -> Result<(), String> {
+    let snap = Snapshot::open(snapshot)?;
+    let (cfg, args) = (snap.meta.config.clone(), snap.meta.args.clone());
+    run(
+        false,
+        params,
+        &cfg,
+        &args,
+        Some(&snap),
+        Some(suspend.unwrap_or(snapshot)),
+    )
+}
+
+/// Builds the system and runs it, booting it or restoring it from
+/// the snapshot. With `suspend`, Ctrl-A s at the console or SIGUSR1
+/// stops the system and saves it to the file.
+fn run(
+    htif: bool,
+    params: &Params,
+    cfg: &SystemConfig,
+    args: &[String],
+    restore: Option<&Snapshot>,
+    suspend: Option<&Path>,
+) -> Result<(), String> {
+    let start = Instant::now();
+    if suspend.is_some() {
+        if htif {
+            return Err("suspend is not supported with HTIF".to_string());
+        }
+        if !cfg.nographic && cfg.devices.iter().any(|d| d.typ == "virtio-gpu-device") {
+            return Err("suspend is not supported with virtio-gpu-device".to_string());
+        }
+        // Block the signal in all threads before the devices start
+        // theirs; a dedicated thread waits for it.
+        block_suspend_signal();
+    }
     let ram_size = parse_mem(&cfg.memory)?;
-    let mem = Arc::new(Memory::new(RAM_BASE, ram_size));
+    let mem = match restore {
+        Some(snap) => Arc::new(snap.memory()?),
+        None => Arc::new(Memory::new(RAM_BASE, ram_size)),
+    };
+    if mem.size() != ram_size {
+        return Err("the snapshot RAM size differs from the configuration".to_string());
+    }
+    let mut disks: Vec<String> = Vec::new();
 
     let mut cpu = Cpu::new(mem.clone());
     cpu.trace = params.cpu_trace;
@@ -116,7 +202,12 @@ pub fn system_emulation(
 
     let plic = Plic::new(vec![signals.clone()], PLIC_BASE);
 
-    let console: Arc<dyn dev::UartPeer> = Arc::new(UartConsole::new(params.cooked));
+    let mut console = UartConsole::new(params.cooked);
+    if suspend.is_some() {
+        let s = signals.clone();
+        console.set_suspend_key(Box::new(move || s.suspend()));
+    }
+    let console: Arc<dyn dev::UartPeer> = Arc::new(console);
     let uart = Uart::new("Cons", UART_BASE, plic.clone(), UART_IRQ, console);
     let nmea = Uart::new(
         "NMEA",
@@ -166,6 +257,7 @@ pub fn system_emulation(
                     .write(!drive.readonly)
                     .open(&drive.file)
                     .map_err(|e| format!("{}: {}", drive.file, e))?;
+                disks.push(drive.file.clone());
                 let id = if d.id.is_empty() {
                     format!("goemu-disk-{}", idx)
                 } else {
@@ -251,6 +343,7 @@ pub fn system_emulation(
             .write(true)
             .open(arg)
             .map_err(|e| format!("failed to open disk file {}: {}", arg, e))?;
+        disks.push(arg.clone());
         let blk = virtio::Blk::create(
             virtio_ram,
             plic.clone(),
@@ -268,60 +361,40 @@ pub fn system_emulation(
     cpu.set_mode(Mode::M);
 
     if !cfg.symbols.is_empty() {
-        cpu.symtab = Some(SystemMap::load(&cfg.symbols)?);
-    }
-
-    let mut entrypoint = 0;
-    if !cfg.bios.is_empty() {
-        let data = std::fs::read(&cfg.bios).map_err(|e| format!("failed to read BIOS: {}", e))?;
-        load_ram(&mem, OFS_BIOS, &data)?;
-        entrypoint = OFS_BIOS;
+        // Check the file now; it is loaded when traces need it.
+        std::fs::metadata(&cfg.symbols).map_err(|e| format!("{}: {}", cfg.symbols, e))?;
+        cpu.set_symbols(&cfg.symbols);
     }
 
     let mut htif_status = None;
-    if !cfg.kernel.is_empty() {
-        let (htif_dev, entry) = load_kernel(&cpu, &mem, &cfg.kernel)
-            .map_err(|e| format!("failed to read kernel: {}", e))?;
-        if cfg.bios.is_empty() {
-            entrypoint = entry;
+    match restore {
+        Some(snap) => {
+            check_disks(&snap.meta.disks, &disks)?;
+            snap.restore(&mut cpu)?;
+            println!(
+                "Restored {} in {:.1?}",
+                snap.path.display(),
+                start.elapsed()
+            );
         }
-        if htif {
-            let h = htif_dev.ok_or_else(|| "no HTIF device".to_string())?;
-            htif_status = Some(h.exit_status.clone());
-            cpu.overlay = Some(Box::new(h));
+        None => {
+            htif_status = boot(htif, &mut cpu, &mem, &plic, &uarts, &virtio_devices, cfg)?;
         }
     }
 
-    let mut initrd_size = 0;
-    if !cfg.initrd.is_empty() {
-        let data =
-            std::fs::read(&cfg.initrd).map_err(|e| format!("failed to read initrd: {}", e))?;
-        initrd_size = data.len() as u64;
-        load_ram(&mem, OFS_INITRD, &data)?;
-    }
-
-    let nodes: Vec<VirtioNode> = virtio_devices
-        .iter()
-        .map(|v| VirtioNode {
-            name: v.name.clone(),
-            start: v.start,
-            end: v.end,
-            irq: v.irq,
-        })
-        .collect();
-    let dtb = make_dtb(initrd_size, &mem, &plic, &uarts, &nodes, cfg);
-    if !cfg.dumpdtb.is_empty() {
-        std::fs::write(&cfg.dumpdtb, &dtb).map_err(|e| format!("{}: {}", cfg.dumpdtb, e))?;
-    }
-    load_ram(&mem, OFS_DTB, &dtb)?;
-
-    cpu.x[reg::A0 as usize] = 0;
-    cpu.x[reg::A1 as usize] = OFS_DTB;
-    cpu.pc = entrypoint;
+    // A restored CPU has executed instructions before this run.
+    let instret_start = cpu.instret;
 
     // Start UARTs.
     for u in &uarts {
         u.start_peer();
+    }
+    if suspend.is_some() {
+        let s = signals.clone();
+        std::thread::Builder::new()
+            .name("suspend".to_string())
+            .spawn(move || wait_suspend_signal(&s))
+            .map_err(|e| e.to_string())?;
     }
 
     let (instret, runtime, jit_stats) = if let Some(g) = gpu {
@@ -339,7 +412,25 @@ pub fn system_emulation(
         r?;
         (instret, runtime, stats)
     } else {
-        cpu.run()?;
+        let mut saved = None;
+        cpu.run_with(|cpu| {
+            let Some(path) = suspend else {
+                return Ok(());
+            };
+            let meta = snapshot::Meta {
+                config: cfg.clone(),
+                args: args.to_vec(),
+                disks: disks
+                    .iter()
+                    .map(|f| DiskInfo::of(f))
+                    .collect::<Result<_, _>>()?,
+            };
+            saved = Some(snapshot::save(path, cpu, &meta, restore)?);
+            Ok(())
+        })?;
+        if let (Some(stats), Some(path)) = (saved, suspend) {
+            println!("Suspended to {}: {}", path.display(), stats);
+        }
         (cpu.instret, cpu.runtime, cpu.jit_summary())
     };
 
@@ -349,7 +440,7 @@ pub fn system_emulation(
         instret,
         runtime,
         if secs > 0.0 {
-            instret as f64 / 1e6 / secs
+            (instret - instret_start) as f64 / 1e6 / secs
         } else {
             0.0
         }
@@ -367,6 +458,117 @@ pub fn system_emulation(
         }
     }
     Ok(())
+}
+
+/// Loads the firmware, the kernel, the initrd, and the device tree
+/// into RAM and sets up the boot hart. Returns the HTIF exit status
+/// if the HTIF device is enabled.
+fn boot(
+    htif: bool,
+    cpu: &mut Cpu,
+    mem: &Memory,
+    plic: &Plic,
+    uarts: &[Uart],
+    virtio_devices: &[VirtioMmio],
+    cfg: &SystemConfig,
+) -> Result<Option<Arc<std::sync::atomic::AtomicU64>>, String> {
+    let mut entrypoint = 0;
+    if !cfg.bios.is_empty() {
+        let data = std::fs::read(&cfg.bios).map_err(|e| format!("failed to read BIOS: {}", e))?;
+        load_ram(mem, OFS_BIOS, &data)?;
+        entrypoint = OFS_BIOS;
+    }
+
+    let mut htif_status = None;
+    if !cfg.kernel.is_empty() {
+        let (htif_dev, entry) = load_kernel(cpu, mem, &cfg.kernel)
+            .map_err(|e| format!("failed to read kernel: {}", e))?;
+        if cfg.bios.is_empty() {
+            entrypoint = entry;
+        }
+        if htif {
+            let h = htif_dev.ok_or_else(|| "no HTIF device".to_string())?;
+            htif_status = Some(h.exit_status.clone());
+            cpu.overlay = Some(Box::new(h));
+        }
+    }
+
+    let mut initrd_size = 0;
+    if !cfg.initrd.is_empty() {
+        let data =
+            std::fs::read(&cfg.initrd).map_err(|e| format!("failed to read initrd: {}", e))?;
+        initrd_size = data.len() as u64;
+        load_ram(mem, OFS_INITRD, &data)?;
+    }
+
+    let nodes: Vec<VirtioNode> = virtio_devices
+        .iter()
+        .map(|v| VirtioNode {
+            name: v.name.clone(),
+            start: v.start,
+            end: v.end,
+            irq: v.irq,
+        })
+        .collect();
+    let dtb = make_dtb(initrd_size, mem, plic, uarts, &nodes, cfg);
+    if !cfg.dumpdtb.is_empty() {
+        std::fs::write(&cfg.dumpdtb, &dtb).map_err(|e| format!("{}: {}", cfg.dumpdtb, e))?;
+    }
+    load_ram(mem, OFS_DTB, &dtb)?;
+
+    cpu.x[reg::A0 as usize] = 0;
+    cpu.x[reg::A1 as usize] = OFS_DTB;
+    cpu.pc = entrypoint;
+    Ok(htif_status)
+}
+
+/// Checks that the disk images of the restored system have not
+/// changed since it was suspended.
+fn check_disks(saved: &[DiskInfo], disks: &[String]) -> Result<(), String> {
+    if saved.len() != disks.len() {
+        return Err("the snapshot has different disks".to_string());
+    }
+    for (s, file) in saved.iter().zip(disks) {
+        let now = DiskInfo::of(file)?;
+        if now.size != s.size {
+            return Err(format!(
+                "{}: disk size changed from {} to {} bytes since the snapshot",
+                file, s.size, now.size
+            ));
+        }
+        if now.mtime != s.mtime {
+            eprintln!(
+                "warning: {}: disk image modified since the snapshot was taken",
+                file
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Blocks SIGUSR1 in the calling thread and the threads it starts.
+fn block_suspend_signal() {
+    // SAFETY: signal mask manipulation of the calling thread.
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGUSR1);
+        libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+    }
+}
+
+/// Waits for SIGUSR1 and requests suspend.
+fn wait_suspend_signal(signals: &crate::cpu::HartSignals) {
+    // SAFETY: waiting for a blocked signal.
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGUSR1);
+        let mut sig = 0;
+        while libc::sigwait(&set, &mut sig) == 0 {
+            signals.suspend();
+        }
+    }
 }
 
 fn load_ram(mem: &Memory, paddr: u64, data: &[u8]) -> Result<(), String> {

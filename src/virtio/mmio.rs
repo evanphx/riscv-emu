@@ -5,9 +5,11 @@ use crate::isa::Exception;
 use crate::logger::{Level, Log};
 use crate::memory::Memory;
 use crate::mmu::{Mmio, Shm};
+use crate::snapshot::{StateReader, StateWriter};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::{Arc, Mutex, Weak};
+use std::time::{Duration, Instant};
 
 pub const MAGIC: u32 = 0x74726976; // "virt"
 pub const VERSION: u32 = 0x2;
@@ -117,6 +119,9 @@ pub struct Queue {
     /// Guest physical address of the used ring.
     pub used_phys: u64,
     pub last_avail_idx: u16,
+    /// Descriptor chains taken from the available ring and not yet
+    /// completed. Each queue completes its chains in order.
+    pub inflight: u16,
 }
 
 /// Guest memory accessor used by the device implementations.
@@ -252,6 +257,9 @@ pub struct VirtioState {
     /// Incremented on device reset. Asynchronous workers use it to
     /// discard completions of requests started before the reset.
     pub generation: u64,
+    /// Set when the system is suspended: the device no longer delivers
+    /// host input to the guest.
+    pub frozen: bool,
 }
 
 impl VirtioState {
@@ -292,6 +300,7 @@ impl VirtioState {
                 })
                 .collect(),
             generation: 0,
+            frozen: false,
         }
     }
 
@@ -341,6 +350,7 @@ impl VirtioState {
     /// Adds the descriptor chain to the used ring and notifies the
     /// guest.
     pub fn complete_descriptor(&mut self, q: usize, desc: u16, tx: u32) {
+        self.queues[q].inflight = self.queues[q].inflight.saturating_sub(1);
         if let Err(e) = self.push_used(q, desc, tx).and_then(|_| self.notify(q)) {
             self.log.error(format_args!("complete descriptor: {}", e));
         }
@@ -444,6 +454,24 @@ pub trait Handler: Send {
     fn config_store(&mut self, _st: &mut VirtioState, _offset: u64, _size: u64, _v: u64) -> bool {
         false
     }
+
+    /// Returns the queues whose asynchronous requests complete on
+    /// their own; a snapshot waits for them. Requests on the other
+    /// queues, such as receive buffers waiting for host input, stay in
+    /// flight and are resubmitted when the snapshot is restored.
+    fn drain_queues(&self) -> Vec<usize> {
+        Vec::new()
+    }
+
+    /// Saves the device specific state into a snapshot.
+    fn save_state(&self, st: &VirtioState, _w: &mut StateWriter) -> Result<(), String> {
+        Err(format!("{} does not support snapshots", st.log.name))
+    }
+
+    /// Restores the device specific state saved by save_state.
+    fn load_state(&mut self, st: &mut VirtioState, _r: &mut StateReader) -> Result<(), String> {
+        Err(format!("{} does not support snapshots", st.log.name))
+    }
 }
 
 /// A VirtIO device: the transport state and the device handler.
@@ -483,6 +511,7 @@ impl VirtioDevice {
             match self.handler.execute_descriptor_chain(st, q, head) {
                 Ok(0) => {
                     // Asynchronous processing.
+                    st.queues[q].inflight += 1;
                     crate::log_debug!(st.log, "chain idx={} asynchronous processing", head);
                 }
                 Ok(tx) => {
@@ -587,6 +616,7 @@ impl VirtioDevice {
                         q.avail_phys = 0;
                         q.used_phys = 0;
                         q.last_avail_idx = 0;
+                        q.inflight = 0;
                     }
                     return Ok(());
                 }
@@ -711,6 +741,106 @@ impl Mmio for VirtioMmio {
 
     fn store(&mut self, _now: u64, paddr: u64, size: u64, v: u64) -> Result<(), Exception> {
         self.dev.lock().unwrap().store(paddr - self.start, size, v)
+    }
+
+    fn quiesce(&mut self) -> Result<(), String> {
+        let drain = {
+            let mut d = self.dev.lock().unwrap();
+            d.state.frozen = true;
+            d.handler.drain_queues()
+        };
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let d = self.dev.lock().unwrap();
+            if drain
+                .iter()
+                .all(|&q| d.state.queues.get(q).is_none_or(|q| q.inflight == 0))
+            {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(format!("{}: requests did not complete", d.state.log.name));
+            }
+            drop(d);
+            std::thread::sleep(Duration::from_micros(20));
+        }
+    }
+
+    fn resume(&mut self) {
+        self.dev.lock().unwrap().state.frozen = false;
+    }
+
+    fn save_state(&mut self, w: &mut StateWriter) -> Result<(), String> {
+        let d = self.dev.lock().unwrap();
+        let st = &d.state;
+        w.u32(st.device_id);
+        w.u32(st.shm_sel);
+        w.u32(st.device_features_sel);
+        w.u32(st.driver_features_sel);
+        w.u32(st.driver_features[0]);
+        w.u32(st.driver_features[1]);
+        w.u32(st.status);
+        w.u32(st.interrupt_status);
+        w.u32(st.queue_sel);
+        w.u64(st.generation);
+        w.u32(st.queues.len() as u32);
+        for q in &st.queues {
+            w.u32(q.num);
+            w.u32(q.ready);
+            w.u64(q.desc_phys);
+            w.u64(q.avail_phys);
+            w.u64(q.used_phys);
+            w.u16(q.last_avail_idx);
+            w.u16(q.inflight);
+        }
+        d.handler.save_state(st, w)
+    }
+
+    fn load_state(&mut self, r: &mut StateReader) -> Result<(), String> {
+        let mut d = self.dev.lock().unwrap();
+        let d = &mut *d;
+        let st = &mut d.state;
+        let device_id = r.u32()?;
+        if device_id != st.device_id {
+            return Err(format!(
+                "{}: snapshot has device type {}",
+                st.log.name, device_id
+            ));
+        }
+        st.shm_sel = r.u32()?;
+        st.device_features_sel = r.u32()?;
+        st.driver_features_sel = r.u32()?;
+        st.driver_features = [r.u32()?, r.u32()?];
+        st.status = r.u32()?;
+        st.interrupt_status = r.u32()?;
+        st.queue_sel = r.u32()?;
+        st.generation = r.u64()?;
+        if r.u32()? as usize != st.queues.len() {
+            return Err(format!("{}: number of queues differs", st.log.name));
+        }
+        for q in st.queues.iter_mut() {
+            q.num = r.u32()?;
+            q.ready = r.u32()?;
+            q.desc_phys = r.u64()?;
+            q.avail_phys = r.u64()?;
+            q.used_phys = r.u64()?;
+            q.last_avail_idx = r.u16()?;
+            q.inflight = r.u16()?;
+        }
+        d.handler.load_state(st, r)?;
+
+        // Resubmit the requests that were in flight. They are the last
+        // ones taken from the available ring, because the queues
+        // complete their requests in order.
+        for q in 0..d.state.queues.len() {
+            let vq = &mut d.state.queues[q];
+            if vq.inflight > 0 {
+                vq.last_avail_idx = vq.last_avail_idx.wrapping_sub(vq.inflight);
+                vq.inflight = 0;
+                d.process_queue(q as u32);
+            }
+        }
+        Ok(())
     }
 }
 

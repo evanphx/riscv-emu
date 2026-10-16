@@ -5,11 +5,17 @@ use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::sync::Mutex;
 
+/// The escape key of the console commands (Ctrl-A).
+const ESCAPE: u8 = 0x01;
+
 /// Console peer reading the host stdin and writing to stdout.
 pub struct UartConsole {
     pub cooked: bool,
     input: Mutex<VecDeque<u8>>,
     old_state: Mutex<Option<libc::termios>>,
+    /// Called on Ctrl-A s. When set, Ctrl-A starts a console command:
+    /// Ctrl-A a or Ctrl-A Ctrl-A sends Ctrl-A to the guest.
+    suspend_key: Option<Box<dyn Fn() + Send + Sync>>,
 }
 
 impl UartConsole {
@@ -18,7 +24,13 @@ impl UartConsole {
             cooked,
             input: Mutex::new(VecDeque::new()),
             old_state: Mutex::new(None),
+            suspend_key: None,
         }
+    }
+
+    /// Enables the Ctrl-A s console command calling f.
+    pub fn set_suspend_key(&mut self, f: Box<dyn Fn() + Send + Sync>) {
+        self.suspend_key = Some(f);
     }
 
     fn make_raw(&self) {
@@ -49,13 +61,37 @@ impl UartPeer for UartConsole {
         }
         let mut stdin = std::io::stdin();
         let mut buf = [0u8; 256];
+        let mut escape = false;
         loop {
             let n = match stdin.read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => n,
             };
-            self.input.lock().unwrap().extend(&buf[..n]);
-            uart.input_available();
+            let mut input = self.input.lock().unwrap();
+            for &b in &buf[..n] {
+                let Some(suspend) = &self.suspend_key else {
+                    input.push_back(b);
+                    continue;
+                };
+                if !escape {
+                    escape = b == ESCAPE;
+                    if !escape {
+                        input.push_back(b);
+                    }
+                    continue;
+                }
+                escape = false;
+                match b {
+                    b's' | b'S' => suspend(),
+                    b'a' | ESCAPE => input.push_back(ESCAPE),
+                    _ => input.extend([ESCAPE, b]),
+                }
+            }
+            let avail = !input.is_empty();
+            drop(input);
+            if avail {
+                uart.input_available();
+            }
         }
     }
 

@@ -4,6 +4,7 @@
 
 use crate::isa::Exception;
 use crate::memory::Memory;
+use crate::snapshot::{StateReader, StateWriter};
 use std::fmt;
 
 /// Memory access types.
@@ -42,6 +43,28 @@ pub trait Mmio: Send {
 
     /// Halts the device when the CPU stops.
     fn halt(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Prepares the stopped system for a snapshot: the device
+    /// completes its in-flight requests that finish on their own and
+    /// stops changing the guest state.
+    fn quiesce(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Undoes quiesce when the snapshot could not be saved and the
+    /// system continues.
+    fn resume(&mut self) {}
+
+    /// Saves the device state into a snapshot. Devices without state
+    /// keep the default.
+    fn save_state(&mut self, _w: &mut StateWriter) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Restores the device state saved by save_state.
+    fn load_state(&mut self, _r: &mut StateReader) -> Result<(), String> {
         Ok(())
     }
 }
@@ -253,6 +276,10 @@ impl Mmio for Shm {
             }
         }
         Ok(())
+    }
+
+    fn save_state(&mut self, _w: &mut StateWriter) -> Result<(), String> {
+        Err("shared memory regions do not support snapshots".to_string())
     }
 }
 

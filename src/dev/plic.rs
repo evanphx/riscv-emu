@@ -3,6 +3,7 @@
 use crate::cpu::HartSignals;
 use crate::isa::{self, Exception};
 use crate::mmu::Mmio;
+use crate::snapshot::{StateReader, StateWriter};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -264,6 +265,41 @@ impl Mmio for Plic {
             }
             _ => {}
         }
+        Ok(())
+    }
+
+    fn save_state(&mut self, w: &mut StateWriter) -> Result<(), String> {
+        let s = self.state.lock().unwrap();
+        for g in &s.gateways {
+            w.u32(g.priority);
+            w.bool(g.asserted);
+            w.bool(g.inflight);
+        }
+        w.u64(s.pending);
+        w.u32(s.num_contexts as u32);
+        for ctx in 0..s.num_contexts {
+            w.u64(s.enables[ctx]);
+            w.u32(s.thresholds[ctx]);
+        }
+        Ok(())
+    }
+
+    fn load_state(&mut self, r: &mut StateReader) -> Result<(), String> {
+        let mut s = self.state.lock().unwrap();
+        for g in s.gateways.iter_mut() {
+            g.priority = r.u32()?;
+            g.asserted = r.bool()?;
+            g.inflight = r.bool()?;
+        }
+        s.pending = r.u64()?;
+        if r.u32()? as usize != s.num_contexts {
+            return Err("number of contexts differs".to_string());
+        }
+        for ctx in 0..s.num_contexts {
+            s.enables[ctx] = r.u64()?;
+            s.thresholds[ctx] = r.u32()?;
+        }
+        s.reevaluate();
         Ok(())
     }
 }

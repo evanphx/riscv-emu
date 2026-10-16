@@ -15,6 +15,7 @@ pub mod memory;
 pub mod mmu;
 pub mod network;
 pub mod params;
+pub mod snapshot;
 pub mod system;
 pub mod virtio;
 

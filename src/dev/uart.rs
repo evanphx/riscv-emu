@@ -4,6 +4,7 @@ use super::Plic;
 use crate::isa::Exception;
 use crate::logger::{Level, Log};
 use crate::mmu::Mmio;
+use crate::snapshot::{StateReader, StateWriter};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -262,5 +263,46 @@ impl Mmio for Uart {
 
     fn halt(&mut self) -> Result<(), String> {
         self.peer.halt()
+    }
+
+    fn save_state(&mut self, w: &mut StateWriter) -> Result<(), String> {
+        let r = self.regs.lock().unwrap();
+        for v in [
+            r.ier,
+            r.fcr,
+            r.lcr,
+            r.mcr,
+            r.scr,
+            r.dll,
+            r.dlm,
+            r.isr_pending,
+        ] {
+            w.u8(v);
+        }
+        Ok(())
+    }
+
+    fn load_state(&mut self, rd: &mut StateReader) -> Result<(), String> {
+        let mut guard = self.regs.lock().unwrap();
+        let r = &mut *guard;
+        for v in [
+            &mut r.ier,
+            &mut r.fcr,
+            &mut r.lcr,
+            &mut r.mcr,
+            &mut r.scr,
+            &mut r.dll,
+            &mut r.dlm,
+            &mut r.isr_pending,
+        ] {
+            *v = rd.u8()?;
+        }
+        // Host input that was not read before the snapshot is lost, so
+        // the receive interrupt is no longer pending.
+        r.isr_pending &= !0x01;
+        self.input_avail.store(false, Ordering::SeqCst);
+        self.plic
+            .set_interrupt_request(self.irq, r.isr_pending != 0);
+        Ok(())
     }
 }

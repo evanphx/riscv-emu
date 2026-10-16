@@ -3,6 +3,7 @@
 use super::mmio::*;
 use crate::dev::Plic;
 use crate::memory::Memory;
+use crate::snapshot::{StateReader, StateWriter};
 use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -297,6 +298,26 @@ impl Handler for Blk {
             tx.send(req).map_err(|e| e.to_string())?;
         }
         Ok(0)
+    }
+
+    fn drain_queues(&self) -> Vec<usize> {
+        vec![0]
+    }
+
+    fn save_state(&self, _st: &VirtioState, w: &mut StateWriter) -> Result<(), String> {
+        w.u64(self.size_sectors);
+        Ok(())
+    }
+
+    fn load_state(&mut self, st: &mut VirtioState, r: &mut StateReader) -> Result<(), String> {
+        let sectors = r.u64()?;
+        if sectors != self.size_sectors {
+            return Err(format!(
+                "{}: disk size changed from {} to {} sectors",
+                st.log.name, sectors, self.size_sectors
+            ));
+        }
+        Ok(())
     }
 
     fn config_load(&mut self, _st: &mut VirtioState, offset: u64, size: u64) -> Option<u64> {

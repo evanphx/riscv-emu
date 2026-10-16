@@ -3,6 +3,7 @@
 use super::mmio::*;
 use crate::dev::Plic;
 use crate::memory::Memory;
+use crate::snapshot::{StateReader, StateWriter};
 use std::fs::File;
 use std::io::Read;
 use std::sync::Arc;
@@ -49,6 +50,14 @@ impl Rng {
 }
 
 impl Handler for Rng {
+    fn save_state(&self, _st: &VirtioState, _w: &mut StateWriter) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn load_state(&mut self, _st: &mut VirtioState, _r: &mut StateReader) -> Result<(), String> {
+        Ok(())
+    }
+
     fn device_stats(&self, st: &VirtioState) {
         println!("{}: read    : {}", st.log.name, FileSize(self.st_read));
     }

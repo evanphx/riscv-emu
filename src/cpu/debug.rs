@@ -45,7 +45,7 @@ impl Cpu {
 
     /// Prints the function name of the PC if a symbol table is loaded.
     pub(super) fn trace_func(&self, pc: u64) {
-        if let Some(sym) = &self.symtab {
+        if let Some(sym) = self.symtab() {
             if let Some((e, mapped)) = sym.func_name(pc) {
                 eprintln!(
                     "{}{:8x}  <{}+0x{:x}>:{}",
@@ -115,7 +115,8 @@ impl Cpu {
 
     /// Traces the instruction and register changes (debug trace).
     pub(super) fn trace_instr(&mut self, raw: u32, instr: &Instr) {
-        if let Some(sym) = &self.symtab {
+        self.symtab();
+        if let Some(sym) = self.symtab.get() {
             if let Some(mapped) = crate::cpu::SystemMap::kernel_map(self.pc) {
                 if let Some(idx) = sym.resolve_index(mapped) {
                     if Some(idx) != self.last_symbol {
@@ -174,7 +175,7 @@ impl Cpu {
 
     /// Disassembles the kernel function containing vaddr.
     pub fn disassemble_kernel(&self, vaddr: u64) {
-        let Some(sym) = &self.symtab else {
+        let Some(sym) = self.symtab() else {
             return;
         };
         let Some((entry, _)) = sym.func_name(vaddr) else {

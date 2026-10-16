@@ -95,6 +95,8 @@ Main flags:
 | `-jit-sync` | compile blocks synchronously, for deterministic runs (implies `-jit`) |
 | `-jit-cache file` | load and save JIT compiled code in `file` (implies `-jit`) |
 | `-jit-opt` | compile slower, optimized code, e.g. to build a `-jit-cache` (implies `-jit`) |
+| `-suspend file` | suspend the system to `file` on Ctrl-A s or `SIGUSR1` |
+| `-restore file` | restore a suspended system from `file` |
 | `-cooked` | don't put the terminal into raw mode |
 | `-htif` | enable the HTIF tohost/fromhost device for ELF kernels |
 | `-symbols file` | kernel System.map for traces |
@@ -104,6 +106,63 @@ Main flags:
 
 Additional arguments that are not `.goemu` files are attached as
 VirtIO block devices.
+
+## Suspend and restore
+
+With `-suspend file`, pressing Ctrl-A s at the console (or sending
+the emulator `SIGUSR1`) stops the guest and saves the whole machine,
+RAM, CPU, and device state, to `file`; `-restore file` continues it
+where it stopped:
+
+```shell
+$ rsemu -jit -suspend vm.snap configs/buildroot.goemu
+...
+# Suspended to vm.snap: 39.6 MiB of RAM in 24.2ms
+$ rsemu -jit -restore vm.snap
+Restored vm.snap in 3.4ms
+```
+
+A restored system uses the configuration saved in the snapshot, so
+`-restore` takes no `.goemu` files, disks, or `-m`, and it is
+suspended back into the same file unless `-suspend` names another.
+With suspend enabled, Ctrl-A a or Ctrl-A Ctrl-A sends a Ctrl-A to the
+guest.
+
+The snapshot is built for fast suspend and restore:
+
+- Guest RAM is stored page-aligned in the file, so a restore maps it
+  into the guest copy-on-write with one `mmap` call instead of reading
+  it: restoring takes a few milliseconds regardless of the RAM size, and the
+  host reads pages from the file (usually from the page cache) when
+  the guest first touches them.
+- Zero pages are not written and stay holes in the file, so a
+  snapshot of a 512 MiB guest that uses 40 MiB takes 40 MiB of disk.
+  Untouched RAM is found from `/proc/self/pagemap` without reading it,
+  and the remaining pages are written by several threads in large
+  runs.
+- Suspending a restored VM to its own snapshot file writes back only
+  the pages the guest modified since the restore (the pages
+  `/proc/self/pagemap` reports as copied-on-write), which typically
+  takes a few milliseconds. On filesystems with reflinks (XFS, Btrfs),
+  saving to another file clones the original and also writes only the
+  modified pages.
+- Several emulators can restore the same snapshot at the same time.
+  They hold a shared lock on it, and a VM saving to a file that
+  another one has mapped writes a new file and renames it into place
+  instead of modifying it.
+
+Before saving, the devices finish their in-flight disk requests and
+network transmissions; receive buffers the guest posted stay with the
+guest and are handed to the device again on restore. Host input that
+the guest has not read when it is suspended (console bytes, network
+frames) is dropped. If the snapshot cannot be written, the error is
+printed and the guest continues running.
+
+The disk images are not part of the snapshot: the guest's disk cache
+expects them to be unchanged when it is restored. The emulator
+refuses a disk whose size changed and warns about one modified after
+the snapshot was taken. The guest clock continues from where it
+stopped. The VirtIO GPU and the HTIF test device are not supported.
 
 ## Networking
 

@@ -55,10 +55,22 @@ impl std::fmt::Display for MemError {
 
 impl std::error::Error for MemError {}
 
+/// The host memory of the guest RAM.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Backing {
+    /// Anonymous memory: pages that were never written are zero.
+    Anonymous,
+    /// A private (copy-on-write) mapping of a snapshot file: pages
+    /// that were never written hold the file contents. The device and
+    /// inode numbers identify the file.
+    File { dev: u64, ino: u64 },
+}
+
 /// Guest physical RAM.
 pub struct Memory {
     ptr: *mut u8,
     len: usize,
+    backing: Backing,
     pub ram_base: u64,
     pub ram_end: u64,
     num_pages: usize,
@@ -76,11 +88,12 @@ unsafe impl Sync for Memory {}
 
 impl Drop for Memory {
     fn drop(&mut self) {
-        // SAFETY: ptr and len come from Box::into_raw in new().
-        unsafe {
-            drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(
-                self.ptr, self.len,
-            )));
+        if self.len > 0 {
+            // SAFETY: ptr and len are the mapping created in new() or
+            // from_file().
+            unsafe {
+                libc::munmap(self.ptr as *mut libc::c_void, self.len);
+            }
         }
     }
 }
@@ -88,16 +101,73 @@ impl Drop for Memory {
 impl Memory {
     /// Creates a new RAM of size bytes at the physical address base.
     pub fn new(base: u64, size: u64) -> Memory {
+        Self::map(base, size, None).expect("failed to allocate guest RAM")
+    }
+
+    /// Creates a RAM of size bytes at the physical address base from
+    /// the file contents at offset. The file is mapped copy-on-write:
+    /// pages are read from the file when the guest first accesses
+    /// them, and guest writes do not modify the file. The offset must
+    /// be a multiple of the host page size.
+    pub fn from_file(
+        base: u64,
+        size: u64,
+        file: &std::fs::File,
+        offset: u64,
+    ) -> std::io::Result<Memory> {
+        Self::map(base, size, Some((file, offset)))
+    }
+
+    fn map(base: u64, size: u64, file: Option<(&std::fs::File, u64)>) -> std::io::Result<Memory> {
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::io::AsRawFd;
         assert!(
             size.is_multiple_of(PAGE_SIZE),
             "memory size is not multiple of page size"
         );
-        let buf = vec![0u8; size as usize].into_boxed_slice();
-        let len = buf.len();
-        let ptr = Box::into_raw(buf) as *mut u8;
-        Memory {
+        let len = size as usize;
+        let mut ptr = std::ptr::NonNull::<u8>::dangling().as_ptr();
+        let mut backing = Backing::Anonymous;
+        if len > 0 {
+            let prot = libc::PROT_READ | libc::PROT_WRITE;
+            let flags = libc::MAP_PRIVATE | libc::MAP_NORESERVE;
+            // SAFETY: a new mapping that no other object refers to.
+            let p = unsafe {
+                match file {
+                    None => libc::mmap(
+                        std::ptr::null_mut(),
+                        len,
+                        prot,
+                        flags | libc::MAP_ANONYMOUS,
+                        -1,
+                        0,
+                    ),
+                    Some((f, ofs)) => libc::mmap(
+                        std::ptr::null_mut(),
+                        len,
+                        prot,
+                        flags,
+                        f.as_raw_fd(),
+                        ofs as libc::off_t,
+                    ),
+                }
+            };
+            if p == libc::MAP_FAILED {
+                return Err(std::io::Error::last_os_error());
+            }
+            ptr = p as *mut u8;
+            if let Some((f, _)) = file {
+                let md = f.metadata()?;
+                backing = Backing::File {
+                    dev: md.dev(),
+                    ino: md.ino(),
+                };
+            }
+        }
+        Ok(Memory {
             ptr,
             len,
+            backing,
             ram_base: base,
             ram_end: base + size,
             num_pages: (size / PAGE_SIZE) as usize,
@@ -106,7 +176,22 @@ impl Memory {
                 .map(|_| AtomicU64::new(0))
                 .collect(),
             code_dirty: AtomicBool::new(false),
-        }
+        })
+    }
+
+    /// Returns the host memory backing the RAM.
+    pub fn backing(&self) -> Backing {
+        self.backing
+    }
+
+    /// Returns the whole RAM as a slice.
+    ///
+    /// # Safety
+    ///
+    /// The CPU and the devices must not write to guest memory while
+    /// the slice is used.
+    pub unsafe fn ram(&self) -> &[u8] {
+        std::slice::from_raw_parts(self.ptr, self.len)
     }
 
     /// Marks the page at the RAM offset as holding compiled code.

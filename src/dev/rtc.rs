@@ -2,6 +2,7 @@
 
 use crate::isa::Exception;
 use crate::mmu::Mmio;
+use crate::snapshot::{StateReader, StateWriter};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub struct GoldfishRtc {
@@ -50,6 +51,16 @@ impl Mmio for GoldfishRtc {
     }
 
     fn store(&mut self, _now: u64, _paddr: u64, _size: u64, _v: u64) -> Result<(), Exception> {
+        Ok(())
+    }
+
+    fn save_state(&mut self, w: &mut StateWriter) -> Result<(), String> {
+        w.u32(self.high);
+        Ok(())
+    }
+
+    fn load_state(&mut self, r: &mut StateReader) -> Result<(), String> {
+        self.high = r.u32()?;
         Ok(())
     }
 }

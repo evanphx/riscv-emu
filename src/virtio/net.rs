@@ -11,6 +11,7 @@ use crate::memory::Memory;
 use crate::network::dhcp::{self, ClientInfo};
 use crate::network::tun::{self, Tunnel};
 use crate::network::*;
+use crate::snapshot::{StateReader, StateWriter};
 use crate::system::Netdev;
 use std::fmt;
 use std::fs::File;
@@ -193,11 +194,11 @@ struct Chain {
 struct NetShared {
     log: Log,
     guest: GuestMem,
-    host_mac: Mac,
-    guest_mac: Mac,
+    host_mac: AtomicMac,
+    guest_mac: AtomicMac,
     host_ip: Ipv4Addr,
     tun: Tunnel,
-    dhcp: dhcp::Server,
+    dhcp: Mutex<dhcp::Server>,
     /// Length of the virtio-net packet header.
     hdr_len: AtomicUsize,
     /// Ethernet frames to deliver to the guest.
@@ -212,6 +213,28 @@ pub struct Net {
     frames: Option<mpsc::Receiver<Vec<u8>>>,
     recv_desc: Option<mpsc::Sender<Chain>>,
     send_desc: Option<mpsc::Sender<Chain>>,
+}
+
+/// A MAC address of the device, which is replaced when a snapshot is
+/// restored.
+struct AtomicMac(AtomicU64);
+
+impl AtomicMac {
+    fn new(mac: Mac) -> AtomicMac {
+        let m = AtomicMac(AtomicU64::new(0));
+        m.set(mac);
+        m
+    }
+
+    fn get(&self) -> Mac {
+        Mac::from_slice(&self.0.load(Ordering::Relaxed).to_le_bytes())
+    }
+
+    fn set(&self, mac: Mac) {
+        let mut b = [0u8; 8];
+        b[..6].copy_from_slice(&mac.0);
+        self.0.store(u64::from_le_bytes(b), Ordering::Relaxed);
+    }
 }
 
 /// Returns a random locally administered unicast MAC address.
@@ -291,11 +314,11 @@ impl Net {
             shared: Arc::new(NetShared {
                 log,
                 guest: GuestMem { mem },
-                host_mac,
-                guest_mac,
+                host_mac: AtomicMac::new(host_mac),
+                guest_mac: AtomicMac::new(guest_mac),
                 host_ip,
                 tun: tunnel,
-                dhcp: server,
+                dhcp: Mutex::new(server),
                 hdr_len: AtomicUsize::new(12),
                 frames: frames_tx,
                 st_sent: AtomicU64::new(0),
@@ -330,34 +353,42 @@ impl NetShared {
         let mut pending: Option<Vec<u8>> = None;
         for chain in descs {
             crate::log_debug!(self.log, "receiving to descriptor {}", chain.head);
-            let frame = match pending.take() {
-                Some(f) => f,
-                None => match frames.recv() {
-                    Ok(f) => f,
-                    Err(_) => return,
-                },
-            };
-            crate::log_debug!(self.log, "received frame of {} bytes", frame.len());
+            loop {
+                let frame = match pending.take() {
+                    Some(f) => f,
+                    None => match frames.recv() {
+                        Ok(f) => f,
+                        Err(_) => return,
+                    },
+                };
+                crate::log_debug!(self.log, "received frame of {} bytes", frame.len());
 
-            let Some(dev) = dev.upgrade() else {
-                return;
-            };
-            let mut d = dev.lock().unwrap();
-            if d.state.generation != chain.generation {
-                // The chain predates a device reset: keep the frame for
-                // the next descriptor.
-                pending = Some(frame);
-                continue;
+                let Some(dev) = dev.upgrade() else {
+                    return;
+                };
+                let mut d = dev.lock().unwrap();
+                if d.state.generation != chain.generation {
+                    // The chain predates a device reset: keep the frame
+                    // for the next descriptor.
+                    pending = Some(frame);
+                    break;
+                }
+                if d.state.frozen {
+                    // The system is being suspended; the network drops
+                    // the frame and the chain stays in flight.
+                    continue;
+                }
+                let tx = self
+                    .store_frame(&chain.queue, chain.head, &frame)
+                    .unwrap_or_else(|e| {
+                        // Complete the descriptor anyway to avoid
+                        // descriptor leaks.
+                        self.log.error(format_args!("store packet failed: {}", e));
+                        0
+                    });
+                d.state.complete_descriptor(RECEIVEQ, chain.head, tx);
+                break;
             }
-            let tx = self
-                .store_frame(&chain.queue, chain.head, &frame)
-                .unwrap_or_else(|e| {
-                    // Complete the descriptor anyway to avoid descriptor
-                    // leaks.
-                    self.log.error(format_args!("store packet failed: {}", e));
-                    0
-                });
-            d.state.complete_descriptor(RECEIVEQ, chain.head, tx);
         }
     }
 
@@ -419,7 +450,12 @@ impl NetShared {
             debug_ip(&self.log, &ip[..n]);
 
             let mut frame = vec![0u8; 14 + n];
-            make_ethernet(&mut frame, self.guest_mac, self.host_mac, ETHERNET_IPV4);
+            make_ethernet(
+                &mut frame,
+                self.guest_mac.get(),
+                self.host_mac.get(),
+                ETHERNET_IPV4,
+            );
             frame[14..].copy_from_slice(&ip[..n]);
             if self.frames.send(frame).is_err() {
                 return;
@@ -532,8 +568,9 @@ impl NetShared {
                     if arp.tpa == self.host_ip {
                         // Respond to ARP requests for the host address.
                         let mut resp = vec![0u8; 14 + 28];
-                        make_ethernet(&mut resp, arp.sha, self.host_mac, frame_type);
-                        make_arp(&mut resp[14..], 2, self.host_mac, arp.tpa, arp.sha, arp.spa);
+                        let host_mac = self.host_mac.get();
+                        make_ethernet(&mut resp, arp.sha, host_mac, frame_type);
+                        make_arp(&mut resp[14..], 2, host_mac, arp.tpa, arp.sha, arp.spa);
                         self.deliver(resp);
                     }
                 } else {
@@ -591,7 +628,7 @@ impl NetShared {
             .trace(format_args!("DHCP request data:\n{}", hex_dump(packet)));
         crate::log_debug!(self.log, "DHCP request: {}", req);
 
-        let resp = match self.dhcp.request(&req) {
+        let resp = match self.dhcp.lock().unwrap().request(&req) {
             Ok(Some(resp)) => resp,
             Ok(None) => {
                 crate::log_info!(self.log, "ignoring DHCP request {}", req.msg_type);
@@ -630,7 +667,7 @@ impl NetShared {
                 req.hostname,
                 iface
             );
-            self.guest_mac
+            self.guest_mac.get()
         };
         crate::log_info!(
             self.log,
@@ -645,7 +682,7 @@ impl NetShared {
 
         let rdata = resp.encode();
         let mut frame = vec![0u8; 14 + 20 + 8 + rdata.len()];
-        make_ethernet(&mut frame, dst_mac, self.host_mac, ETHERNET_IPV4);
+        make_ethernet(&mut frame, dst_mac, self.host_mac.get(), ETHERNET_IPV4);
 
         // IP.
         let ip = &mut frame[14..];
@@ -707,6 +744,46 @@ impl Handler for Net {
         self.shared.hdr_len.store(hdr_len, Ordering::Relaxed);
     }
 
+    fn drain_queues(&self) -> Vec<usize> {
+        vec![TRANSMITQ]
+    }
+
+    fn save_state(&self, _st: &VirtioState, w: &mut StateWriter) -> Result<(), String> {
+        let s = &self.shared;
+        w.u64(s.hdr_len.load(Ordering::Relaxed) as u64);
+        w.bytes(&s.host_mac.get().0);
+        w.bytes(&s.guest_mac.get().0);
+        Ok(())
+    }
+
+    fn load_state(&mut self, _st: &mut VirtioState, r: &mut StateReader) -> Result<(), String> {
+        let s = &self.shared;
+        s.hdr_len.store(r.u64()? as usize, Ordering::Relaxed);
+        let mac = |b: &[u8]| {
+            if b.len() == 6 {
+                Ok(Mac::from_slice(b))
+            } else {
+                Err("invalid MAC address".to_string())
+            }
+        };
+        let host_mac = mac(r.bytes()?)?;
+        let guest_mac = mac(r.bytes()?)?;
+        // The guest keeps using the MAC addresses of the suspended
+        // system.
+        s.host_mac.set(host_mac);
+        let old = s.guest_mac.get();
+        s.guest_mac.set(guest_mac);
+        let mut dhcp = s.dhcp.lock().unwrap();
+        if let Some(client) = dhcp.clients.remove(&old) {
+            dhcp.add_client(guest_mac, client);
+        }
+        s.log.info(format_args!(
+            "restored guest {}, host {}",
+            guest_mac, host_mac
+        ));
+        Ok(())
+    }
+
     fn device_stats(&self, st: &VirtioState) {
         let s = &self.shared;
         println!(
@@ -749,7 +826,7 @@ impl Handler for Net {
         // 0x100.
         if size == 1 && (0x100..0x106).contains(&offset) {
             crate::log_debug!(st.log, "Load8(MAC[{}][0x{:03x}])", offset - 0x100, offset);
-            return Some(self.shared.guest_mac.0[(offset - 0x100) as usize] as u64);
+            return Some(self.shared.guest_mac.get().0[(offset - 0x100) as usize] as u64);
         }
         None
     }

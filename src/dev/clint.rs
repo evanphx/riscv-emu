@@ -4,6 +4,7 @@
 use crate::cpu::HartSignals;
 use crate::isa::{self, Exception};
 use crate::mmu::Mmio;
+use crate::snapshot::{StateReader, StateWriter};
 use std::sync::Arc;
 
 pub const CLINT_OFS_MSIP: u64 = 0;
@@ -116,6 +117,20 @@ impl Mmio for Clint {
             }
             o => eprintln!("CLINT: store: unknown register {:x} = {:x}", o, v),
         }
+        Ok(())
+    }
+
+    fn save_state(&mut self, w: &mut StateWriter) -> Result<(), String> {
+        w.u64(self.msip);
+        w.u64(self.mtimecmp);
+        w.u64(self.mtime);
+        Ok(())
+    }
+
+    fn load_state(&mut self, r: &mut StateReader) -> Result<(), String> {
+        self.msip = r.u64()?;
+        self.mtimecmp = r.u64()?;
+        self.mtime = r.u64()?;
         Ok(())
     }
 }
