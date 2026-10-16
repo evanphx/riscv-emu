@@ -12,7 +12,7 @@ It needs gcc >= 14 for riscv64 (the function tracer needs
 `-fmin-function-alignment`); without `CROSS_COMPILE` it downloads
 kernel.org's gcc 15.2. BTF needs pahole >= 1.22 (dwarves).
 
-`configs/buildroot-rsemu-kernel.goemu` boots buildroot with it from
+`configs/buildroot.goemu` boots buildroot with it from
 `linux-7.0.11-rsemu/` next to the other guest images. A build of this
 directory's sources is in [linux-7.0.11-rsemu](linux-7.0.11-rsemu);
 copy or link it there, or copy `OUTDIR/obj/arch/riscv/boot/Image` and
@@ -128,7 +128,7 @@ reading the BTF types into the kernel's table of them.
 `ctest/mkdisk.sh` makes `ctest.ext2`, a disk with crun and two OCI
 bundles. Attach it as a second disk and run the test in the guest:
 
-    rsemu -jit configs/buildroot-rsemu-kernel.goemu ctest.ext2
+    rsemu -jit configs/buildroot.goemu ctest.ext2
     # mount /dev/vdb /mnt && sh /mnt/ctest.sh
 
 It runs a container with and without a user namespace, on an overlay
@@ -146,5 +146,5 @@ task_struct. VMLINUX is any BTF kernel's vmlinux, for vmlinux.h; using
 one whose task_struct differs from the running kernel's exercises the
 relocations.
 
-    rsemu -jit configs/buildroot-rsemu-kernel.goemu bpftest.ext2
+    rsemu -jit configs/buildroot.goemu bpftest.ext2
     # mount /dev/vdb /mnt && /mnt/bpfcore

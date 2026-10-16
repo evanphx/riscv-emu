@@ -40,13 +40,17 @@ The JIT is the default `jit` cargo feature; build with
 ## Booting Linux
 
 The guest images (OpenSBI, Linux kernel, buildroot root filesystem)
-live in the upstream repository's `cmd/goemu` directory. The
-configuration files in [configs](configs) use the same JSON format as
-the original `.goemu` files and paths relative to the current
-directory:
+live in the upstream repository's `cmd/goemu` directory.
+[configs/buildroot.goemu](configs/buildroot.goemu) boots the kernel
+built from [guest/linux](guest/linux), which is linked next to them;
+[configs/buildroot-goemu-kernel.goemu](configs/buildroot-goemu-kernel.goemu)
+boots the upstream repository's kernel instead. The configuration
+files use the same JSON format as the original `.goemu` files and
+paths relative to the current directory:
 
 ```shell
 $ git clone https://github.com/markkurossi/riscv
+$ ln -s /path/to/riscv-rs/guest/linux/linux-7.0.11-rsemu riscv/cmd/goemu/
 $ cd riscv/cmd/goemu
 $ /path/to/rsemu -jit /path/to/riscv-rs/configs/buildroot.goemu
 OpenSBI v1.8.1-126-ga8be5e94
@@ -55,13 +59,13 @@ Welcome to GoEMU RISC-V Linux
 
 goemu login: root
 # uname -a
-Linux goemu 7.0.11 #9 SMP PREEMPT Wed Jun  3 08:23:43 UTC 2026 riscv64 GNU/Linux
+Linux goemu 7.0.11 #1 SMP PREEMPT Fri Oct 16 14:42:29 UTC 2026 riscv64 GNU/Linux
 # poweroff
 ...
-[   27.320208] reboot: Power down
-CPU: instret: 1502759037, runtime: 18.642273947s, MIPS: 80.61
-JIT: 2199 blocks (57826 instructions) compiled in 2.205362368s, 125726884 block runs, 1349007312 instructions executed, 0 invalidated
-virtio-rng: read    : 576 B
+[    3.970105] reboot: Power down
+CPU: instret: 240546907, runtime: 3.947535688s, MIPS: 60.94
+JIT: 2735 blocks (57867 instructions) compiled in 1.01795869s, 1379635 dispatches, 172073729 instructions executed, 1 invalidated, 5370 reused at other addresses
+virtio-rng: read    : 320 B
 virtio-blk: read    : 3 MB
 virtio-blk: wrote   : 0 B
 ```
@@ -117,9 +121,9 @@ where it stopped:
 ```shell
 $ rsemu -jit -suspend vm.snap configs/buildroot.goemu
 ...
-# Suspended to vm.snap: 39.6 MiB of RAM in 24.2ms
+# Suspended to vm.snap: 37.2 MiB of RAM in 21.3ms
 $ rsemu -jit -restore vm.snap
-Restored vm.snap in 3.4ms
+Restored vm.snap in 3.0ms
 ```
 
 A restored system uses the configuration saved in the snapshot, so
@@ -136,7 +140,7 @@ The snapshot is built for fast suspend and restore:
   host reads pages from the file (usually from the page cache) when
   the guest first touches them.
 - Zero pages are not written and stay holes in the file, so a
-  snapshot of a 512 MiB guest that uses 40 MiB takes 40 MiB of disk.
+  snapshot of a 512 MiB guest that uses 37 MiB takes 37 MiB of disk.
   Untouched RAM is found from `/proc/self/pagemap` without reading it,
   and the remaining pages are written by several threads in large
   runs.
@@ -187,8 +191,9 @@ subnet on the host.
 configuration) adds a VirtIO GPU with a keyboard and a pointer device
 and opens a window (winit + softbuffer, the default `gui` cargo
 feature). The guest kernel needs the virtio-gpu DRM driver and
-`console=tty0` for a framebuffer console; the buildroot kernel image in
-the upstream repository is built without it. Click the window to grab
+`console=tty0` for a framebuffer console; the kernel of
+`buildroot.goemu` has the driver, the upstream repository's kernel
+image is built without it. Click the window to grab
 the mouse and press Alt+Esc to release it. Without a display, the GPU
 still works and the emulator logs `virtio-gpu: no display`.
 
@@ -343,6 +348,10 @@ events while booting.
 
 Host wall-clock times on a shared 2-core x86-64 machine. The md5sum,
 shell loop, and sort benchmarks run inside the booted buildroot guest.
+The Linux measurements in this section and in the JIT sections above
+use the upstream repository's kernel
+(`configs/buildroot-goemu-kernel.goemu`), which is the one the Go
+original boots.
 
 | Workload | Go original | Rust interpreter | Rust JIT | JIT, warm `-jit-cache` | JIT, precompiled `-jit-opt` cache |
 |----------|------------:|-----------------:|---------:|-----------------------:|----------------------------------:|

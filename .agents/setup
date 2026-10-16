@@ -38,7 +38,7 @@ rustup component add rustfmt clippy
 # Guest images (OpenSBI, Linux, buildroot) live in the upstream
 # repository's cmd/goemu directory; rsemu runs from there (see README.md).
 # Link this repository's kernel next to them for
-# configs/buildroot-rsemu-kernel.goemu.
+# configs/buildroot.goemu.
 upstream=$workspace/riscv
 [ -d "$upstream/.git" ] || git clone -q --depth 1 https://github.com/markkurossi/riscv "$upstream"
 ln -sfn "$repo/guest/linux/linux-7.0.11-rsemu" "$upstream/cmd/goemu/linux-7.0.11-rsemu"
