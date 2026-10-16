@@ -1,0 +1,44 @@
+lib/string: Compare the first character before the rest in strstr()
+
+strstr() and strnstr() call memcmp() at every position of the string,
+and strstr() starts with a strlen() of the string searched. Check the
+first character inline, call strncmp() only where it matches, and stop
+at the end of the string rather than measuring it first. strncmp()
+stops at the NUL of the searched string, so nothing past it is read.
+
+The trace event code calls strstr() on print formats and field types
+of every event at boot: this saves about 1.5M instructions there.
+
+--- a/lib/string.c
++++ b/lib/string.c
+@@ -750,17 +750,15 @@
+  */
+ char *strstr(const char *s1, const char *s2)
+ {
+-	size_t l1, l2;
++	size_t l2;
+ 
+ 	l2 = strlen(s2);
+ 	if (!l2)
+ 		return (char *)s1;
+-	l1 = strlen(s1);
+-	while (l1 >= l2) {
+-		l1--;
+-		if (!memcmp(s1, s2, l2))
++	/* strncmp() stops at the end of s1, so s1 needs no strlen() */
++	for (; *s1; s1++) {
++		if (*s1 == *s2 && !strncmp(s1, s2, l2))
+ 			return (char *)s1;
+-		s1++;
+ 	}
+ 	return NULL;
+ }
+@@ -783,7 +781,7 @@
+ 		return (char *)s1;
+ 	while (len >= l2) {
+ 		len--;
+-		if (!memcmp(s1, s2, l2))
++		if (*s1 == *s2 && !memcmp(s1, s2, l2))
+ 			return (char *)s1;
+ 		s1++;
+ 	}

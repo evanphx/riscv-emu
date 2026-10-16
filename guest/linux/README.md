@@ -66,29 +66,58 @@ that riscv puts 8 bytes of the patchable entry before the function.
 FTRACE_SORT_STARTUP_TEST, the function tracer and fentry/fexit
 programs work with it.
 
+The others take most of what BTF and tracing still cost at boot, in
+instructions before init (165M with 0001 and 0002, 102M with all, 70M
+without BTF and tracing):
+
+- `0003` (32M): the kernel's own BTF is part of its read-only data, so
+  only its layout is checked when it is parsed, not every name and
+  member as for BTF from user space.
+- `0004` (17M): ftrace initializes the kernel's 34000 call sites
+  through one writable alias of the kernel text, not a fixmap mapping
+  and two TLB and icache flushes per write.
+- `0005` (3M): the ftrace records of the freed init functions are
+  removed with one move rather than one per record.
+- `0006` (1.5M): strstr() compares the first character before calling
+  strncmp(), and does not measure the string first.
+- `0007` (2.3M): syscall metadata is found by binary search, not by
+  comparing each syscall's name with all of them.
+- `0008` (4M): the riscv64 jump label table is sorted at build time,
+  and the kernel only checks that it is sorted.
+
+The formats of all trace events, the syscall events, the function
+tracer (also from the command line), kprobes, CO-RE programs and the
+container test work the same with them.
+
 ## Timings
 
 Seconds, medians of 3 interleaved runs of rsemu with the buildroot
 image (`init`: the kernel starts init; `session`: login, workloads and
 poweroff). Built with gcc 15.2 unless noted:
 
-| mode         | kernel                              | init | login | session |
-|--------------|-------------------------------------|-----:|------:|--------:|
-| interpreter  | defconfig (gcc 12)                  | 9.95 | 11.04 |   32.62 |
-| interpreter  | rsemu.config without BTF, tracing   | 0.77 |  1.84 |   23.36 |
-| interpreter  | ... with BTF                        | 1.03 |  2.12 |   23.68 |
-| interpreter  | ... with BTF, tracing, patch 0001   | 2.21 |  3.30 |   25.31 |
-| interpreter  | rsemu.config (all patches)          | 1.98 |  3.08 |   24.66 |
-| -jit         | defconfig (gcc 12)                  | 1.76 |  2.51 |    8.12 |
-| -jit         | rsemu.config without BTF, tracing   | 0.49 |  1.24 |    7.06 |
-| -jit         | rsemu.config (all patches)          | 1.05 |  1.88 |    7.56 |
-| -jit-opt     | defconfig (gcc 12)                  | 0.84 |  1.22 |    5.79 |
-| -jit-opt     | rsemu.config without BTF, tracing   | 0.19 |  0.56 |    5.41 |
-| -jit-opt     | rsemu.config (all patches)          | 0.63 |  1.02 |    5.68 |
+| mode         | kernel                                | init | login | session |
+|--------------|---------------------------------------|-----:|------:|--------:|
+| interpreter  | defconfig (gcc 12)                    | 9.95 | 11.04 |   32.62 |
+| interpreter  | rsemu.config without BTF, tracing     | 0.78 |  1.83 |   23.08 |
+| interpreter  | ... with BTF                          | 1.03 |  2.07 |   23.52 |
+| interpreter  | rsemu.config, patches 0001-0002 only  | 1.99 |  3.09 |   24.70 |
+| interpreter  | rsemu.config                          | 1.09 |  2.17 |   24.28 |
+| -jit         | defconfig (gcc 12)                    | 1.76 |  2.51 |    8.12 |
+| -jit         | rsemu.config without BTF, tracing     | 0.55 |  1.31 |    7.26 |
+| -jit         | ... with BTF                          | 0.57 |  1.31 |    7.07 |
+| -jit         | rsemu.config, patches 0001-0002 only  | 1.11 |  1.93 |    7.66 |
+| -jit         | rsemu.config                          | 0.63 |  1.45 |    7.42 |
+| -jit-opt     | defconfig (gcc 12)                    | 0.84 |  1.22 |    5.79 |
+| -jit-opt     | rsemu.config without BTF, tracing     | 0.22 |  0.60 |    5.26 |
+| -jit-opt     | ... with BTF                          | 0.24 |  0.64 |    5.36 |
+| -jit-opt     | rsemu.config, patches 0001-0002 only  | 0.66 |  1.03 |    5.70 |
+| -jit-opt     | rsemu.config                          | 0.27 |  0.65 |    5.44 |
 
-What remains of the cost of tracing at boot is mostly ftrace turning
-its 34000 call sites into nops one at a time, and checking the kernel
-BTF (about 25 million instructions, 0.25 s of guest time).
+With all the patches, BTF and tracing cost 0.3 s of boot in the
+interpreter and 0.05-0.1 s with the JITs. Most of what remains is
+registering the trace events (their formats are checked and rewritten
+with enum values), creating ftrace's records of the call sites, and
+reading the BTF types into the kernel's table of them.
 
 ## Container test
 

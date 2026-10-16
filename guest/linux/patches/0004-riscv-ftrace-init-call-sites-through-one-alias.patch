@@ -1,0 +1,140 @@
+riscv: ftrace: Initialize the kernel's call sites through one alias
+
+ftrace_init() turns each of the kernel's ~34000 patchable function
+entries into "auipc t0, ftrace_caller; nop" and, with CALL_OPS, sets
+the ops literal before it. Each of those two writes maps the page
+into the fixmap, writes, flushes the icache, and unmaps the page with
+a TLB flush; with the lock and checks it is about 500 instructions per
+call site, 17M instructions at boot.
+
+During boot, write the core kernel's call sites through a single
+writable vmap() alias of the kernel text instead, made at the first
+call and removed with one icache flush by an early_initcall, before
+the other CPUs come up. Both the old and the new contents of a call
+site are nops, so it does not matter when the CPU sees the change;
+ftrace_make_call() flushes the icache before anything is enabled.
+Module call sites, and everything after boot, are patched as before.
+
+Tested with the function tracer, "ftrace=function" on the command
+line, kprobes and BPF fentry/fexit programs.
+
+--- a/arch/riscv/kernel/ftrace.c
++++ b/arch/riscv/kernel/ftrace.c
+@@ -10,7 +10,9 @@
+ #include <linux/memory.h>
+ #include <linux/irqflags.h>
+ #include <linux/stop_machine.h>
++#include <linux/vmalloc.h>
+ #include <asm/cacheflush.h>
++#include <asm/sections.h>
+ #include <asm/text-patching.h>
+ 
+ #ifdef CONFIG_DYNAMIC_FTRACE
+@@ -146,6 +148,65 @@
+ 	return 0;
+ }
+ 
++#ifdef CONFIG_MMU
++/*
++ * ftrace_init() initializes every call site in the kernel, tens of
++ * thousands of them. Patching them one at a time maps a page into the
++ * fixmap, flushes the TLB and the icache twice per site, so during boot
++ * they are written through a writable alias of the kernel text instead,
++ * made once and removed with a single icache flush before the other CPUs
++ * come up. Either contents of a site are nops, so it does not matter
++ * when the CPU sees the change.
++ */
++static void *ftrace_boot_text;
++static bool ftrace_boot_text_tried;
++
++/* The alias of [addr, addr_end) in the kernel text, during boot */
++static void *ftrace_boot_text_addr(unsigned long addr, unsigned long addr_end)
++{
++	unsigned long start = (unsigned long)_start;
++	unsigned long end = PAGE_ALIGN((unsigned long)__init_data_begin);
++
++	if (system_state != SYSTEM_BOOTING || addr < start || addr_end > end)
++		return NULL;
++
++	if (!ftrace_boot_text_tried) {
++		unsigned int i, n = (end - start) >> PAGE_SHIFT;
++		phys_addr_t phys = __pa_symbol(_start);
++		struct page **pages;
++
++		ftrace_boot_text_tried = true;
++		pages = kvmalloc_array(n, sizeof(*pages), GFP_KERNEL);
++		if (!pages)
++			return NULL;
++		for (i = 0; i < n; i++)
++			pages[i] = phys_to_page(phys + i * PAGE_SIZE);
++		ftrace_boot_text = vmap(pages, n, VM_MAP, PAGE_KERNEL);
++		kvfree(pages);
++	}
++	if (!ftrace_boot_text)
++		return NULL;
++
++	return ftrace_boot_text + (addr - start);
++}
++
++static int __init ftrace_boot_text_free(void)
++{
++	if (ftrace_boot_text) {
++		vunmap(ftrace_boot_text);
++		ftrace_boot_text = NULL;
++		flush_icache_all();
++	}
++	return 0;
++}
++early_initcall(ftrace_boot_text_free);
++#else
++static void *ftrace_boot_text_addr(unsigned long addr, unsigned long addr_end)
++{
++	return NULL;
++}
++#endif
++
+ /*
+  * This is called early on, and isn't wrapped by
+  * ftrace_arch_code_modify_{prepare,post_process}() and therefor doesn't hold
+@@ -157,18 +218,37 @@
+ {
+ 	unsigned long pc = rec->ip - MCOUNT_AUIPC_SIZE;
+ 	unsigned int nops[2], offset;
++	u32 *alias = NULL;
+ 	int ret;
+ 
++	offset = (unsigned long) &ftrace_caller - pc;
++	nops[0] = to_auipc_t0(offset);
++	nops[1] = RISCV_INSN_NOP4;
++
++	if (IS_ENABLED(CONFIG_DYNAMIC_FTRACE_WITH_CALL_OPS)) {
++		/* The ops literal sits in the 8 bytes before the function */
++		unsigned long literal = ALIGN_DOWN(rec->ip - 12, 8);
++		void *lit = mod ? NULL : ftrace_boot_text_addr(literal, pc + 8);
++
++		if (lit) {
++			*(const struct ftrace_ops **)lit = &ftrace_nop_ops;
++			alias = lit + (pc - literal);
++		}
++	} else {
++		alias = mod ? NULL : ftrace_boot_text_addr(pc, pc + 8);
++	}
++	if (alias) {
++		alias[0] = nops[0];
++		alias[1] = nops[1];
++		return 0;
++	}
++
+ 	guard(mutex)(&text_mutex);
+ 
+ 	ret = ftrace_rec_set_nop_ops(rec);
+ 	if (ret)
+ 		return ret;
+ 
+-	offset = (unsigned long) &ftrace_caller - pc;
+-	nops[0] = to_auipc_t0(offset);
+-	nops[1] = RISCV_INSN_NOP4;
+-
+ 	ret = patch_insn_write((void *)pc, nops, 2 * MCOUNT_INSN_SIZE);
+ 
+ 	return ret;

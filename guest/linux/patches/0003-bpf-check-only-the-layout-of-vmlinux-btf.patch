@@ -1,0 +1,153 @@
+bpf: Check only the layout of the kernel's own BTF at boot
+
+The first user of vmlinux BTF, which with DEBUG_INFO_BTF is a kfunc
+registration in an initcall, parses it with the checks meant for BTF
+loaded from user space: every name is checked to be an identifier,
+every struct member, enum value and function parameter is checked,
+type tag chains are walked, and the first named type is found by a
+linear scan. With 88000 types that is about 32M instructions at boot
+on riscv64, a fifth of what the kernel runs before init with tracing
+on, most of it in btf_name_valid_identifier().
+
+vmlinux BTF is generated with the kernel by pahole and resolve_btfids
+(which parses it with libbpf) and is part of the kernel's read-only
+data; the kernel already skips the resolve pass for it. Trust it like
+the rest of the image: keep the checks of the header, the string
+section, each type's kind and name offset and that the types fit in
+the type section, but take the size of each type's data from its kind
+and vlen rather than from the per-kind check_meta(). Module BTF and
+BTF from user space are checked as before.
+
+vmlinux BTF is sorted by name with the unnamed types first, as
+btf_check_sorted() already assumes, so find the first named type by
+binary search.
+
+--- a/kernel/bpf/btf.c
++++ b/kernel/bpf/btf.c
+@@ -321,6 +321,8 @@
+ 	u32 top_stack;
+ 	enum verifier_phase phase;
+ 	enum resolve_mode resolve_mode;
++	/* The kernel's own BTF: only the layout of the types is checked */
++	bool trusted;
+ };
+ 
+ static const char * const btf_kind_str[NR_BTF_KINDS] = {
+@@ -561,15 +563,20 @@
+ 
+ 	n = btf_nr_types(btf);
+ 	if (btf_is_vmlinux(btf)) {
+-		for (i = btf_start_id(btf); i < n; i++) {
+-			const struct btf_type *t = btf_type_by_id(btf, i);
+-			const char *n = btf_name_by_offset(btf, t->name_off);
+-
+-			if (n[0] != '\0') {
+-				btf->named_start_id = i;
+-				return;
+-			}
++		u32 lo = btf_start_id(btf), hi = n;
++
++		/* Sorted by name, so the unnamed types come first */
++		while (lo < hi) {
++			u32 mid = lo + (hi - lo) / 2;
++			const struct btf_type *t = btf_type_by_id(btf, mid);
++
++			if (btf_name_by_offset(btf, t->name_off)[0] != '\0')
++				hi = mid;
++			else
++				lo = mid + 1;
+ 		}
++		if (lo < n)
++			btf->named_start_id = lo;
+ 		return;
+ 	}
+ 
+@@ -5316,6 +5323,36 @@
+ 	[BTF_KIND_ENUM64] = &enum64_ops,
+ };
+ 
++/* The size of the data that follows a btf_type, for trusted BTF */
++static u32 btf_type_extra_size(const struct btf_type *t)
++{
++	u16 vlen = btf_type_vlen(t);
++
++	switch (BTF_INFO_KIND(t->info)) {
++	case BTF_KIND_INT:
++		return sizeof(u32);
++	case BTF_KIND_ARRAY:
++		return sizeof(struct btf_array);
++	case BTF_KIND_STRUCT:
++	case BTF_KIND_UNION:
++		return vlen * sizeof(struct btf_member);
++	case BTF_KIND_ENUM:
++		return vlen * sizeof(struct btf_enum);
++	case BTF_KIND_ENUM64:
++		return vlen * sizeof(struct btf_enum64);
++	case BTF_KIND_FUNC_PROTO:
++		return vlen * sizeof(struct btf_param);
++	case BTF_KIND_VAR:
++		return sizeof(struct btf_var);
++	case BTF_KIND_DATASEC:
++		return vlen * sizeof(struct btf_var_secinfo);
++	case BTF_KIND_DECL_TAG:
++		return sizeof(struct btf_decl_tag);
++	default:
++		return 0;
++	}
++}
++
+ static s32 btf_check_meta(struct btf_verifier_env *env,
+ 			  const struct btf_type *t,
+ 			  u32 meta_left)
+@@ -5349,9 +5386,18 @@
+ 		return -EINVAL;
+ 	}
+ 
+-	var_meta_size = btf_type_ops(t)->check_meta(env, t, meta_left);
+-	if (var_meta_size < 0)
+-		return var_meta_size;
++	if (env->trusted) {
++		var_meta_size = btf_type_extra_size(t);
++		if ((u32)var_meta_size > meta_left) {
++			btf_verifier_log(env, "[%u] meta_left:%u meta_needed:%d",
++					 env->log_type_id, meta_left, var_meta_size);
++			return -EINVAL;
++		}
++	} else {
++		var_meta_size = btf_type_ops(t)->check_meta(env, t, meta_left);
++		if (var_meta_size < 0)
++			return var_meta_size;
++	}
+ 
+ 	meta_left -= var_meta_size;
+ 
+@@ -6350,9 +6396,11 @@
+ 	if (err)
+ 		goto errout;
+ 
+-	err = btf_check_type_tags(env, btf, 1);
+-	if (err)
+-		goto errout;
++	if (!env->trusted) {
++		err = btf_check_type_tags(env, btf, 1);
++		if (err)
++			goto errout;
++	}
+ 
+ 	btf_check_sorted(btf);
+ 	refcount_set(&btf->refcnt, 1);
+@@ -6380,6 +6428,14 @@
+ 
+ 	log = &env->log;
+ 	log->level = BPF_LOG_KERNEL;
++	/*
++	 * vmlinux BTF is generated with the kernel and is part of its
++	 * read-only data, so it is trusted like the rest of the image: check
++	 * that the types are laid out within the type section, but not the
++	 * contents of each type (names, sizes, offsets, type tag chains),
++	 * which costs millions of instructions at boot.
++	 */
++	env->trusted = true;
+ 	btf = btf_parse_base(env, "vmlinux", __start_BTF, __stop_BTF - __start_BTF);
+ 	if (IS_ERR(btf))
+ 		goto err_out;

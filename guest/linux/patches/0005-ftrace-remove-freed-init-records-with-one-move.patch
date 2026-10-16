@@ -1,0 +1,69 @@
+ftrace: Remove the records of freed init functions with one move
+
+ftrace_free_mem() looks up one record in the range being freed at a
+time and moves the rest of the page down by one record each time.
+When the kernel frees its init memory, the records of all the init
+functions, which are together at the end of the sorted records, are
+removed this way: about 2.8M instructions of memmove() on riscv64.
+
+The records are sorted, so the ones in the range are contiguous: find
+the first and last with the binary search and a scan, and move the
+rest of the page once.
+
+--- a/kernel/trace/ftrace.c
++++ b/kernel/trace/ftrace.c
+@@ -8280,24 +8280,35 @@
+ 		mod_map = allocate_ftrace_mod_map(mod, start, end);
+ 
+ 	for (pg = ftrace_pages_start; pg; last_pg = &pg->next, pg = *last_pg) {
++		struct dyn_ftrace *recs_end, *last;
++
+ 		if (end < pg->records[0].ip ||
+ 		    start >= (pg->records[pg->index - 1].ip + MCOUNT_INSN_SIZE))
+ 			continue;
+- again:
++
+ 		rec = bsearch(&key, pg->records, pg->index,
+ 			      sizeof(struct dyn_ftrace),
+ 			      ftrace_cmp_recs);
+ 		if (!rec)
+ 			continue;
+ 
+-		/* rec will be cleared from hashes after ftrace_lock unlock */
+-		add_to_clear_hash_list(&clear_hash, rec);
++		/*
++		 * The records are sorted, so the ones in the range are
++		 * together: remove them all with one move of the rest.
++		 */
++		while (rec > pg->records && !ftrace_cmp_recs(&key, rec - 1))
++			rec--;
++		recs_end = pg->records + pg->index;
++		for (last = rec; last < recs_end && !ftrace_cmp_recs(&key, last); last++) {
++			/* rec will be cleared from hashes after ftrace_lock unlock */
++			add_to_clear_hash_list(&clear_hash, last);
+ 
+-		if (mod_map)
+-			save_ftrace_mod_rec(mod_map, rec);
++			if (mod_map)
++				save_ftrace_mod_rec(mod_map, last);
++		}
+ 
+-		pg->index--;
+-		ftrace_update_tot_cnt--;
++		pg->index -= last - rec;
++		ftrace_update_tot_cnt -= last - rec;
+ 		if (!pg->index) {
+ 			*last_pg = pg->next;
+ 			pg->next = tmp_page;
+@@ -8307,10 +8318,7 @@
+ 				ftrace_pages = pg;
+ 			continue;
+ 		}
+-		memmove(rec, rec + 1,
+-			(pg->index - (rec - pg->records)) * sizeof(*rec));
+-		/* More than one function may be in this block */
+-		goto again;
++		memmove(rec, last, (recs_end - last) * sizeof(*rec));
+ 	}
+ 	mutex_unlock(&ftrace_lock);
+ 

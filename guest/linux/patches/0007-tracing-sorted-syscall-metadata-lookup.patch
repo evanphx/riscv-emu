@@ -1,0 +1,124 @@
+tracing: Look up syscall metadata in a sorted copy
+
+init_ftrace_syscalls() finds the metadata of each syscall by comparing
+its symbol name with the name of each metadata entry, about 450 x 450
+string comparisons, 2.7M instructions on riscv64.
+
+Where the architecture defines arch_syscall_sym_name(), the metadata
+name that a syscall symbol matches exactly, sort a copy of the
+metadata by name and binary search it instead. Define it for riscv
+(skip "__riscv_"). The syscall events and their formats are the same.
+
+--- a/arch/riscv/include/asm/ftrace.h
++++ b/arch/riscv/include/asm/ftrace.h
+@@ -45,6 +45,9 @@
+ 	return !strcmp(sym + 8, name);
+ }
+ 
++/* The metadata name that a syscall symbol matches: skip __riscv_ */
++#define arch_syscall_sym_name(sym) ((sym) + 8)
++
+ struct dyn_arch_ftrace {
+ };
+ #endif
+--- a/kernel/trace/trace_syscalls.c
++++ b/kernel/trace/trace_syscalls.c
+@@ -9,6 +9,8 @@
+ #include <linux/ftrace.h>
+ #include <linux/perf_event.h>
+ #include <linux/xarray.h>
++#include <linux/sort.h>
++#include <linux/bsearch.h>
+ #include <asm/syscall.h>
+ 
+ #include "trace_output.h"
+@@ -80,6 +82,56 @@
+ }
+ #endif /* ARCH_TRACE_IGNORE_COMPAT_SYSCALLS */
+ 
++#ifdef arch_syscall_sym_name
++/*
++ * Where the architecture says which metadata name a symbol matches, look
++ * the names up in a sorted copy of the metadata rather than comparing
++ * each syscall with all of them.
++ */
++static struct syscall_metadata **syscalls_metadata_sorted __initdata;
++static size_t syscalls_metadata_nr __initdata;
++
++static int __init syscall_meta_cmp(const void *a, const void *b)
++{
++	const struct syscall_metadata *ma = *(const struct syscall_metadata **)a;
++	const struct syscall_metadata *mb = *(const struct syscall_metadata **)b;
++
++	return strcmp(ma->name, mb->name);
++}
++
++static int __init syscall_meta_name_cmp(const void *key, const void *elt)
++{
++	const struct syscall_metadata *m = *(const struct syscall_metadata **)elt;
++
++	return strcmp(key, m->name);
++}
++
++static void __init sort_syscall_meta(void)
++{
++	struct syscall_metadata **start = __start_syscalls_metadata;
++	struct syscall_metadata **stop = __stop_syscalls_metadata;
++	size_t n = 0;
++
++	syscalls_metadata_sorted = kmalloc_array(stop - start, sizeof(*start), GFP_KERNEL);
++	if (!syscalls_metadata_sorted)
++		return;
++	for (; start < stop; start++)
++		if ((*start)->name)
++			syscalls_metadata_sorted[n++] = *start;
++	sort(syscalls_metadata_sorted, n, sizeof(*start), syscall_meta_cmp, NULL);
++	syscalls_metadata_nr = n;
++}
++
++static void __init free_sorted_syscall_meta(void)
++{
++	kfree(syscalls_metadata_sorted);
++	syscalls_metadata_sorted = NULL;
++}
++#else
++static void __init sort_syscall_meta(void) { }
++static void __init free_sorted_syscall_meta(void) { }
++#endif
++
+ static __init struct syscall_metadata *
+ find_syscall_meta(unsigned long syscall)
+ {
+@@ -95,6 +147,16 @@
+ 	if (arch_syscall_match_sym_name(str, "sys_ni_syscall"))
+ 		return NULL;
+ 
++#ifdef arch_syscall_sym_name
++	if (syscalls_metadata_sorted) {
++		struct syscall_metadata **m;
++
++		m = bsearch(arch_syscall_sym_name(str), syscalls_metadata_sorted,
++			    syscalls_metadata_nr, sizeof(*m), syscall_meta_name_cmp);
++		return m ? *m : NULL;
++	}
++#endif
++
+ 	for ( ; start < stop; start++) {
+ 		if ((*start)->name && arch_syscall_match_sym_name(str, (*start)->name))
+ 			return *start;
+@@ -1345,6 +1407,7 @@
+ 		}
+ 	}
+ 
++	sort_syscall_meta();
+ 	for (i = 0; i < NR_syscalls; i++) {
+ 		addr = arch_syscall_addr(i);
+ 		meta = find_syscall_meta(addr);
+@@ -1363,6 +1426,7 @@
+ 		}
+ 
+ 	}
++	free_sorted_syscall_meta();
+ }
+ 
+ #ifdef CONFIG_PERF_EVENTS
