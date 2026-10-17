@@ -446,6 +446,121 @@ fn direct_mmap_reads_follow_remaps_and_permissions() {
 
 #[cfg(feature = "jit")]
 #[test]
+fn direct_mmap_proven_alignment_preserves_loads_and_stores() {
+    // Mask an unknown base, add a shifted index, then use both aligned
+    // addresses and an unaligned base with a compensating negative offset.
+    let words: [u32; 10] = [
+        0xff847413, 0x00359593, 0x00b40433, 0x01840413, 0x00a43023, 0x00043283, 0xfff40413,
+        0xfea42ea3, 0xffd42303, 0x0004b383,
+    ];
+    for backend in ["", "direct", "direct-mmap"] {
+        for opt in [false, true] {
+            for (low, index) in [(1, 3), (7, 2), (0, 5)] {
+                let mem = backend_ram(backend, 0x4000);
+                mem.write_bytes(
+                    0,
+                    &words
+                        .iter()
+                        .flat_map(|v| v.to_le_bytes())
+                        .collect::<Vec<_>>(),
+                );
+                let mut cpu = Cpu::new(mem.clone());
+                cpu.pc = RAM_BASE;
+                cpu.x[8] = RAM_BASE + 0x2010 + low;
+                cpu.x[9] = RAM_BASE + 0x4000;
+                cpu.x[10] = 0x1234_5678_89ab_cdef;
+                cpu.x[11] = index;
+                cpu.x[7] = 107;
+                cpu.trap_handler = Some(Box::new(|_, trap| {
+                    assert_eq!(trap.cause, isa::CAUSE_LOAD_PAGE_FAULT);
+                    assert_eq!(trap.pc, RAM_BASE + 36);
+                    assert_eq!(trap.tval, RAM_BASE + 0x4000);
+                    Err("expected fault".into())
+                }));
+                if !backend.is_empty() {
+                    cpu.enable_jit(1, 0).unwrap();
+                    cpu.set_jit_backend(backend).unwrap();
+                    cpu.set_jit_optimize(opt);
+                }
+                assert_eq!(cpu.run().unwrap_err(), "expected fault");
+                let address = 0x2010 + 8 * index + 24;
+                assert_eq!(mem.read_u64(address), 0x1234_5678_89ab_cdef);
+                assert_eq!(mem.read_u32(address - 4), 0x89ab_cdef);
+                assert_eq!(cpu.x[5], 0x1234_5678_89ab_cdef);
+                assert_eq!(cpu.x[6], 0xffff_ffff_89ab_cdef);
+                assert_eq!(cpu.x[7], 107);
+                assert_eq!(cpu.x[8], RAM_BASE + address - 1);
+                assert_eq!(cpu.instret, 10);
+                if backend == "direct-mmap" {
+                    assert!(cpu.jit_stats().unwrap().elided_alignment_guards >= 4);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "jit")]
+#[test]
+fn direct_mmap_alignment_proofs_do_not_cross_branch_entries() {
+    use riscv::mmu::{self, Satp, PTE_R, PTE_U, PTE_X, SATP_MODE_SV39};
+    let half = 1u64 << 38;
+    for opt in [false, true] {
+        let mem = backend_ram("direct-mmap", 0x10000);
+        let root = mem.alloc_page().unwrap();
+        let code = mem.alloc_page().unwrap();
+        let user = mem.alloc_page().unwrap();
+        let supervisor = mem.alloc_page().unwrap();
+        let satp = Satp::new(SATP_MODE_SV39, root);
+        mmu::set_map_sv39(&mem, satp, 4, code, PTE_R | PTE_X | PTE_U).unwrap();
+        mmu::set_map_sv39(&mem, satp, (half >> 12) - 1, user, PTE_R | PTE_U).unwrap();
+        mmu::set_map_sv39(&mem, satp, half.wrapping_neg() >> 12, supervisor, PTE_R).unwrap();
+        // The taken edge skips the mask. Reusing its alignment proof at
+        // the join could read across the host window into the next bank.
+        let words = [0x00060463u32, 0xff847413, 0x00043283, 0x0004b303];
+        mem.write_bytes(
+            mem.page_offset_of(code).unwrap(),
+            &words
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<_>>(),
+        );
+        mem.write_u64(
+            mem.page_offset_of(user).unwrap() + 4088,
+            0x1234_5678_9abc_def0,
+        );
+        mem.write_u64(
+            mem.page_offset_of(supervisor).unwrap(),
+            0xfedc_ba98_7654_3210,
+        );
+        let mut cpu = Cpu::new(mem.clone());
+        cpu.set_satp(satp);
+        cpu.enable_jit(1, 0).unwrap();
+        cpu.set_jit_backend("direct-mmap").unwrap();
+        cpu.set_jit_optimize(opt);
+        // Populate adjacent windows: U's highest page, then S's lowest.
+        cpu.set_mode(Mode::U);
+        cpu.load64(half - 8).unwrap();
+        cpu.set_mode(Mode::S);
+        cpu.load64(half.wrapping_neg()).unwrap();
+        cpu.set_mode(Mode::U);
+        cpu.pc = 0x4000;
+        cpu.x[8] = half - 4;
+        cpu.x[9] = 0x9000;
+        cpu.x[5] = 911;
+        cpu.trap_handler = Some(Box::new(move |_, trap| {
+            assert_eq!(trap.cause, isa::CAUSE_LOAD_PAGE_FAULT);
+            assert_eq!(trap.pc, 0x4008);
+            assert_eq!(trap.tval, half);
+            Err("expected boundary fault".into())
+        }));
+        assert_eq!(cpu.run().unwrap_err(), "expected boundary fault");
+        assert_eq!(cpu.x[5], 911);
+        assert_eq!(cpu.instret, 2);
+    }
+}
+
+#[cfg(feature = "jit")]
+#[test]
 fn direct_mmap_stores_follow_permissions_and_dirty_bits() {
     use riscv::mmu::{
         self, Pte, Satp, PTE_A, PTE_D, PTE_R, PTE_U, PTE_V, PTE_W, PTE_X, SATP_MODE_SV39,

@@ -297,6 +297,91 @@ fn read_alu(op: Op) -> bool {
     )
 }
 
+/// Possible low-three-bit values, not observations of a particular run.
+/// Restart at every branch entry and helper: a proof must hold on every
+/// path into an access, including loop backedges and cold trace entries.
+fn aligned_accesses(instrs: &[BlockInstr], leaders: &HashSet<u64>) -> HashSet<u64> {
+    use Op::*;
+    let mut values = [u8::MAX; 32];
+    let mut aligned = HashSet::default();
+    for (n, bi) in instrs.iter().enumerate() {
+        if leaders.contains(&bi.pc)
+            || n == 0
+            || instrs[n - 1].pc.wrapping_add(instrs[n - 1].size) != bi.pc
+        {
+            values.fill(u8::MAX);
+        }
+        values[0] = 1; // x0 is exactly zero modulo eight.
+        let i = bi.instr;
+        if let Some((size, write)) = mem_access(i.op) {
+            let possible = values[i.rs1 as usize];
+            if size > 1
+                && (0..8).all(|v| {
+                    possible & (1 << v) == 0 || ((v as i64 + i.imm as i64) & (size - 1)) == 0
+                })
+            {
+                aligned.insert(bi.pc);
+            }
+            if !write && !matches!(i.op, Flw | Fld) {
+                values[i.rd as usize] = u8::MAX;
+            }
+            continue;
+        }
+        let a = values[i.rs1 as usize];
+        let b = values[i.rs2 as usize];
+        let mut result = 0;
+        match i.op {
+            Lui => result = 1 << (i.imm as u64 & 7),
+            Auipc => result = 1 << (bi.pc.wrapping_add(i.imm as i64 as u64) & 7),
+            Addi | Addiw | Andi | Ori | Xori | Slli | Slliw | SlliUw => {
+                for v in 0..8u64 {
+                    if a & (1 << v) == 0 {
+                        continue;
+                    }
+                    let imm = i.imm as i64 as u64;
+                    let r = match i.op {
+                        Addi | Addiw => v.wrapping_add(imm),
+                        Andi => v & imm,
+                        Ori => v | imm,
+                        Xori => v ^ imm,
+                        _ => v.wrapping_shl(i.imm as u32),
+                    };
+                    result |= 1 << (r & 7);
+                }
+            }
+            Add | Addw | AddUw | Sub | Subw | And | Or | Xor | Mul | Mulw | Sh1add | Sh2add
+            | Sh3add | Sh1addUw | Sh2addUw | Sh3addUw => {
+                for x in 0..8u64 {
+                    for y in 0..8u64 {
+                        if a & (1 << x) == 0 || b & (1 << y) == 0 {
+                            continue;
+                        }
+                        let r = match i.op {
+                            Add | Addw | AddUw => x + y,
+                            Sub | Subw => x.wrapping_sub(y),
+                            And => x & y,
+                            Or => x | y,
+                            Xor => x ^ y,
+                            Mul | Mulw => x * y,
+                            Sh1add | Sh1addUw => (x << 1) + y,
+                            Sh2add | Sh2addUw => (x << 2) + y,
+                            _ => (x << 3) + y,
+                        };
+                        result |= 1 << (r & 7);
+                    }
+                }
+            }
+            _ if read_alu(i.op) => result = u8::MAX,
+            _ => {
+                values.fill(u8::MAX);
+                continue;
+            }
+        }
+        values[i.rd as usize] = result;
+    }
+    aligned
+}
+
 struct Emitter {
     a: Asm,
     regs: [Option<u8>; 32],
@@ -308,6 +393,8 @@ struct Emitter {
     read_exits: Vec<(usize, u64)>,
     tlb_exits: Vec<(usize, usize, usize)>,
     specialized_loads: u64,
+    aligned: HashSet<u64>,
+    elided_alignment_guards: u64,
     loop_reads: Vec<LoopRead>,
     chain: usize,
     ret: usize,
@@ -315,7 +402,7 @@ struct Emitter {
     pending_count: i32,
 }
 
-pub(super) fn compile(req: &Request) -> (Vec<u8>, u64, u64, u64) {
+pub(super) fn compile(req: &Request) -> (Vec<u8>, u64, u64, u64, u64) {
     use Op::*;
     let mut a = Asm::default();
     let chain = a.label();
@@ -332,6 +419,8 @@ pub(super) fn compile(req: &Request) -> (Vec<u8>, u64, u64, u64) {
         read_exits: Vec::new(),
         tlb_exits: Vec::new(),
         specialized_loads: 0,
+        aligned: HashSet::default(),
+        elided_alignment_guards: 0,
         loop_reads: Vec::new(),
         chain,
         ret,
@@ -409,6 +498,9 @@ pub(super) fn compile(req: &Request) -> (Vec<u8>, u64, u64, u64) {
             }
         }
     }
+    if req.env.host_mmap {
+        t.aligned = aligned_accesses(&req.instrs, &leaders);
+    }
     t.plan_loop_reads(&req.instrs);
     let mut index = 0;
     let mut fused_pairs = 0;
@@ -463,6 +555,7 @@ pub(super) fn compile(req: &Request) -> (Vec<u8>, u64, u64, u64) {
         fused_pairs,
         t.specialized_loads,
         t.loop_reads.len() as u64,
+        t.elided_alignment_guards,
     )
 }
 
@@ -1022,12 +1115,14 @@ impl Emitter {
             self.a.alu(0, AX, 1, true);
             self.a.shift(5, AX, Some(1), true);
             self.a.branch(Some(5), slow);
-            if size > 1 {
+            if size > 1 && !self.aligned.contains(&bi.pc) {
                 // Aligned power-of-two accesses cannot cross a window edge.
                 // Split/unaligned accesses retain the precise helper.
                 self.a.mov(AX, SI);
                 self.a.alu(4, AX, size as i32 - 1, true);
                 self.a.branch(Some(5), slow);
+            } else if size > 1 {
+                self.elided_alignment_guards += 1;
             }
             self.a.lea_label(CX, slow);
             if write {

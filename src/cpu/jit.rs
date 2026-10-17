@@ -155,6 +155,8 @@ pub struct JitStats {
     pub specialized_loads: u64,
     /// Direct loops emitted with a translation guard outside the backedge.
     pub hoisted_read_loops: u64,
+    /// Mmap access sites emitted without a statically redundant alignment guard.
+    pub elided_alignment_guards: u64,
     pub mmap_faults: u64,
     pub mmap_fills: u64,
     pub mmap_flushes: u64,
@@ -192,6 +194,13 @@ impl std::fmt::Display for JitStats {
         }
         if self.hoisted_read_loops > 0 {
             write!(f, ", {} hoisted read loops", self.hoisted_read_loops)?;
+        }
+        if self.elided_alignment_guards > 0 {
+            write!(
+                f,
+                ", {} elided alignment guards",
+                self.elided_alignment_guards
+            )?;
         }
         if self.mmap_fills > 0 || self.mmap_faults > 0 {
             write!(
@@ -1476,6 +1485,7 @@ impl Jit {
         self.stats.fused_pairs += r.fused_pairs;
         self.stats.specialized_loads += r.specialized_loads;
         self.stats.hoisted_read_loops += r.hoisted_read_loops;
+        self.stats.elided_alignment_guards += r.elided_alignment_guards;
         Ok(func)
     }
 
@@ -1513,6 +1523,7 @@ struct Compiled {
     fused_pairs: u64,
     specialized_loads: u64,
     hoisted_read_loops: u64,
+    elided_alignment_guards: u64,
     time: Duration,
 }
 
@@ -1665,14 +1676,20 @@ impl Compiler {
     fn compile(&mut self, req: Request) -> Result<Compiled, String> {
         let start = Instant::now();
         if req.env.direct {
-            let (machine_code, fused_pairs, specialized_loads, hoisted_read_loops) =
-                direct::compile(&req);
+            let (
+                machine_code,
+                fused_pairs,
+                specialized_loads,
+                hoisted_read_loops,
+                elided_alignment_guards,
+            ) = direct::compile(&req);
             return Ok(Compiled {
                 request: req,
                 machine_code,
                 fused_pairs,
                 specialized_loads,
                 hoisted_read_loops,
+                elided_alignment_guards,
                 time: start.elapsed(),
             });
         }
@@ -1711,6 +1728,7 @@ impl Compiler {
             fused_pairs: 0,
             specialized_loads: 0,
             hoisted_read_loops: 0,
+            elided_alignment_guards: 0,
             time: start.elapsed(),
         })
     }

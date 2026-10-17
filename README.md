@@ -805,6 +805,53 @@ These remain noisy, three-sample shared-host measurements, not a general
 speedup claim. Raw commands, timings, binary hashes and the reproduction
 script are in `.amp/in/artifacts/host-mmap-writes.json`.
 
+### Mmap alignment-guard removal
+
+The read/write mmap checkpoint is preserved on `experiment/host-mmap`;
+the guard-removal follow-up is on `experiment/mmap-guards`. The ordinary
+`direct` backend is unchanged: its alignment check is already folded into
+the software-TLB tag comparison, not a separate branch.
+
+For mmap accesses, a forward analysis tracks the possible low three bits
+of integer registers through constants, masks, shifts and arithmetic. It
+includes signed memory offsets and runs on decoded guest instructions,
+independent of peephole fusion. Facts reset at branch entries, trace gaps
+and helpers. A load invalidates facts for its integer destination. When
+all possible effective addresses satisfy the access's alignment, the
+emitter omits the three-instruction alignment guard. Unknown addresses
+keep the guard; canonical-address checks and fault recovery remain.
+No observed pointer value or guest ABI promise is treated as a proof.
+
+An untimed diagnostic emitted 1,391 fewer alignment guards during Linux
+boot, 1,766 during fresh Node startup and 2,086 during the integer workload.
+These count newly emitted access sites, not runtime executions; restored
+cached code is not counted again. See
+`.amp/in/artifacts/mmap-alignment-diagnostics.txt`. Temporary checkpoint
+logging was removed; the timed binaries did not contain it.
+
+Three rotated-order trials per variant used isolated caches and checked
+all 108 Node commands' exact output. Medians below show fresh / continued
+runs. Request-through-exit includes restore and command execution, but
+excludes saving the resulting snapshot; hot times cover only loop bodies.
+
+| Workload | Direct | Guarded mmap | Guard-elided mmap |
+|----------|-------:|-------------:|-----------------:|
+| Linux/agent readiness | 0.710 s | 1.113 s | 1.182 s |
+| Node request through exit | 1.170 / 0.986 s | 1.579 / 1.112 s | 1.581 / 1.191 s |
+| Crypto/JSON through exit | 2.254 / 1.747 s | 2.580 / 2.207 s | 2.350 / 1.999 s |
+| Integer loop (hot) | 3.886 / 3.688 s | 3.797 / 3.778 s | 3.662 / 3.715 s |
+| Array reads (hot) | 1.447 / 1.161 s | 1.222 / 1.149 s | 1.153 / 1.163 s |
+| Field reads (hot) | 3.602 / 3.084 s | 3.166 / 3.208 s | 3.230 / 3.080 s |
+| Array writes (hot) | 1.234 / 1.245 s | 1.287 / 1.285 s | 1.307 / 1.336 s |
+
+The pass removes guards in real workloads, but does not establish an
+overall win: some loop medians improve, while array writes, Linux
+readiness and Node time through exit do not. Shared-host variability is
+substantial, with only three samples per case. The evidence still does
+not justify replacing ordinary direct mode with mmap. Raw commands,
+timings, hashes and the reproduction script are in
+`.amp/in/artifacts/mmap-alignment-guards.json`.
+
 ### Precompiling the kernel
 
 A training run can compile everything that a boot executes, ahead of
