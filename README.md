@@ -504,19 +504,26 @@ Interpreter-observed stable loads can predict a fixed TLB slot, reducing
 the predicted-hit load path to 10 instructions. This is a guarded hint:
 the actual address must match the live read tag, and a prediction miss
 tries the generic inline TLB lookup before calling a helper.
-Straight-line reads of an unchanged base can share one checked RAM-page
-translation, including across nonfaulting integer arithmetic. Stores,
-helpers, base writes and branch entries end a group. A failed range guard
-returns before the first read, preserving individual read/fault order in
-the interpreter. MMIO and cross-page groups do not use this fast path.
+Straight-line integer loads and stores through an unchanged base can share
+one checked RAM-page translation, including across nonfaulting integer
+arithmetic. Helpers, other memory bases, base writes and branch entries
+end a group. Store groups validate alignment and the write tag; mixed
+groups validate both read and write tags. Stores use the translated base
+directly and clear the LR/SC reservation once per group. A failed guard
+runs an out-of-line compiled copy with individually checked accesses.
+Ordinary misses refill through the existing helpers and resume compiled
+code; MMIO, protected/code pages, unaligned stores and cross-page groups
+retain precise individual access handling and fault order.
 Single-entry read-only loops whose reads all use one invariant base can
 also hoist that guard and translation above their backedge. Conditional
 branches and side exits are allowed, but stores, helpers, CSRs, fences and
 external entries into the middle reject hoisting. The translated base
 stays in RDI without reducing the six cached guest registers. Actual
 reads still occur on every iteration. Re-entry and the existing 4096-guest-
-instruction timeslice limit run the guard again; a guard miss interprets
-from the header instead of raising a speculative fault.
+instruction timeslice limit run the guard again. A guard miss runs a
+separately checked compiled loop, including its header arithmetic and
+conditional reads, rather than raising a speculative fault or interpreting
+the loop. Its local backedges cannot enter the unchecked hoisted body.
 It emits integer arithmetic, branches, memory accesses and FP loads,
 stores and moves directly; other supported instructions call the same
 interpreter/soft-float helpers as the Cranelift backend. No Cranelift
@@ -851,6 +858,122 @@ substantial, with only three samples per case. The evidence still does
 not justify replacing ordinary direct mode with mmap. Raw commands,
 timings, hashes and the reproduction script are in
 `.amp/in/artifacts/mmap-alignment-guards.json`.
+
+### Linked guest/host assembly viewer
+
+Set `RSEMU_DIRECT_DUMP=/tmp/blocks` when running either direct backend
+with a fresh JIT cache. Newly compiled Sv39 user blocks are written as
+`PC.json`, containing guest instructions, native bytes, cached-register
+assignments, emission ranges and hoisted-translation dependencies. This
+is opt-in diagnostic output, not a performance mode. A later compilation
+at the same PC replaces its dump; cached blocks are not dumped again.
+
+Build a self-contained app with GNU `objdump` and
+`riscv64-linux-gnu-objdump` installed:
+
+```shell
+python3 scripts/jit-view.py /tmp/blocks/PC.json --output viewer.html
+```
+
+Hover or focus either assembly listing to highlight its corresponding
+range; click locks it, Escape unlocks, and arrow keys move between lines.
+Fused instructions share a range. Selecting a hoisted load also highlights
+its loop-entry translation. Entry setup and out-of-line exits/helpers are
+shared infrastructure rather than falsely attributed to one instruction.
+Retirement accounting is included in the boundary's emitted range.
+
+A fresh CPU-clock profile of the Node integer workload selected block
+`0x3f76006894` (68.96% of all samples, including startup/snapshot work).
+Its 40 guest instructions generate 290 host instructions / 1466 bytes,
+including cold paths. The poll byte read is a `movzx` plus a register move;
+its eleven-instruction translation is outside the internal backedge.
+The common backedge checks the 4096-instruction timeslice and jumps to
+native offset `0x83`, bypassing that translation. Following this normal
+path gives 59 host instructions for 21 guest instructions, including nine
+retirement updates and ten sign extensions (static path counts, not
+sampled hardware events). The captured app and
+source dump are `.amp/in/artifacts/pages/node-code.html` and
+`.amp/in/artifacts/node-hot-block.json`. CPU-clock sampling is not a
+hardware-cycle measurement or a dynamic instruction count.
+
+### Shared store-translation experiment
+
+The Node frame spills `sd a2,-80(s0); sd a7,-88(s0)` now share a guard
+and translated frame base. Their captured emission shrinks from 28 host
+instructions to 18 (retirement accounting is now batched with subsequent
+instructions). The stores themselves are two direct frame-relative `mov`
+instructions, with one reservation clear. The complete captured block
+shrinks from 1466 bytes / 290 instructions to 1255 bytes / 239 instructions.
+Before/after assembly is in `.amp/in/artifacts/store-groups-disassembly.txt`.
+
+Five alternating-order user-mode RV64 spill microbenchmarks, each with
+600M iterations and independently checked changing stored values, have
+medians of 1.320 s before and 0.964 s after (27% less elapsed time).
+This is not a Linux/Node speedup claim. Six fresh-cache Linux/Node trials
+per variant have these medians:
+
+| Measurement | Before | Shared stores |
+| --- | ---: | ---: |
+| Linux/agent readiness plus base saving | 0.658 s | 0.657 s |
+| Node startup through exit | 1.197 s | 1.214 s |
+| Integer loop hot interval | 0.384 s | 0.381 s |
+| JSON/crypto through exit | 1.970 s | 2.837 s |
+| Array-write hot interval | 1.252 s | 1.278 s |
+
+Every command's stdout was checked. Node totals include VM restore but
+exclude saving the result; hot intervals exclude Node startup. The
+JSON/crypto slowdown in these runs must not be hidden: two separate
+diagnostic CPU-clock profile comparisons did not reproduce it (roughly
+1.89 vs 1.88 s, then 1.99 vs 1.98 s). The cause is unresolved, so there is
+no established broad workload win. Raw trials and executable hashes are
+in `.amp/in/artifacts/store-groups-bench-initial.json` and
+`.amp/in/artifacts/store-groups-bench.json`; the focused benchmark and
+assembly source are in `.amp/in/artifacts/store-groups-microbenchmark.json`.
+
+### Compiled translation-guard fallback experiment
+
+Subsequent diagnostics found millions of failed shared-translation guards
+in slow JSON/crypto runs, including with the older read-only grouping.
+Instead of returning to interpretation, rejected groups now execute
+individually checked compiled accesses; rejected invariant-loop guards
+enter a scalar compiled loop. The ordinary memory helpers refill misses
+and return to compiled code. Only actual guest faults take the fault exit.
+The shared guard is retried on a later entry, not by speculatively repeating
+an access that might have side effects.
+
+The first fallback implementation flushed retirement accounting at the
+end of every successful group and did not establish a broad Node win.
+The final version keeps the original fast-path batching: scalar fallbacks
+account precisely at each fault site, then undo their local count on
+success before rejoining the existing batch. All added count bookkeeping
+is cold. Six alternating fresh-cache trials per variant, with no profiling
+or dump flags, gave these medians:
+
+| Measurement | Interpreter bailout | Compiled fallback |
+| --- | ---: | ---: |
+| Linux/agent readiness plus base saving | 0.735 s | 0.658 s |
+| Node startup through exit | 1.298 s | 1.262 s |
+| Integer loop hot interval | 0.393 s | 0.379 s |
+| JSON/crypto through exit | 2.359 s | 2.148 s |
+| Array-write hot interval | 1.384 s | 1.256 s |
+
+Every output and exit code was checked. These are noisy shared-host wall
+times, not a guaranteed speedup. Separate diagnostic JSON/crypto runs
+reduced dispatches from 3.8–10.5 million to about 0.75 million. Controlled
+30M-iteration, two-mapped-page workloads improved from 1.974 to 0.112 s
+for mixed loads/stores and 1.347 to 0.054 s for an invariant read loop.
+The longer 300M-iteration same-page controls were 0.723 to 0.666 s and
+0.299 to 0.296 s respectively; these are user-mode microbenchmarks, not
+Linux or Node timings. Tests cover mapped page crossings, skipped reads,
+partial completion before faults, exact counters, timeslices, reservations
+and the existing permission/code-invalidation paths.
+
+Final trials, checksums and reproduction harnesses are in
+`.amp/in/artifacts/compiled-fallback-batched.json`,
+`compiled-fallback-batched-diagnostics.json` and
+`compiled-fallback-batched-micro.json`. Earlier group-only and loop-copy
+comparisons remain in `compiled-fallback-groups.json` and
+`compiled-fallback-final.json`; they predate the cold-only count fix.
 
 ### Precompiling the kernel
 

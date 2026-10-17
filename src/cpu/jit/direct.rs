@@ -390,7 +390,7 @@ struct Emitter {
     targets: HashMap<u64, usize>,
     edges: Vec<(usize, u64, u64)>,
     memory_exits: Vec<(usize, usize, u64, u64)>,
-    read_exits: Vec<(usize, u64)>,
+    access_fallbacks: Vec<(usize, Option<usize>, u64, u64)>,
     tlb_exits: Vec<(usize, usize, usize)>,
     specialized_loads: u64,
     aligned: HashSet<u64>,
@@ -416,7 +416,7 @@ pub(super) fn compile(req: &Request) -> (Vec<u8>, u64, u64, u64, u64) {
         targets,
         edges: Vec::new(),
         memory_exits: Vec::new(),
-        read_exits: Vec::new(),
+        access_fallbacks: Vec::new(),
         tlb_exits: Vec::new(),
         specialized_loads: 0,
         aligned: HashSet::default(),
@@ -502,9 +502,17 @@ pub(super) fn compile(req: &Request) -> (Vec<u8>, u64, u64, u64, u64) {
         t.aligned = aligned_accesses(&req.instrs, &leaders);
     }
     t.plan_loop_reads(&req.instrs);
+    // Optional analysis output; offsets are recorded at emission time, not
+    // inferred from disassembly. Keep fused/grouped instructions together.
+    let dump = std::env::var_os("RSEMU_DIRECT_DUMP");
+    let mut spans = Vec::new();
+    let mut hoists = Vec::new();
+    let entry_end = t.a.code.len();
     let mut index = 0;
     let mut fused_pairs = 0;
     while let Some(bi) = req.instrs.get(index) {
+        let first = index;
+        let start = t.a.code.len();
         if leaders.contains(&bi.pc) {
             t.count();
         }
@@ -515,10 +523,19 @@ pub(super) fn compile(req: &Request) -> (Vec<u8>, u64, u64, u64, u64) {
             .find(|l| l.start <= bi.pc && bi.pc <= l.end)
             .copied();
         if let Some(l) = loop_read.filter(|l| l.start == bi.pc) {
+            let start = t.a.code.len();
             t.begin_loop_read(l);
+            if dump.is_some() {
+                hoists.push(serde_json::json!({
+                    "start": start, "end": t.a.code.len(),
+                    "pcs": req.instrs.iter().filter(|b| l.start <= b.pc && b.pc <= l.end
+                        && matches!(b.instr.op, Lb | Lbu | Lh | Lhu | Lw | Lwu | Ld))
+                        .map(|b| format!("{:x}", b.pc)).collect::<Vec<_>>()
+                }));
+            }
         }
         let grouped = if loop_read.is_none() {
-            t.read_group(&req.instrs[index..], &leaders)
+            t.access_group(&req.instrs[index..], &leaders)
         } else {
             0
         };
@@ -547,11 +564,45 @@ pub(super) fn compile(req: &Request) -> (Vec<u8>, u64, u64, u64, u64) {
         if !terminated && !req.instrs.get(index + 1).is_some_and(|b| b.pc == next) {
             t.jump_to(next, last.pc);
         }
+        if dump.is_some() {
+            spans.push(serde_json::json!({
+                "start": start, "end": t.a.code.len(),
+                "pcs": req.instrs[first..=index].iter().map(|b| format!("{:x}", b.pc)).collect::<Vec<_>>()
+            }));
+        }
         index += 1;
     }
-    t.finish();
+    let body_end = t.a.code.len();
+    t.finish(&req.instrs);
+    let code = t.a.finish();
+    if let Some(directory) = dump {
+        let directory = std::path::PathBuf::from(directory);
+        // Kernel blocks are intentionally excluded from this Node analysis.
+        if req.vpc < (1u64 << 38) {
+            let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+                std::fs::create_dir_all(&directory)?;
+                let data = serde_json::json!({
+                    "pc": format!("{:x}", req.vpc), "host_mmap": req.env.host_mmap,
+                    "entry_end": entry_end, "body_end": body_end, "spans": spans, "hoists": hoists,
+                    "registers": t.regs, "code": code,
+                    "guest": req.instrs.iter().map(|b| serde_json::json!({
+                        "pc": format!("{:x}", b.pc), "raw": b.raw, "size": b.size,
+                        "decoded": format!("{:?}", b.instr)
+                    })).collect::<Vec<_>>()
+                });
+                std::fs::write(
+                    directory.join(format!("{:x}.json", req.vpc)),
+                    serde_json::to_vec(&data)?,
+                )?;
+                Ok(())
+            })();
+            if let Err(error) = result {
+                eprintln!("direct JIT dump: {error}");
+            }
+        }
+    }
     (
-        t.a.finish(),
+        code,
         fused_pairs,
         t.specialized_loads,
         t.loop_reads.len() as u64,
@@ -819,30 +870,79 @@ impl Emitter {
         self.a.rr(&[0x09], AX, CX, true);
         self.a.branch(None, self.ret);
     }
-    fn finish(&mut self) {
+    fn finish(&mut self, instrs: &[BlockInstr]) {
         // Branch side exits and guarded backedges live outside the
         // straight-line body, so the hot successor can fall through.
         for (label, target, from) in std::mem::take(&mut self.edges) {
             self.a.bind(label);
             self.jump_to(target, from);
         }
+        // A rejected group still runs compiled, with each access checked
+        // separately. Helpers refill ordinary misses and resume here;
+        // only a real guest fault returns from the block.
+        for (label, done, start, end) in std::mem::take(&mut self.access_fallbacks) {
+            let body: Vec<_> = instrs
+                .iter()
+                .filter(|bi| start <= bi.pc && bi.pc <= end)
+                .collect();
+            // A loop fallback needs its own branch labels and backedges:
+            // none may enter the unchecked, hoisted version of its body.
+            let targets = done.is_none().then(|| self.targets.clone());
+            let loops = std::mem::take(&mut self.loop_reads);
+            let mut leaders = HashSet::from([start]);
+            if targets.is_some() {
+                for bi in &body {
+                    let target = if bi.pc == start {
+                        label
+                    } else {
+                        self.a.label()
+                    };
+                    self.targets.insert(bi.pc, target);
+                    if is_terminator(bi.instr.op) {
+                        leaders.insert(bi.pc.wrapping_add(bi.size));
+                        leaders.insert(bi.pc.wrapping_add(bi.instr.imm as i64 as u64));
+                    }
+                }
+            }
+            self.a.bind(label);
+            for (index, bi) in body.iter().enumerate() {
+                if leaders.contains(&bi.pc) {
+                    self.count();
+                }
+                if targets.is_some() && bi.pc != start {
+                    self.a.bind(self.targets[&bi.pc]);
+                }
+                self.pending_count += 1;
+                self.instr(bi, body.get(index + 1).map(|next| next.pc));
+            }
+            self.count();
+            if let Some(done) = done {
+                // Scalar accesses need precise counts at each fault site.
+                // On success, undo this group's count so the continuation
+                // can retire it with the fast path's existing batch. Keep
+                // this bookkeeping off the successful guard's hot path.
+                self.a.lea(COUNT, COUNT, -(body.len() as i32));
+                self.a.branch(None, done);
+            }
+            // Emit these edges before restoring the fast-path label map.
+            for (label, target, from) in std::mem::take(&mut self.edges) {
+                self.a.bind(label);
+                self.jump_to(target, from);
+            }
+            if let Some(targets) = targets {
+                self.targets = targets;
+            }
+            self.loop_reads = loops;
+        }
         for (label, fast, slow) in std::mem::take(&mut self.tlb_exits) {
             self.a.bind(label);
-            self.tlb_lookup(false, slow);
+            self.tlb_lookup(false, false, slow);
             self.a.branch(None, fast);
         }
         for (slow, done, pc, kind) in std::mem::take(&mut self.memory_exits) {
             self.a.bind(slow);
             self.memory_slow(pc, kind);
             self.a.branch(None, done);
-        }
-        for (label, pc) in std::mem::take(&mut self.read_exits) {
-            self.a.bind(label);
-            self.flush_regs();
-            self.pc(AX, pc);
-            self.a.store(AX, CPU, OFS_PC);
-            self.a.mov(AX, COUNT);
-            self.a.branch(None, self.ret);
         }
         self.a.bind(self.chain);
         self.flush_regs();
@@ -949,76 +1049,123 @@ impl Emitter {
         self.a.alu(4, DX, !0xfff, true);
         let slow = self.a.label();
         self.translation(None, false, slow);
-        // A failed speculative guard does not raise a fault. Interpret
-        // from the header so preceding arithmetic and reads occur in order.
-        self.read_exits.push((slow, l.start));
+        // The scalar loop preserves header arithmetic, conditional reads,
+        // precise faults and timeslices even when the range cannot share
+        // a translation. A later block entry tries the hoisted guard again.
+        self.access_fallbacks.push((slow, None, l.start, l.end));
         self.a.rr(&[0x01], DI, AX, true);
         self.a.bind(l.body);
     }
 
-    /// One checked RAM translation for multiple reads of an unchanged
-    /// base. Only nonfaulting integer operations may separate the reads;
-    /// neither helpers nor stores can clobber the host base in RDI.
-    fn read_group(&mut self, instrs: &[BlockInstr], leaders: &HashSet<u64>) -> usize {
+    /// One checked RAM translation for accesses through an unchanged base.
+    /// RDI holds the translated base across nonfaulting integer operations.
+    /// Guards never fault: a miss runs individually checked accesses in order.
+    fn access_group(&mut self, instrs: &[BlockInstr], leaders: &HashSet<u64>) -> usize {
         use Op::*;
         let base = instrs[0].instr.rs1;
-        if !matches!(instrs[0].instr.op, Lb | Lbu | Lh | Lhu | Lw | Lwu | Ld) {
+        let integer_memory =
+            |op| matches!(op, Lb | Lbu | Lh | Lhu | Lw | Lwu | Ld | Sb | Sh | Sw | Sd);
+        if !integer_memory(instrs[0].instr.op) {
             return 0;
         }
         let (mut lo, mut hi) = (i32::MAX, i32::MIN);
-        let (mut reads, mut end) = (0, 0);
+        let (mut reads, mut writes, mut end) = (0, 0, 0);
+        let (mut align_mask, mut align_bits) = (0, 0);
+        let mut alignment_possible = true;
         for (n, bi) in instrs.iter().enumerate() {
             let i = bi.instr;
-            if (n != 0
+            if n != 0
                 && (leaders.contains(&bi.pc)
-                    || instrs[n - 1].pc.wrapping_add(instrs[n - 1].size) != bi.pc))
-                || i.rd == base
+                    || instrs[n - 1].pc.wrapping_add(instrs[n - 1].size) != bi.pc)
             {
                 break;
             }
-            if matches!(i.op, Lb | Lbu | Lh | Lhu | Lw | Lwu | Ld) {
-                if i.rs1 != base {
+            if integer_memory(i.op) {
+                let (size, write) = mem_access(i.op).unwrap();
+                if i.rs1 != base
+                    || (!write && base != 0 && i.rd == base)
+                    || (write && !self.env.inline_stores)
+                {
                     break;
                 }
-                let size = mem_access(i.op).unwrap().0 as i32;
+                let size = size as i32;
                 let next_lo = lo.min(i.imm);
                 let next_hi = hi.max(i.imm + size - 1);
-                if next_hi - next_lo >= 4096 {
+                let mask = size - 1;
+                let bits = (-i.imm) & mask;
+                let compatible = alignment_possible && (align_bits ^ bits) & align_mask & mask == 0;
+                if next_hi - next_lo >= 4096 || ((writes != 0 || write) && !compatible) {
                     break;
                 }
+                alignment_possible = compatible;
+                align_bits |= bits;
+                align_mask |= mask;
                 (lo, hi) = (next_lo, next_hi);
-                reads += 1;
+                if write {
+                    writes += 1;
+                } else {
+                    reads += 1;
+                }
                 end = n + 1;
-            } else if !read_alu(i.op) {
+            } else if !read_alu(i.op) || (base != 0 && i.rd == base) {
                 break;
             }
         }
-        if reads < 2 {
+        if reads + writes < 2 {
             return 0;
         }
         self.count();
         self.get(DI, base);
+        let slow = self.a.label();
+        if writes != 0 && align_mask != 0 {
+            self.a.mov(AX, DI);
+            self.a.alu(4, AX, align_mask, true);
+            self.a.alu(7, AX, align_bits, true);
+            self.a.branch(Some(5), slow);
+        }
         self.a.lea(SI, DI, lo);
         self.a.lea(DX, DI, hi);
         self.a.alu(4, DX, !0xfff, true);
-        let slow = self.a.label();
         // The index of the first address is part of this range guard:
         // comparing the last page with a predicted slot alone could
         // accept a range whose first address is on another page.
-        self.translation(None, false, slow);
-        self.read_exits.push((slow, instrs[0].pc));
+        self.tlb_lookup(writes != 0, writes != 0 && reads != 0, slow);
+        let done = self.a.label();
+        self.access_fallbacks
+            .push((slow, Some(done), instrs[0].pc, instrs[end - 1].pc));
         self.a.rr(&[0x01], DI, AX, true);
-        // On a miss, return *before* the first read, not with a fault
-        // for a later read. The interpreter refills and preserves order.
+        let mut reservation_cleared = false;
         for bi in &instrs[..end] {
             self.pending_count += 1;
-            if matches!(bi.instr.op, Lb | Lbu | Lh | Lhu | Lw | Lwu | Ld) {
-                self.load_value(bi.instr.op, DI, None, bi.instr.imm);
-                self.set(bi.instr.rd);
+            let i = bi.instr;
+            if integer_memory(i.op) {
+                let (size, write) = mem_access(i.op).unwrap();
+                if write {
+                    let value = self.operand(i.rs2, AX);
+                    if size == 2 {
+                        self.a.bytes(&[0x66]);
+                    }
+                    self.a.mem(
+                        &[if size == 1 { 0x88 } else { 0x89 }],
+                        value,
+                        DI,
+                        i.imm,
+                        size == 8,
+                    );
+                    if !reservation_cleared {
+                        self.a.mem(&[0xc6], 0, CPU, OFS_RESV, false);
+                        self.a.bytes(&[0]);
+                        reservation_cleared = true;
+                    }
+                } else {
+                    self.load_value(i.op, DI, None, i.imm);
+                    self.set(i.rd);
+                }
             } else {
                 self.instr(bi, None);
             }
         }
+        self.a.bind(done);
         end
     }
 
@@ -1056,11 +1203,11 @@ impl Emitter {
             self.tlb_exits.push((generic, fast, slow));
             self.specialized_loads += 1;
         } else {
-            self.tlb_lookup(write, slow);
+            self.tlb_lookup(write, false, slow);
         }
     }
 
-    fn tlb_lookup(&mut self, write: bool, slow: usize) {
+    fn tlb_lookup(&mut self, write: bool, both: bool, slow: usize) {
         let tlb = if self.env.host_mmap {
             self.a.load(CX, CPU, OFS_JIT_TLB);
             CX
@@ -1079,6 +1226,11 @@ impl Emitter {
             true,
         );
         self.a.branch(Some(5), slow);
+        if both {
+            self.a
+                .mem_indexed(&[0x39], DX, tlb, Some(AX), JTLB_TAG_R, true);
+            self.a.branch(Some(5), slow);
+        }
         self.a
             .mem_indexed(&[0x8b], AX, tlb, Some(AX), JTLB_DELTA, true);
     }

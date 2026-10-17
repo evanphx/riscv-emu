@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Node hot loop: RISC-V to x86-64</title>
+<style>
+:root{color-scheme:light dark;--bg:#fff;--surface:#f6f7f9;--text:#1b1f27;--muted:#5d6675;--border:#e1e4ea;--accent:#2f5fd0;--selected:#eaf0fd}
+@media(prefers-color-scheme:dark){:root{--bg:#14161a;--surface:#1c1f25;--text:#e7e9ee;--muted:#9ba3b1;--border:#2c313a;--accent:#8fb0ff;--selected:#1e2a47}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:13px/1.55 system-ui,sans-serif}main{max-width:1440px;margin:auto;padding:28px 24px 80px}h1{font-size:20px;font-weight:500;margin:0 0 8px}h2{font-size:13px;font-weight:500;margin:0}p{margin:6px 0 14px;color:var(--muted)}code,button{font-family:ui-monospace,monospace;font-size:12px}figure{margin:0}.panes{display:grid;grid-template-columns:minmax(330px,1fr) minmax(350px,1.3fr);gap:16px}.pane{min-width:0;border:1px solid var(--border);border-radius:8px;overflow:hidden}.heading{padding:10px 12px;background:var(--surface);display:flex;justify-content:space-between}.listing{height:560px;overflow:auto;padding:6px 0;scroll-padding:90px}button.line{display:block;white-space:pre;text-align:left;width:100%;border:0;background:transparent;color:var(--text);padding:4px 12px;cursor:pointer;min-height:27px}button.line.active{background:var(--selected);color:var(--accent)}button:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}@media(hover:hover){button.line:hover{background:var(--surface);color:var(--accent)}}.address{color:var(--muted)}#selection{min-height:48px;border-top:1px solid var(--border);padding:10px 0;margin-top:14px}summary{cursor:pointer}details{margin-top:18px}#registers{white-space:normal}#metrics{font-variant-numeric:tabular-nums}@media(max-width:750px){main{padding:18px 12px 80px}.panes{grid-template-columns:1fr}.listing{height:310px}}
+</style>
+<main>
+<h1>Inside Node’s translated integer loop</h1>
+<p id="metrics"></p>
+<p id="profile"></p>
+<p id="instructions">Hover, click, or focus a RISC-V line to highlight its emitted x86-64 range. Click locks selection; Escape unlocks it. Links work in both directions.</p>
+<figure id="assembly"><div class="panes">
+<section class="pane"><div class="heading"><h2>RISC-V</h2><span>Guest virtual address</span></div><div class="listing" id="guest" aria-label="RISC-V instructions"></div></section>
+<section class="pane"><div class="heading"><h2>x86-64 · Intel syntax</h2><span>Block-relative offset</span></div><div class="listing" id="native" aria-label="x86-64 instructions"></div></section>
+</div><figcaption id="selection" aria-live="polite"></figcaption></figure>
+<details open id="mapping"><summary>How to read the mapping</summary>
+<p>Ranges are recorded by the direct emitter during compilation. Fused pairs and grouped reads share a range. A loop-entry range can include a hoisted translation used by later reads. Retirement accounting at a boundary belongs to that emission range, not necessarily to the selected guest instruction alone. Empty ranges mean no host bytes were emitted.</p>
+<p>Entry register loads and out-of-line slow paths, side exits, chaining, and return code are shared infrastructure, not one-to-one instruction translations. They remain visible but are labeled separately. This is generated code, not a dynamic instruction trace.</p></details>
+<details id="abi"><summary>Register allocation and reproduction</summary><p id="registers"></p>
+<p>r12 = Cpu, r13 = retired count, r14 = entry guest PC, rbp = TLB base (or mmap bias). Other host registers are temporaries. Cpu-relative loads/stores access emulator state; not every host memory operand is a guest memory access.</p>
+<p>Capture with <code>RSEMU_DIRECT_DUMP=/tmp/blocks</code> and <code>-jit-backend direct</code>. Rebuild this app with <code>python3 scripts/jit-view.py /tmp/blocks/PC.json --output viewer.html</code>. GNU objdump and riscv64-linux-gnu-objdump are required.</p></details>
+<p id="provenance">This page renders one compiler dump. Profile context is supplied with the captured analysis; no performance is inferred from static instruction counts.</p>
+</main>
+<script>
+{
+const data=/*DATA*/null;
+if(!data){document.getElementById('metrics').textContent='Generate this page with scripts/jit-view.py.';}else{
+const guest=document.getElementById('guest'), native=document.getElementById('native'), selection=document.getElementById('selection');
+const hex=n=>n.toString(16).padStart(4,'0');
+const owners=data.native.map(row=>data.spans.findIndex(s=>s.start<=row.offset&&row.offset<s.end));
+let locked=false;
+function line(parent,text,index,kind){const b=document.createElement('button');b.className='line';b.textContent=text;b.dataset.group=index;b.dataset.kind=kind;b.setAttribute('aria-pressed','false');parent.append(b);return b;}
+for(const row of data.guest){const group=data.spans.findIndex(s=>s.pcs.includes(row.pc));line(guest,row.pc+'  '+row.text,group,'guest');}
+data.native.forEach((row,i)=>{const b=line(native,'+'+hex(row.offset)+'  '+row.text,owners[i],'native');b.dataset.offset=row.offset;});
+function show(group,origin,scroll=true){
+ const related=group<0?[]:(data.hoists||[]).filter(h=>h.pcs.some(pc=>data.spans[group].pcs.includes(pc)));
+ document.querySelectorAll('.line').forEach(b=>{const active=group>=0&&(Number(b.dataset.group)===group||(b.dataset.kind==='native'&&related.some(h=>h.start<=Number(b.dataset.offset)&&Number(b.dataset.offset)<h.end)));b.classList.toggle('active',active);b.setAttribute('aria-pressed',String(active));});
+ if(group<0){selection.textContent='Shared infrastructure: block entry or out-of-line exits, helpers, chaining and return. No single guest owner.';return;}
+ const s=data.spans[group], rows=data.native.filter(r=>s.start<=r.offset&&r.offset<s.end);
+ selection.textContent=(locked?'Locked · ':'')+s.pcs.map(p=>'0x'+p).join(' + ')+' → +'+hex(s.start)+'…+'+hex(s.end)+' (exclusive); '+rows.length+' host instructions, '+(s.end-s.start)+' bytes'+(s.pcs.length>1?' · shared emission group':'')+related.map(h=>' · also highlights loop-entry translation +'+hex(h.start)+'…+'+hex(h.end)).join('');
+ if(scroll){const pane=origin==='guest'?native:guest;const target=pane.querySelector('[data-group="'+group+'"]');if(target)pane.scrollTop=target.offsetTop-pane.offsetTop-54;}
+}
+document.querySelectorAll('.line').forEach(b=>{
+ b.addEventListener('pointerover',()=>{if(!locked)show(Number(b.dataset.group),b.dataset.kind);});
+ b.addEventListener('focus',()=>{if(!locked)show(Number(b.dataset.group),b.dataset.kind);});
+ b.addEventListener('click',()=>{locked=true;show(Number(b.dataset.group),b.dataset.kind);});
+ b.addEventListener('keydown',e=>{if(e.key==='Escape'){locked=false;show(Number(b.dataset.group),b.dataset.kind,false);}if(e.key==='ArrowDown'||e.key==='ArrowUp'){e.preventDefault();(e.key==='ArrowDown'?b.nextElementSibling:b.previousElementSibling)?.focus();}});
+});
+document.getElementById('metrics').textContent='Block 0x'+data.pc+' · '+(data.host_mmap?'direct-mmap':'direct / software TLB')+' · '+data.guest.length+' guest instructions · '+data.native.length+' total host instructions · '+data.code.length+' native bytes';
+document.getElementById('profile').textContent=data.profile_note||'';
+const names=['rax','rcx','rdx','rbx','rsp','rbp','rsi','rdi','r8','r9','r10','r11','r12','r13','r14','r15'];
+document.getElementById('registers').textContent=data.registers.flatMap((r,i)=>r===null?[]:['x'+i+' → '+names[r]]).join('; ');
+show(0,'guest');
+}
+}
+</script></html>

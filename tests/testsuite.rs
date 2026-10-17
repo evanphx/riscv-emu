@@ -449,9 +449,11 @@ fn direct_mmap_reads_follow_remaps_and_permissions() {
 fn direct_mmap_proven_alignment_preserves_loads_and_stores() {
     // Mask an unknown base, add a shifted index, then use both aligned
     // addresses and an unaligned base with a compensating negative offset.
-    let words: [u32; 10] = [
-        0xff847413, 0x00359593, 0x00b40433, 0x01840413, 0x00a43023, 0x00043283, 0xfff40413,
-        0xfea42ea3, 0xffd42303, 0x0004b383,
+    // Different base registers keep these as standalone mmap accesses,
+    // rather than replacing the alignment checks with a shared RAM guard.
+    let words: [u32; 11] = [
+        0xff847413, 0x00359593, 0x00b40433, 0x01840413, 0x00040613, 0x00a43023, 0x00063283,
+        0xfff40413, 0xfea42ea3, 0xffc62303, 0x0004b383,
     ];
     for backend in ["", "direct", "direct-mmap"] {
         for opt in [false, true] {
@@ -473,7 +475,7 @@ fn direct_mmap_proven_alignment_preserves_loads_and_stores() {
                 cpu.x[7] = 107;
                 cpu.trap_handler = Some(Box::new(|_, trap| {
                     assert_eq!(trap.cause, isa::CAUSE_LOAD_PAGE_FAULT);
-                    assert_eq!(trap.pc, RAM_BASE + 36);
+                    assert_eq!(trap.pc, RAM_BASE + 40);
                     assert_eq!(trap.tval, RAM_BASE + 0x4000);
                     Err("expected fault".into())
                 }));
@@ -490,7 +492,7 @@ fn direct_mmap_proven_alignment_preserves_loads_and_stores() {
                 assert_eq!(cpu.x[6], 0xffff_ffff_89ab_cdef);
                 assert_eq!(cpu.x[7], 107);
                 assert_eq!(cpu.x[8], RAM_BASE + address - 1);
-                assert_eq!(cpu.instret, 10);
+                assert_eq!(cpu.instret, 11);
                 if backend == "direct-mmap" {
                     assert!(cpu.jit_stats().unwrap().elided_alignment_guards >= 4);
                 }
@@ -574,7 +576,13 @@ fn direct_mmap_stores_follow_permissions_and_dirty_bits() {
             let satp = Satp::new(SATP_MODE_SV39, root);
             mmu::set_map_sv39(&mem, satp, 4, code, PTE_R | PTE_X).unwrap();
             mmu::set_map_sv39(&mem, satp, 8, data, PTE_R | PTE_W | PTE_U).unwrap();
-            let words = [0x00a43023u32, 0x18a4332f, 0x00043283, 0x0004b303]; // sd; sc.d; ld; fault
+            let words = [
+                0x00a43023u32,
+                0x00a43423,
+                0x18a4332f,
+                0x00043283,
+                0x0004b303,
+            ]; // sd; sd; sc.d; ld; fault
             mem.write_bytes(
                 mem.page_offset_of(code).unwrap(),
                 &words
@@ -629,14 +637,14 @@ fn direct_mmap_stores_follow_permissions_and_dirty_bits() {
                             isa::CAUSE_LOAD_PAGE_FAULT
                         }
                     );
-                    assert_eq!(trap.pc, if denied { 0x4000 } else { 0x400c });
+                    assert_eq!(trap.pc, if denied { 0x4000 } else { 0x4010 });
                     assert_eq!(trap.tval, address);
                     Err("expected fault".into())
                 }));
                 let old = mem.read_u64(mem.page_offset_of(data).unwrap());
                 let before = cpu.instret;
                 assert_eq!(cpu.run().unwrap_err(), "expected fault");
-                assert_eq!(cpu.instret - before, if denied { 1 } else { 4 });
+                assert_eq!(cpu.instret - before, if denied { 1 } else { 5 });
                 assert_eq!(
                     mem.read_u64(mem.page_offset_of(data).unwrap()),
                     if denied { old } else { 83 + phase }
@@ -644,6 +652,10 @@ fn direct_mmap_stores_follow_permissions_and_dirty_bits() {
                 if !denied {
                     assert_eq!(cpu.x[6], 1, "store must invalidate LR/SC reservation");
                     assert_eq!(cpu.x[5], 83 + phase);
+                    assert_eq!(
+                        mem.read_u64(mem.page_offset_of(data).unwrap() + 8),
+                        83 + phase
+                    );
                     assert_ne!(mem.read_u64(leaf) & PTE_D as u64, 0);
                 }
                 // A rejected cross-page store must not write its first bytes.
@@ -672,8 +684,11 @@ fn direct_mmap_stores_invalidate_code_through_evicted_aliases() {
             let new = 0x0004b303_02700293u64; // addi x5,zero,39; unmapped ld
             mem.write_bytes(
                 mem.page_offset_of(writer).unwrap(),
-                &0x0004b303_00a43023u64.to_le_bytes(),
-            ); // sd x10,0(x8); unmapped ld
+                &[0x00a43023u32, 0x00a43423, 0x0004b303]
+                    .iter()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect::<Vec<_>>(),
+            ); // sd x10,0(x8); sd x10,8(x8); unmapped ld
             let mut cpu = Cpu::new(mem.clone());
             cpu.set_mode(Mode::S);
             cpu.set_satp(satp);
@@ -755,6 +770,100 @@ fn direct_memory_fast_and_slow_paths() {
             expected[5..9].copy_from_slice(&0x89ab_cdefu32.to_le_bytes());
             expected[15..23].copy_from_slice(&0x1234_5678_9abc_def1u64.to_le_bytes());
             assert_eq!(actual, expected);
+        }
+    }
+}
+
+#[cfg(feature = "jit")]
+#[test]
+fn direct_grouped_stores_preserve_order_and_reservations() {
+    let store = |value: u32, offset: i32| {
+        let imm = offset as u32 & 0xfff;
+        ((imm >> 5) << 25) | (value << 20) | (8 << 15) | (3 << 12) | ((imm & 31) << 7) | 0x23
+    };
+    // A frame spill, arithmetic, reload and dependent spill/reload. Reuse
+    // the compiled group with an unaligned base, a mapped page-crossing
+    // range, or a later faulting store.
+    let words = [
+        store(12, -80),
+        0x00160613, // addi x12,x12,1: reload must see the preceding store's old value
+        0xfb043283,
+        store(5, -88),
+        0xfa843303,
+        0xfff50513,
+        0xfe0514e3,
+        0x00048413,
+        0x00200513,
+        0xfff58593,
+        0xfc059ce3,
+        0x00093a03,
+    ];
+    for backend in ["", "direct", "direct-mmap"] {
+        for opt in [false, true] {
+            for offset in [0x20d0, 0x20d4, 0x3050, 80] {
+                let crosses = offset == 80;
+                let mem = backend_ram(backend, 0x4000);
+                mem.write_bytes(
+                    0x1000,
+                    &words
+                        .iter()
+                        .flat_map(|v| v.to_le_bytes())
+                        .collect::<Vec<_>>(),
+                );
+                let mut cpu = Cpu::new(mem.clone());
+                cpu.pc = RAM_BASE + 0x1000;
+                cpu.x[8] = RAM_BASE + 0x20d0;
+                cpu.x[9] = RAM_BASE + offset;
+                cpu.x[10] = 20;
+                cpu.x[11] = 2;
+                cpu.x[12] = 0xfedc_ba98_7654_3210;
+                cpu.x[18] = RAM_BASE + 0x4000;
+                cpu.reservation_valid = true;
+                cpu.reservation = RAM_BASE + 0x2080;
+                cpu.instret_limit = 1000;
+                cpu.trap_handler = Some(Box::new(move |_, trap| {
+                    assert_eq!(trap.pc, RAM_BASE + 0x1000 + if crosses { 12 } else { 44 });
+                    assert_eq!(
+                        trap.tval,
+                        if crosses {
+                            RAM_BASE - 8
+                        } else {
+                            RAM_BASE + 0x4000
+                        }
+                    );
+                    assert_eq!(
+                        trap.cause,
+                        if crosses {
+                            isa::CAUSE_STORE_PAGE_FAULT
+                        } else {
+                            isa::CAUSE_LOAD_PAGE_FAULT
+                        }
+                    );
+                    Err("expected fault".into())
+                }));
+                if !backend.is_empty() {
+                    cpu.enable_jit(1, 0).unwrap();
+                    cpu.set_jit_backend(backend).unwrap();
+                    cpu.set_jit_optimize(opt);
+                }
+                assert_eq!(cpu.run().unwrap_err(), "expected fault");
+                assert_eq!(
+                    cpu.x[12],
+                    0xfedc_ba98_7654_3210 + if crosses { 21 } else { 22 }
+                );
+                assert_eq!(cpu.x[5], cpu.x[12] - 1);
+                assert_eq!(cpu.x[6], cpu.x[12] - if crosses { 2 } else { 1 });
+                let count = if crosses { 148 } else { 163 };
+                assert_eq!((cpu.instret, cpu.time), (count, count));
+                assert!(!cpu.reservation_valid);
+                let mut bytes = [0; 8];
+                mem.read_bytes(offset - 80, &mut bytes);
+                assert_eq!(u64::from_le_bytes(bytes), cpu.x[12] - 1);
+                if !crosses {
+                    mem.read_bytes(offset - 88, &mut bytes);
+                    assert_eq!(u64::from_le_bytes(bytes), cpu.x[12] - 1);
+                }
+            }
         }
     }
 }
@@ -909,8 +1018,9 @@ fn direct_profiled_read_group_checks_both_pages() {
 #[test]
 fn direct_loop_reads_revalidate_on_reentry() {
     // Each inner loop crosses the JIT timeslice limit. The outer loop
-    // changes the base before entering that same header again. A range
-    // miss must preserve the header arithmetic and individual fault order.
+    // changes the base before entering that same header again. Mapped
+    // page-crossing ranges must keep running; unmapped ranges must preserve
+    // the header arithmetic and individual fault order.
     let words: [u32; 12] = [
         0x00138393, // addi x7,x7,1
         0x01100463, // beq x0,x17,+8: optionally skip the first read
@@ -927,13 +1037,16 @@ fn direct_loop_reads_revalidate_on_reentry() {
     ];
     for backend in ["", "cranelift", "direct", "direct-mmap"] {
         for opt in [false, true] {
-            for (crosses, skip, inner_entry) in [
-                (false, false, false),
-                (true, false, false),
-                (false, true, false),
-                (true, true, false),
-                (false, false, true),
+            for (base, skip, inner_entry) in [
+                (0x2fe0, false, false),
+                (0x2ff0, false, false),
+                (0x2fe0, true, false),
+                (0x2ff0, true, false),
+                (0x2fe0, false, true),
+                (0x1ff8, false, false),
+                (0x1ff8, true, false),
             ] {
+                let crosses = base == 0x2ff0;
                 let mem = backend_ram(backend, 0x3000);
                 let mut program = Vec::new();
                 if inner_entry {
@@ -949,14 +1062,20 @@ fn direct_loop_reads_revalidate_on_reentry() {
                         .flat_map(|v| v.to_le_bytes())
                         .collect::<Vec<_>>(),
                 );
-                for (offset, value) in [(0x2000, 17u64), (0x2010, 39), (0x2fe0, 83), (0x2ff0, 107)]
-                {
+                for (offset, value) in [
+                    (0x2000, 17u64),
+                    (0x2010, 39),
+                    (0x2fe0, 83),
+                    (0x2ff0, 107),
+                    (0x1ff8, 131),
+                    (0x2008, 157),
+                ] {
                     mem.write_bytes(offset, &value.to_le_bytes());
                 }
                 let mut cpu = Cpu::new(mem);
                 cpu.pc = RAM_BASE;
                 cpu.x[8] = RAM_BASE + 0x2000;
-                cpu.x[9] = RAM_BASE + if crosses { 0x2ff0 } else { 0x2fe0 };
+                cpu.x[9] = RAM_BASE + base;
                 cpu.x[10] = 5000;
                 cpu.x[11] = 2;
                 cpu.x[13] = 5000;
@@ -982,11 +1101,22 @@ fn direct_loop_reads_revalidate_on_reentry() {
                         0
                     } else if crosses {
                         107
+                    } else if base == 0x1ff8 {
+                        131
                     } else {
                         83
                     }
                 );
-                assert_eq!(cpu.x[6], if crosses { 39 } else { 107 });
+                assert_eq!(
+                    cpu.x[6],
+                    if crosses {
+                        39
+                    } else if base == 0x1ff8 {
+                        157
+                    } else {
+                        107
+                    }
+                );
                 let headers = if crosses { 5001 } else { 10000 };
                 assert_eq!(cpu.x[7], headers - u64::from(inner_entry));
                 assert_eq!(
@@ -995,6 +1125,8 @@ fn direct_loop_reads_revalidate_on_reentry() {
                         0
                     } else if crosses {
                         85000
+                    } else if base == 0x1ff8 {
+                        740000
                     } else {
                         500000
                     }
