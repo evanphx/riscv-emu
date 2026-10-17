@@ -189,24 +189,21 @@ impl Cpu {
         if self.translate(lo, access).is_err() {
             return false;
         }
-        if self.data_mode == Mode::M || self.satp.mode() == SATP_MODE_BARE {
-            self.jit_fill_bare(lo);
-        } else {
-            let e = self.tlb[((lo >> 12) & 0xfff) as usize];
-            if e.tag != TlbEntry::tag(lo, self.data_key) {
-                return false;
-            }
-            self.jit_tlb_fill(lo, self.data_key, e.page, e.flags);
-        }
+        self.jit_fill_data(lo);
         self.jtlb_host(lo, hi - lo + 1, write).is_some()
     }
 
-    /// Fills the compiled code TLB entry of the data address vaddr if
-    /// data accesses are not translated, so that compiled code accesses
-    /// the page directly from then on.
-    pub(super) fn jit_fill_bare(&mut self, vaddr: u64) {
+    /// Refills the compiled code TLB after a successful data access or
+    /// probe. A generic TLB hit does not walk or refill the JIT TLB,
+    /// which can be invalidated or replaced independently.
+    fn jit_fill_data(&mut self, vaddr: u64) {
         if self.data_mode == Mode::M || self.satp.mode() == SATP_MODE_BARE {
             self.jit_tlb_fill(vaddr, self.data_key, vaddr & !0xfff, PTE_R | PTE_W | PTE_D);
+        } else {
+            let e = self.tlb[((vaddr >> 12) & 0xfff) as usize];
+            if e.tag == TlbEntry::tag(vaddr, self.data_key) {
+                self.jit_tlb_fill(vaddr, self.data_key, e.page, e.flags);
+            }
         }
     }
 
@@ -232,7 +229,10 @@ impl Cpu {
         let writable = flags & PTE_W != 0
             && flags & PTE_D != 0
             && !self.jit_code_page(ofs)
-            && !self.overlay.as_ref().is_some_and(|o| o.overlaps(page4k, 0x1000));
+            && !self
+                .overlay
+                .as_ref()
+                .is_some_and(|o| o.overlaps(page4k, 0x1000));
         self.jtlb[idx] = JitTlbEntry {
             tag_r: if flags & PTE_R != 0 { tag } else { u64::MAX },
             tag_w: if writable { tag } else { u64::MAX },
@@ -501,7 +501,7 @@ impl Cpu {
         if memory::avail(vaddr, size) {
             let paddr = self.translate(vaddr, ACCESS_READ)?;
             let v = self.phys_load(vaddr, paddr, size)?;
-            self.jit_fill_bare(vaddr);
+            self.jit_fill_data(vaddr);
             return Ok(v);
         }
         self.load_split(vaddr, size)
@@ -543,7 +543,7 @@ impl Cpu {
         if memory::avail(vaddr, size) {
             let paddr = self.translate(vaddr, ACCESS_WRITE)?;
             self.phys_store(vaddr, paddr, size, v)?;
-            self.jit_fill_bare(vaddr);
+            self.jit_fill_data(vaddr);
             return Ok(());
         }
         self.store_split(vaddr, size, v)

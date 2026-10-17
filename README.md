@@ -504,19 +504,26 @@ Interpreter-observed stable loads can predict a fixed TLB slot, reducing
 the predicted-hit load path to 10 instructions. This is a guarded hint:
 the actual address must match the live read tag, and a prediction miss
 tries the generic inline TLB lookup before calling a helper.
-Straight-line reads of an unchanged base can share one checked RAM-page
-translation, including across nonfaulting integer arithmetic. Stores,
-helpers, base writes and branch entries end a group. A failed range guard
-returns before the first read, preserving individual read/fault order in
-the interpreter. MMIO and cross-page groups do not use this fast path.
+Straight-line integer loads and stores through an unchanged base can share
+one checked RAM-page translation, including across nonfaulting integer
+arithmetic. Helpers, other memory bases, base writes and branch entries
+end a group. Store groups validate alignment and the write tag; mixed
+groups validate both read and write tags. Stores use the translated base
+directly and clear the LR/SC reservation once per group. A failed guard
+runs an out-of-line compiled copy with individually checked accesses.
+Ordinary misses refill through the existing helpers and resume compiled
+code; MMIO, protected/code pages, unaligned stores and cross-page groups
+retain precise individual access handling and fault order.
 Single-entry read-only loops whose reads all use one invariant base can
 also hoist that guard and translation above their backedge. Conditional
 branches and side exits are allowed, but stores, helpers, CSRs, fences and
 external entries into the middle reject hoisting. The translated base
 stays in RDI without reducing the six cached guest registers. Actual
 reads still occur on every iteration. Re-entry and the existing 4096-guest-
-instruction timeslice limit run the guard again; a guard miss interprets
-from the header instead of raising a speculative fault.
+instruction timeslice limit run the guard again. A guard miss runs a
+separately checked compiled loop, including its header arithmetic and
+conditional reads, rather than raising a speculative fault or interpreting
+the loop. Its local backedges cannot enter the unchecked hoisted body.
 It emits integer arithmetic, branches, memory accesses and FP loads,
 stores and moves directly; other supported instructions call the same
 interpreter/soft-float helpers as the Cranelift backend. No Cranelift
@@ -727,6 +734,71 @@ Its source and raw results are in
 `.amp/in/artifacts/loop-hoist-microbenchmark.json`. Static diagnostic
 summaries are in `.amp/in/artifacts/loop-hoist-diagnostics.txt`; temporary
 checkpoint logging was removed before the timed runs.
+
+### Linked guest/host assembly viewer
+
+Set `RSEMU_DIRECT_DUMP=/tmp/blocks` when running the direct backend with
+a fresh JIT cache. Newly compiled Sv39 user blocks are written as
+`PC.json`, containing guest instructions, native bytes, cached-register
+assignments, emission ranges and hoisted-translation dependencies. This
+is opt-in diagnostic output, not a performance mode. A later compilation
+at the same PC replaces its dump; cached blocks are not dumped again.
+
+Build a self-contained app with GNU `objdump` and
+`riscv64-linux-gnu-objdump` installed:
+
+```shell
+python3 scripts/jit-view.py /tmp/blocks/PC.json --output viewer.html
+```
+
+Hover or focus either assembly listing to highlight its corresponding
+range; click locks it, Escape unlocks, and arrow keys move between lines.
+Fused instructions share a range. Selecting a hoisted load also highlights
+its loop-entry translation. Entry setup and out-of-line exits/helpers are
+shared infrastructure rather than falsely attributed to one instruction.
+Retirement accounting is included in the boundary's emitted range.
+
+### Shared translations and compiled guard fallbacks
+
+Frame spills through the same base now share a guard and translation.
+Rejected groups execute individually checked compiled accesses, and
+rejected invariant-loop guards enter a scalar compiled loop. Only actual
+guest faults take the fault exit; a guard failure does not interpret the
+group or speculatively repeat accesses. Scalar fallbacks account precisely
+at each fault site, then undo their local count on success before rejoining
+the existing fast-path retirement batch. All added count bookkeeping is cold.
+
+The mmap experiments remain separate on `experiment/host-mmap` and
+`experiment/mmap-guards`; this backend uses software JIT TLB translations,
+not host virtual-address aliases or SIGSEGV recovery.
+
+Earlier shared-store experiments had mixed Node results. The subsequent
+compiled-fallback experiment improved JSON/crypto time through exit from
+2.359 to 2.148 s over six alternating fresh-cache trials per variant.
+Raw trials and reproduction harnesses are in
+`.amp/in/artifacts/store-groups-bench.json` and
+`.amp/in/artifacts/compiled-fallback-batched.json`. Those captures were made
+with ordinary `direct` on the experimental branch; they are not new
+measurements of this mmap-free branch. Shared-host timings are exploratory.
+
+### JIT TLB refill
+
+Successful slow data reads, writes and range probes refill the JIT TLB
+from the current-key interpreter translation even when no page walk was
+needed. The existing fill routine retains permissions, dirty-bit checks,
+code-write invalidation and store-overlay restrictions. The inline hit
+path is unchanged.
+
+Six alternating trials on the experimental branch's ordinary `direct`
+backend reduced command-only Node startup from 1.048 to 0.890 s and
+JSON/crypto from 1.827 to 1.479 s. Linux/agent readiness including base
+saving was 3.7% slower; warmed integer performance was approximately
+unchanged, and the array-write hot interval was 2.1% slower. Separate
+instrumented JSON/crypto runs reduced memory-helper calls from 9–23 million
+to about 89,000. These are not a universal speedup or measurements of the
+mmap-free branch. Raw timings, hashes, commands and diagnostics are in
+`.amp/in/artifacts/jit-tlb-refill-bench.json` and
+`.amp/in/artifacts/jit-tlb-refill-diagnostics.json`.
 
 ### Precompiling the kernel
 
