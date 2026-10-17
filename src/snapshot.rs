@@ -359,6 +359,18 @@ impl Snapshot {
         .map_err(|e| format!("{}: mapping RAM: {}", self.path.display(), e))
     }
 
+    /// Experimental coherent RAM, copied from snapshot extents. It does
+    /// not claim to retain the private-COW incremental-save optimization.
+    pub fn memory_shared(&self) -> Result<Memory, String> {
+        Memory::from_file_shared(
+            self.header.ram_base,
+            self.header.ram_size,
+            &self.file,
+            RAM_OFFSET,
+        )
+        .map_err(|e| format!("{}: shared RAM: {}", self.path.display(), e))
+    }
+
     /// Restores the CPU and device state. The CPU must have been
     /// created with the memory from [`Snapshot::memory`] and the
     /// devices of the saved configuration.
@@ -488,6 +500,14 @@ pub fn save(
                 file.set_len(RAM_OFFSET + mem.size())?;
                 let pages = write_pages(&file, ram, |page| {
                     pm.touched(page) && !is_zero(page_data(ram, page))
+                })?;
+                (false, pages)
+            }
+            (_, _, Backing::Shared) => {
+                file.set_len(RAM_OFFSET + mem.size())?;
+                let allocated = mem.shared_pages()?;
+                let pages = write_pages(&file, ram, |page| {
+                    allocated[page] && !is_zero(page_data(ram, page))
                 })?;
                 (false, pages)
             }
@@ -710,6 +730,20 @@ mod tests {
         let snap = Snapshot::open(&path).unwrap();
         let mem3 = snap.memory().unwrap();
         // SAFETY: the CPU is not running.
+        assert!(unsafe { cpu.mem.ram() == mem3.ram() });
+
+        // Shared RAM must preserve restored pages even when they have
+        // never been accessed through the canonical mapping.
+        let mut shared = machine(snap.memory_shared().unwrap());
+        snap.restore(&mut shared).unwrap();
+        fill(&shared.mem, 5000, 0);
+        fill(&shared.mem, 7777, 0xcc);
+        let stats = save(&path, &mut shared, &meta, Some(&snap)).unwrap();
+        assert!(!stats.incremental);
+        assert_eq!(stats.pages, data.len() as u64 + 1);
+        let saved = Snapshot::open(&path).unwrap().memory().unwrap();
+        assert!(unsafe { shared.mem.ram() == saved.ram() });
+        // Replacing the snapshot must not change its original mapping.
         assert!(unsafe { cpu.mem.ram() == mem3.ram() });
         std::fs::remove_file(&path).unwrap();
     }

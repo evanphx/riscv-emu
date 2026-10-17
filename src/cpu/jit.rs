@@ -53,6 +53,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 mod direct;
+pub(super) mod hostmap;
 
 /// Compiled block entry point. Cranelift uses its tail convention with
 /// (cpu: *mut Cpu, count: u64); direct uses the ABI in direct.rs. Count
@@ -154,6 +155,9 @@ pub struct JitStats {
     pub specialized_loads: u64,
     /// Direct loops emitted with a translation guard outside the backedge.
     pub hoisted_read_loops: u64,
+    pub mmap_faults: u64,
+    pub mmap_fills: u64,
+    pub mmap_flushes: u64,
     pub invalidated: u64,
     /// Calls from the dispatcher into compiled code.
     pub dispatches: u64,
@@ -188,6 +192,13 @@ impl std::fmt::Display for JitStats {
         }
         if self.hoisted_read_loops > 0 {
             write!(f, ", {} hoisted read loops", self.hoisted_read_loops)?;
+        }
+        if self.mmap_fills > 0 || self.mmap_faults > 0 {
+            write!(
+                f,
+                ", {} mmap fills, {} mmap flushes, {} host memory faults",
+                self.mmap_fills, self.mmap_flushes, self.mmap_faults
+            )?;
         }
         if self.load_profile_samples > 0 {
             write!(
@@ -400,6 +411,7 @@ impl Hasher for FxHasher {
 struct CodePages<'a> {
     mem: &'a crate::memory::Memory,
     jtlb: &'a mut [JitTlbEntry],
+    host_map: Option<&'a mut hostmap::HostMap>,
     /// Host address of RAM offset 0.
     ram: u64,
 }
@@ -409,6 +421,9 @@ impl CodePages<'_> {
     fn mark(&mut self, ofs: u64) {
         if !self.mem.mark_code(ofs) {
             return;
+        }
+        if let Some(map) = self.host_map.as_mut() {
+            map.protect_code(ofs & !0xfff);
         }
         let host = self.ram + (ofs & !0xfff);
         for e in self.jtlb.iter_mut() {
@@ -426,6 +441,7 @@ macro_rules! code_pages {
         &mut CodePages {
             mem: &$cpu.mem,
             jtlb: &mut $cpu.jtlb[..],
+            host_map: $cpu.jit_host_map.as_mut(),
             ram: $cpu.mem.ptr_at(0) as u64,
         }
     };
@@ -1737,6 +1753,7 @@ impl Worker {
 struct CodegenEnv {
     inline_stores: bool,
     direct: bool,
+    host_mmap: bool,
     /// Compile with Cranelift's optimizations. Optimized and
     /// unoptimized code are interchangeable, so this is not part of the
     /// code cache fingerprint.
@@ -1779,6 +1796,7 @@ const JENTRY_SHIFT: i64 = std::mem::size_of::<JEntry>().trailing_zeros() as i64;
 const _: () = assert!(std::mem::size_of::<JEntry>().is_power_of_two());
 
 const OFS_JIT_TLB: i32 = offset_of!(Cpu, jit_tlb_base) as i32;
+const OFS_MMAP_BIAS: i32 = offset_of!(Cpu, jit_mmap_bias) as i32;
 const JTLB_TAG_R: i32 = offset_of!(JitTlbEntry, tag_r) as i32;
 const JTLB_TAG_W: i32 = offset_of!(JitTlbEntry, tag_w) as i32;
 const JTLB_DELTA: i32 = offset_of!(JitTlbEntry, delta) as i32;
@@ -2150,7 +2168,11 @@ impl<'a, 'b> Translator<'a, 'b> {
     fn group_host(&mut self, k: u64, pc: u64, base: Value) -> Option<Value> {
         let &(id, off) = self.group_of.get(&pc)?;
         if self.groups[id].first_pc == pc {
-            let (lo, hi, write) = (self.groups[id].lo, self.groups[id].hi, self.groups[id].write);
+            let (lo, hi, write) = (
+                self.groups[id].lo,
+                self.groups[id].hi,
+                self.groups[id].write,
+            );
             let lo_v = self.b.ins().iadd_imm_s(base, lo);
             let hi_v = self.b.ins().iadd_imm_s(base, hi);
             let slow = self.b.create_block();
@@ -2361,10 +2383,7 @@ impl<'a, 'b> Translator<'a, 'b> {
         self.b.ins().brif(ok, fast, &[], slow, &[]);
 
         self.b.switch_to_block(fast);
-        let delta = self
-            .b
-            .ins()
-            .load(types::I64, f, ent, JTLB_DELTA);
+        let delta = self.b.ins().load(types::I64, f, ent, JTLB_DELTA);
         self.b.ins().iadd(addr, delta)
     }
 
@@ -3245,6 +3264,10 @@ impl Cpu {
     pub fn jit_stats(&self) -> Option<JitStats> {
         self.jit.as_ref().map(|j| {
             let mut stats = j.stats;
+            if let Some(map) = self.jit_host_map.as_ref() {
+                stats.mmap_fills = map.fills;
+                stats.mmap_flushes = map.flushes;
+            }
             for p in &j.load_profiles {
                 if p.samples >= LOAD_PROFILE_MIN_SAMPLES {
                     if p.polymorphic {
@@ -3447,7 +3470,13 @@ impl Cpu {
         let enter = self.jit.as_ref().unwrap().enter;
         // SAFETY: the block was compiled for this CPU's memory and TLB
         // layout and accesses the CPU only through the pointer.
-        let r = unsafe { enter(self as *mut Cpu, func) };
+        let r = unsafe {
+            if self.jit_host_map.is_some() {
+                hostmap::enter(self as *mut Cpu, func, enter)
+            } else {
+                enter(self as *mut Cpu, func)
+            }
+        };
         let count = r & 0xffff_ffff;
         self.time = self.time.wrapping_add(count);
         self.instret = self.instret.wrapping_add(count);
@@ -3485,6 +3514,7 @@ fn cache_fingerprint(env: CodegenEnv) -> Result<u64, String> {
     let mut h = FxHasher(fp);
     h.write_u64(env.inline_stores as u64);
     h.write_u64(env.direct as u64);
+    h.write_u64(env.host_mmap as u64);
     Ok(h.finish())
 }
 
@@ -3773,6 +3803,7 @@ impl Cpu {
         CodegenEnv {
             inline_stores: self.overlay.is_none(),
             direct: self.jit.as_ref().is_some_and(|j| j.direct),
+            host_mmap: self.jit_host_map.is_some(),
             optimize: self.jit.as_ref().is_some_and(|j| j.optimize),
         }
     }
@@ -3782,16 +3813,26 @@ impl Cpu {
     pub fn set_jit_backend(&mut self, backend: &str) -> Result<(), String> {
         let direct = match backend {
             "" | "cranelift" => false,
-            "direct" => true,
+            "direct" | "direct-mmap" => true,
             _ => return Err(format!("unknown JIT backend: {backend}")),
         };
+        let host_mmap = backend == "direct-mmap";
         if let Some(jit) = self.jit.as_mut() {
-            if jit.direct == direct {
+            if jit.direct == direct && self.jit_host_map.is_some() == host_mmap {
                 return Ok(());
             }
             if !jit.blocks.is_empty() || !jit.pending.is_empty() {
                 return Err("select the JIT backend before running the CPU".into());
             }
+            self.jit_host_map = if host_mmap {
+                let fd = self
+                    .mem
+                    .shared_fd()
+                    .ok_or("direct-mmap requires shared memfd RAM")?;
+                Some(hostmap::HostMap::new(fd)?)
+            } else {
+                None
+            };
             jit.direct = direct;
             jit.load_profiles = if direct {
                 vec![LoadProfile::default(); LOAD_PROFILE_SIZE].into_boxed_slice()
@@ -3804,6 +3845,7 @@ impl Cpu {
                 compile_enter(&mut jit._enter_arena)?
             };
         }
+        self.flush_tlb();
         Ok(())
     }
 

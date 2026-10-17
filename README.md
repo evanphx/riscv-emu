@@ -728,6 +728,83 @@ Its source and raw results are in
 summaries are in `.amp/in/artifacts/loop-hoist-diagnostics.txt`; temporary
 checkpoint logging was removed before the timed runs.
 
+### Host-mapped RAM experiment
+
+`-jit-backend direct-mmap` is a Linux/x86-64 opt-in experiment, not a
+replacement for `direct`. Four sparse 512 GiB host windows separate the
+existing privilege/SUM banks. Guest RAM pages are mapped with effective
+read/write permissions into these windows from coherent shared memfd RAM.
+Standalone JIT accesses check Sv39 canonicality and alignment, establish an out-of-line recovery
+label, then access `[RBP + guest_address]` without a software TLB
+lookup. Unmapped aliases fault back to the normal memory helper; the
+SIGSEGV handler only redirects execution, never walks tables or maps pages.
+SFENCE, SATP changes and permission revocation invalidate the aliases.
+MMIO, noncanonical and unaligned addresses retain ordinary slow paths.
+Writes use host aliases only for guest-writable, dirty RAM pages without
+compiled code or an overlapping store overlay. A first write to a clean
+guest page faults through the ordinary helper, which sets the guest dirty
+bit before enabling host writes. Successful inline stores clear the LR/SC
+reservation. Compiling a physical page revokes writes from every host
+alias, including aliases evicted from the software TLB; later stores fault
+through the code-invalidation helper. This applies to synchronous and
+background compilation and cached-code validation. When an overlay is
+installed, generated stores retain the ordinary helper path. Existing
+grouped and loop-hoisted reads retain their checked RAM translations;
+they do not use the host alias path.
+
+This is **not a single-instruction memory-access implementation**: address
+guards and recovery setup remain. It reserves 2 TiB of virtual address
+space per CPU, maps pages individually, and is subject to host VMA limits.
+Snapshots copy sparse source extents into the memfd and save allocated
+memfd extents, rather than relying on private-COW pagemap bits. Scanning
+unallocated shared RAM through mmap would instantiate zero pages. Cache
+fingerprints distinguish this ABI from both other backends.
+
+Three interleaved isolated-cache trials compared the committed direct
+backend with the initial read-only alias experiment. All 60 Node commands
+checked exact stdout, including fresh restores and continuation restores. Medians:
+
+| Workload | Direct fresh / continued | Mmap fresh / continued |
+|----------|-------------------------:|-----------------------:|
+| Linux/agent readiness (startup only) | 0.811 s | 1.017 s |
+| Node startup (whole request) | 2.473 / 1.813 s | 1.808 / 1.387 s |
+| Crypto/JSON (whole request) | 3.508 / 2.686 s | 2.494 / 2.182 s |
+| Integer loop, 10 × 300M (hot) | 3.667 / 3.652 s | 3.641 / 3.642 s |
+| Array reads, 3 × 100M (hot) | 1.056 / 1.171 s | 1.196 / 1.205 s |
+| Four-field reads, 3 × 100M (hot) | 3.132 / 3.182 s | 3.085 / 3.142 s |
+
+There is no convincing hot-loop improvement: integer and field times are
+approximately unchanged, and array reads regress. Whole-request gains
+must not be attributed to faster guest memory access: they include the
+different RAM/snapshot implementation. For example, fresh Node startup
+time through the command's exit event worsened 1.378 → 1.631 s even though
+whole-request time improved. Linux readiness also regressed. Shared-host
+wall times and three samples per case do not establish hardware-level
+causality. Raw commands, binary hashes, exit times and loop-body times are
+in `.amp/in/artifacts/host-mmap-experiment.json`.
+
+The write extension was compared against the read-only alias binary in
+three new interleaved trials per variant, with identical shared RAM and
+snapshot handling. All 72 Node commands checked exact output. The added
+write workload overwrites a 4096-element Int32Array for 3 × 100M iterations
+and checks the final sum against an independently computed result.
+
+| Workload | Read-only fresh / continued | Read/write fresh / continued |
+|----------|----------------------------:|-----------------------------:|
+| Linux/agent readiness (startup only) | 0.963 s | 1.223 s |
+| Node startup (whole request) | 2.141 / 1.724 s | 1.770 / 1.421 s |
+| Crypto/JSON (whole request) | 3.016 / 2.268 s | 3.045 / 2.387 s |
+| Integer loop (hot) | 3.817 / 3.973 s | 3.815 / 3.725 s |
+| Array reads (hot) | 1.449 / 1.174 s | 1.238 / 1.168 s |
+| Field reads (hot) | 3.689 / 3.435 s | 3.620 / 3.255 s |
+| Array writes (hot) | 1.344 / 1.345 s | 1.227 / 1.278 s |
+
+Array writes improve about 9% fresh / 5% continued; Node startup improves
+about 17–18%, but Linux readiness regresses about 27% and crypto is mixed.
+These remain noisy, three-sample shared-host measurements, not a general
+speedup claim. Raw commands, timings, binary hashes and the reproduction
+script are in `.amp/in/artifacts/host-mmap-writes.json`.
+
 ### Precompiling the kernel
 
 A training run can compile everything that a boot executes, ahead of

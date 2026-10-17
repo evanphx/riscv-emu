@@ -155,7 +155,7 @@ const FLAGS: &[FlagSpec] = &[
         name: "jit-backend",
         boolean: false,
         multi: false,
-        usage: "JIT backend: cranelift (default) or direct (experimental; implies -jit)",
+        usage: "JIT backend: cranelift (default), direct, or direct-mmap (experimental; implies -jit)",
     },
     FlagSpec {
         name: "jit-threshold",

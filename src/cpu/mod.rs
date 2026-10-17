@@ -257,6 +257,10 @@ pub struct Cpu {
 
     #[cfg(feature = "jit")]
     jit: Option<Box<jit::Jit>>,
+    #[cfg(feature = "jit")]
+    jit_host_map: Option<jit::hostmap::HostMap>,
+    #[cfg(feature = "jit")]
+    jit_mmap_bias: u64,
     /// Exception raised by a memory access of JIT compiled code.
     #[cfg(feature = "jit")]
     jit_exception: Option<Exception>,
@@ -349,6 +353,10 @@ impl Cpu {
             instret_limit: u64::MAX,
             #[cfg(feature = "jit")]
             jit: None,
+            #[cfg(feature = "jit")]
+            jit_host_map: None,
+            #[cfg(feature = "jit")]
+            jit_mmap_bias: 0,
             #[cfg(feature = "jit")]
             jit_exception: None,
             #[cfg(feature = "jit")]

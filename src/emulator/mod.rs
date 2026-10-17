@@ -50,7 +50,11 @@ pub struct Emulator {
 impl Emulator {
     /// Creates a new emulator with an 8 MB RAM and a 1 MB stack.
     pub fn new(params: Params) -> Result<Emulator, String> {
-        let mem = Arc::new(Memory::new(RAM_BASE, 2048 * PAGE_SIZE));
+        let mem = Arc::new(if params.jit_backend == "direct-mmap" {
+            Memory::new_shared(RAM_BASE, 2048 * PAGE_SIZE).map_err(|e| e.to_string())?
+        } else {
+            Memory::new(RAM_BASE, 2048 * PAGE_SIZE)
+        });
 
         // Skip page 0.
         mem.alloc_page().map_err(|e| e.to_string())?;

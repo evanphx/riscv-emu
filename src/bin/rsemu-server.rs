@@ -139,7 +139,7 @@ fn usage() -> ! {
     eprintln!(
         "usage: rsemu-server -config FILE.goemu [-listen ADDR] [-state DIR] [-rsemu PATH]
                     [-timeout SECONDS] [-warm N] [-warm-ttl SECONDS]
-                    [-warmup COMMAND] [-nojit] [-jit-backend cranelift|direct]
+                    [-warmup COMMAND] [-nojit] [-jit-backend cranelift|direct|direct-mmap]
 
   -config   system configuration with the vmagent initramfs
             (configs/vmagent.goemu); relative paths in it are relative
@@ -184,7 +184,10 @@ fn main() {
             "rsemu" => opts.rsemu = PathBuf::from(value()),
             "jit-backend" => {
                 opts.jit_backend = value();
-                if !matches!(opts.jit_backend.as_str(), "cranelift" | "direct") {
+                if !matches!(
+                    opts.jit_backend.as_str(),
+                    "cranelift" | "direct" | "direct-mmap"
+                ) {
                     usage();
                 }
             }

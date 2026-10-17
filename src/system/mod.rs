@@ -204,7 +204,12 @@ fn run(
         block_suspend_signal();
     }
     let ram_size = parse_mem(&cfg.memory)?;
+    let shared = params.jit_backend == "direct-mmap";
     let mem = match restore {
+        Some(snap) if shared => Arc::new(snap.memory_shared()?),
+        None if shared => {
+            Arc::new(Memory::new_shared(RAM_BASE, ram_size).map_err(|e| e.to_string())?)
+        }
         Some(snap) => Arc::new(snap.memory()?),
         None => Arc::new(Memory::new(RAM_BASE, ram_size)),
     };

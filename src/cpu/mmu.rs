@@ -64,6 +64,10 @@ impl Cpu {
             self.jtlb[bank * TLB_SIZE + idx] = JitTlbEntry::INVALID;
         }
         #[cfg(feature = "jit")]
+        if let Some(map) = self.jit_host_map.as_mut() {
+            map.flush_page(vaddr);
+        }
+        #[cfg(feature = "jit")]
         self.jit_flush_page(vaddr);
     }
 
@@ -100,6 +104,10 @@ impl Cpu {
         self.jtlb_mxr = ms.mxr();
         self.jbank = jtlb_bank(self.data_key) * TLB_SIZE;
         self.jit_tlb_base = self.jtlb[self.jbank..].as_ptr() as u64;
+        #[cfg(feature = "jit")]
+        if let Some(map) = self.jit_host_map.as_ref() {
+            self.jit_mmap_bias = map.bias(jtlb_bank(self.data_key));
+        }
         self.fetch_key = self.mode as u16 | bits;
         self.jit_jkey = self.jit_gen << 16 | self.fetch_key as u64;
     }
@@ -219,6 +227,10 @@ impl Cpu {
         let idx = bank * TLB_SIZE + ((vaddr >> 12) & 0xfff) as usize;
         if !self.mem.contains_range(page4k, 0x1000) {
             self.jtlb[idx] = JitTlbEntry::INVALID;
+            #[cfg(feature = "jit")]
+            if let Some(map) = self.jit_host_map.as_mut() {
+                map.fill(bank, vaddr, 0, false, false);
+            }
             return;
         }
         if self.jlog.len() < JLOG_MAX {
@@ -232,7 +244,14 @@ impl Cpu {
         let writable = flags & PTE_W != 0
             && flags & PTE_D != 0
             && !self.jit_code_page(ofs)
-            && !self.overlay.as_ref().is_some_and(|o| o.overlaps(page4k, 0x1000));
+            && !self
+                .overlay
+                .as_ref()
+                .is_some_and(|o| o.overlaps(page4k, 0x1000));
+        #[cfg(feature = "jit")]
+        if let Some(map) = self.jit_host_map.as_mut() {
+            map.fill(bank, vaddr, ofs, flags & PTE_R != 0, writable);
+        }
         self.jtlb[idx] = JitTlbEntry {
             tag_r: if flags & PTE_R != 0 { tag } else { u64::MAX },
             tag_w: if writable { tag } else { u64::MAX },
@@ -242,6 +261,10 @@ impl Cpu {
 
     /// Invalidates the JIT TLB entries.
     pub(super) fn jit_tlb_clear(&mut self) {
+        #[cfg(feature = "jit")]
+        if let Some(map) = self.jit_host_map.as_mut() {
+            map.clear();
+        }
         if self.jlog_full {
             self.jtlb.fill(JitTlbEntry::INVALID);
         } else {

@@ -212,6 +212,12 @@ impl Asm {
         self.labels.push(None);
         n
     }
+    fn lea_label(&mut self, dst: u8, label: usize) {
+        self.rex(true, dst, 0);
+        self.bytes(&[0x8d, 5 | ((dst & 7) << 3)]);
+        self.fixups.push((self.code.len(), label));
+        self.i32(0);
+    }
     fn bind(&mut self, label: usize) {
         self.labels[label] = Some(self.code.len());
     }
@@ -384,7 +390,15 @@ pub(super) fn compile(req: &Request) -> (Vec<u8>, u64, u64, u64) {
     t.a.load(PC, CPU, OFS_PC);
     // RBP is callee-saved and already saved by the entry trampoline.
     // Helpers preserve it; a CSR changing the bank ends the block.
-    t.a.load(TLB, CPU, OFS_JIT_TLB);
+    t.a.load(
+        TLB,
+        CPU,
+        if req.env.host_mmap {
+            OFS_MMAP_BIAS
+        } else {
+            OFS_JIT_TLB
+        },
+    );
     t.a.branch(None, t.targets[&req.vpc]);
     let mut leaders = HashSet::from([req.vpc]);
     for bi in &req.instrs {
@@ -936,9 +950,15 @@ impl Emitter {
             let offset = (slot as i32) << JTLB_SHIFT;
             let generic = self.a.label();
             let fast = self.a.label();
-            self.a.mem(&[0x39], DX, TLB, offset + JTLB_TAG_R, true);
+            let tlb = if self.env.host_mmap {
+                self.a.load(CX, CPU, OFS_JIT_TLB);
+                CX
+            } else {
+                TLB
+            };
+            self.a.mem(&[0x39], DX, tlb, offset + JTLB_TAG_R, true);
             self.a.branch(Some(5), generic);
-            self.a.load(AX, TLB, offset + JTLB_DELTA);
+            self.a.load(AX, tlb, offset + JTLB_DELTA);
             self.a.bind(fast);
             self.tlb_exits.push((generic, fast, slow));
             self.specialized_loads += 1;
@@ -948,20 +968,26 @@ impl Emitter {
     }
 
     fn tlb_lookup(&mut self, write: bool, slow: usize) {
+        let tlb = if self.env.host_mmap {
+            self.a.load(CX, CPU, OFS_JIT_TLB);
+            CX
+        } else {
+            TLB
+        };
         self.a.mov(AX, SI);
         self.a.shift(5, AX, Some((12 - JTLB_SHIFT) as u8), true);
         self.a.alu(4, AX, 0xfff << JTLB_SHIFT, true);
         self.a.mem_indexed(
             &[0x39],
             DX,
-            TLB,
+            tlb,
             Some(AX),
             if write { JTLB_TAG_W } else { JTLB_TAG_R },
             true,
         );
         self.a.branch(Some(5), slow);
         self.a
-            .mem_indexed(&[0x8b], AX, TLB, Some(AX), JTLB_DELTA, true);
+            .mem_indexed(&[0x8b], AX, tlb, Some(AX), JTLB_DELTA, true);
     }
 
     fn memory(&mut self, bi: &BlockInstr, size: i64, write: bool) {
@@ -987,7 +1013,44 @@ impl Emitter {
         }
         let slow = self.a.label();
         let done = self.a.label();
-        if !write || self.env.inline_stores {
+        if self.env.host_mmap && (!write || self.env.inline_stores) {
+            // Require canonical Sv39 (sar(addr,38) is 0 or -1). Without
+            // this check an arbitrary guest pointer could escape the
+            // reserved window and access unrelated host process memory.
+            self.a.mov(AX, SI);
+            self.a.shift(7, AX, Some(38), true);
+            self.a.alu(0, AX, 1, true);
+            self.a.shift(5, AX, Some(1), true);
+            self.a.branch(Some(5), slow);
+            if size > 1 {
+                // Aligned power-of-two accesses cannot cross a window edge.
+                // Split/unaligned accesses retain the precise helper.
+                self.a.mov(AX, SI);
+                self.a.alu(4, AX, size as i32 - 1, true);
+                self.a.branch(Some(5), slow);
+            }
+            self.a.lea_label(CX, slow);
+            if write {
+                if size == 2 {
+                    self.a.bytes(&[0x66]);
+                }
+                if size == 1 {
+                    self.a.bytes(&[0x40]); // DIL, not BH
+                }
+                self.a.mem_indexed(
+                    &[if size == 1 { 0x88 } else { 0x89 }],
+                    DI,
+                    TLB,
+                    Some(SI),
+                    0,
+                    size == 8,
+                );
+                self.a.mem(&[0xc6], 0, CPU, OFS_RESV, false);
+                self.a.bytes(&[0]);
+            } else {
+                self.load_value(i.op, TLB, Some(SI), 0);
+            }
+        } else if !write || self.env.inline_stores {
             // The bank base stays in RBP across accesses. Indexed host
             // operands avoid serial additions to form both addresses.
             self.a.mov(DX, SI);

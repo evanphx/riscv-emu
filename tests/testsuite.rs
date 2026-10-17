@@ -55,6 +55,7 @@ enum Exec<'a> {
     #[allow(dead_code)]
     JitOpt,
     Direct(bool),
+    DirectMmap(bool),
     /// JIT with the code cache file.
     #[allow(dead_code)]
     JitCache(&'a Path),
@@ -63,7 +64,11 @@ enum Exec<'a> {
 /// Runs the test ELF file. Returns Ok(None) on success, and
 /// Ok(Some(n)) if test case n failed.
 fn run_test(file: &Path, exec: Exec) -> Result<Option<u64>, String> {
-    let mem = Arc::new(Memory::new(RAM_BASE, 0x200_0000));
+    let mem = Arc::new(if matches!(exec, Exec::DirectMmap(_)) {
+        Memory::new_shared(RAM_BASE, 0x200_0000).unwrap()
+    } else {
+        Memory::new(RAM_BASE, 0x200_0000)
+    });
     let mut cpu = Cpu::new(mem.clone());
     cpu.set_mode(Mode::M);
 
@@ -137,6 +142,10 @@ fn enable_jit(cpu: &mut Cpu, exec: Exec) -> Result<(), String> {
             cpu.set_jit_backend("direct")?;
             cpu.set_jit_optimize(opt);
         }
+        Exec::DirectMmap(opt) => {
+            cpu.set_jit_backend("direct-mmap")?;
+            cpu.set_jit_optimize(opt);
+        }
         Exec::JitCache(path) => cpu.set_jit_cache(path),
         Exec::JitOpt => cpu.set_jit_optimize(true),
         _ => {}
@@ -196,6 +205,8 @@ fn report(dir: &str, exec: Exec, filter: impl Fn(&str) -> bool) {
             Exec::JitOpt => " (optimizing JIT)",
             Exec::Direct(false) => " (direct JIT)",
             Exec::Direct(true) => " (direct regions)",
+            Exec::DirectMmap(false) => " (direct mmap)",
+            Exec::DirectMmap(true) => " (direct mmap regions)",
             Exec::JitCache(_) => " (JIT cache)",
         },
         count,
@@ -250,6 +261,28 @@ fn vpu_tests_direct() {
     report("testdata/vpu", Exec::Direct(false), all);
 }
 
+#[cfg(feature = "jit")]
+#[test]
+fn isa_tests_direct_mmap() {
+    report("testdata/isa", Exec::DirectMmap(false), all);
+    report("testdata/isa", Exec::DirectMmap(true), all);
+}
+
+#[cfg(feature = "jit")]
+#[test]
+fn vpu_tests_direct_mmap() {
+    report("testdata/vpu", Exec::DirectMmap(false), all);
+}
+
+#[cfg(feature = "jit")]
+fn backend_ram(backend: &str, size: u64) -> Arc<Memory> {
+    Arc::new(if backend == "direct-mmap" {
+        Memory::new_shared(RAM_BASE, size).unwrap()
+    } else {
+        Memory::new(RAM_BASE, size)
+    })
+}
+
 /// Unlike the HTIF suite, this has no overlay: stores can use the
 /// direct RAM path. Verify dirty registers and exact counters at a
 /// memory fault, and exercise the backend ABI boundary on cache reload.
@@ -265,11 +298,19 @@ fn direct_ram_fault_and_cache() {
         0x00a40023, 0x00040303, 0x006383b3, 0xfff50513, 0x00140413, 0xfe0516e3, 0xc02025f3,
         0xc0102673, 0x0004be03, 0x06300e93,
     ];
-    for (index, backend) in ["", "cranelift", "direct", "direct", "cranelift"]
-        .iter()
-        .enumerate()
+    for (index, backend) in [
+        "",
+        "cranelift",
+        "direct",
+        "direct",
+        "direct-mmap",
+        "direct-mmap",
+        "cranelift",
+    ]
+    .iter()
+    .enumerate()
     {
-        let mem = Arc::new(Memory::new(RAM_BASE, 0x4000));
+        let mem = backend_ram(backend, 0x4000);
         let bytes: Vec<u8> = words.iter().flat_map(|v| v.to_le_bytes()).collect();
         mem.write_bytes(0, &bytes);
         let mut cpu = Cpu::new(mem.clone());
@@ -301,7 +342,7 @@ fn direct_ram_fault_and_cache() {
         mem.read_bytes(0x2000, &mut data);
         assert_eq!(data.as_slice(), (1..=131u8).rev().collect::<Vec<_>>());
         if let Some(stats) = cpu.jit_stats() {
-            if index == 3 {
+            if index == 3 || index == 5 {
                 assert!(stats.cache_hits > 0);
             } else {
                 assert_eq!(stats.loaded, 0, "cache must not cross backend ABIs");
@@ -309,6 +350,239 @@ fn direct_ram_fault_and_cache() {
         }
     }
     std::fs::remove_file(path).unwrap();
+}
+
+#[cfg(feature = "jit")]
+#[test]
+fn direct_mmap_reads_follow_remaps_and_permissions() {
+    use riscv::mmu::{self, Pte, Satp, PTE_A, PTE_R, PTE_U, PTE_V, PTE_X, SATP_MODE_SV39};
+    let words = [0x00043283u32, 0x00128293, 0x0004b303]; // ld; addi; unmapped ld
+    for backend in ["", "cranelift", "direct", "direct-mmap"] {
+        for opt in [false, true] {
+            let mem = backend_ram(backend, 0x10000);
+            let root = mem.alloc_page().unwrap();
+            let code = mem.alloc_page().unwrap();
+            let first = mem.alloc_page().unwrap();
+            let second = mem.alloc_page().unwrap();
+            let satp = Satp::new(SATP_MODE_SV39, root);
+            mmu::set_map_sv39(&mem, satp, 4, code, PTE_R | PTE_X).unwrap();
+            mmu::set_map_sv39(&mem, satp, 8, first, PTE_R | PTE_U).unwrap();
+            mem.write_bytes(
+                mem.page_offset_of(code).unwrap(),
+                &words
+                    .iter()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect::<Vec<_>>(),
+            );
+            mem.write_u64(mem.page_offset_of(first).unwrap(), 17);
+            mem.write_u64(mem.page_offset_of(second).unwrap(), 39);
+            // Both virtual addresses share root/L1 indices zero. Retain
+            // the leaf location so later phases can edit this guest PTE.
+            let l1 = Pte(mem.read_u64(mem.page_offset_of(root).unwrap())).ppn();
+            let l0 = Pte(mem.read_u64(mem.page_offset_of(l1).unwrap())).ppn();
+            let leaf = mem.page_offset_of(l0).unwrap() + 8 * 8;
+            let mut cpu = Cpu::new(mem.clone());
+            cpu.set_mode(Mode::S);
+            cpu.set_satp(satp);
+            cpu.x[9] = 0x9000;
+            cpu.instret_limit = 1000;
+            if !backend.is_empty() {
+                cpu.enable_jit(1, 0).unwrap();
+                cpu.set_jit_backend(backend).unwrap();
+                cpu.set_jit_optimize(opt);
+            }
+            for phase in 0..9 {
+                let sum = phase != 3 && phase != 6;
+                let mxr = phase == 4;
+                let mut status = cpu.mstatus();
+                status.set_sum(sum);
+                status.set_mxr(mxr);
+                cpu.set_mstatus(status);
+                if phase == 1 {
+                    // Write through canonical RAM while the read alias is live.
+                    mem.write_u64(mem.page_offset_of(first).unwrap(), 83);
+                }
+                if matches!(phase, 2 | 4 | 6) {
+                    let flags = match phase {
+                        4 => PTE_X | PTE_U,
+                        6 => PTE_R,
+                        _ => PTE_R | PTE_U,
+                    };
+                    mem.write_u64(leaf, Pte::make(second, flags | PTE_V | PTE_A).0);
+                    cpu.flush_tlb_page(0x8000);
+                }
+                if phase == 8 {
+                    mem.write_u64(leaf, Pte::make(first, PTE_R | PTE_U | PTE_V | PTE_A).0);
+                    cpu.set_satp(satp);
+                }
+                let denied = matches!(phase, 3 | 5 | 7);
+                cpu.pc = 0x4000;
+                cpu.x[8] = if phase == 7 { 1 << 48 } else { 0x8000 };
+                cpu.x[5] = 911;
+                let address = if denied { cpu.x[8] } else { 0x9000 };
+                cpu.trap_handler = Some(Box::new(move |_, trap| {
+                    assert_eq!(trap.cause, isa::CAUSE_LOAD_PAGE_FAULT);
+                    assert_eq!(trap.pc, if denied { 0x4000 } else { 0x4008 });
+                    assert_eq!(trap.tval, address);
+                    Err("expected fault".into())
+                }));
+                let before = cpu.instret;
+                assert_eq!(cpu.run().unwrap_err(), "expected fault");
+                let expected = match phase {
+                    0 => 18,
+                    1 | 8 => 84,
+                    3 | 5 | 7 => 911,
+                    _ => 40,
+                };
+                assert_eq!(cpu.x[5], expected, "{backend}, phase {phase}");
+                assert_eq!(cpu.instret - before, if denied { 1 } else { 3 });
+            }
+            if backend == "direct-mmap" {
+                assert!(cpu.jit_stats().unwrap().mmap_faults > 0);
+            }
+        }
+    }
+}
+
+#[cfg(feature = "jit")]
+#[test]
+fn direct_mmap_stores_follow_permissions_and_dirty_bits() {
+    use riscv::mmu::{
+        self, Pte, Satp, PTE_A, PTE_D, PTE_R, PTE_U, PTE_V, PTE_W, PTE_X, SATP_MODE_SV39,
+    };
+    for backend in ["", "direct", "direct-mmap"] {
+        for opt in [false, true] {
+            let mem = backend_ram(backend, 0x10000);
+            let root = mem.alloc_page().unwrap();
+            let code = mem.alloc_page().unwrap();
+            let data = mem.alloc_page().unwrap();
+            let satp = Satp::new(SATP_MODE_SV39, root);
+            mmu::set_map_sv39(&mem, satp, 4, code, PTE_R | PTE_X).unwrap();
+            mmu::set_map_sv39(&mem, satp, 8, data, PTE_R | PTE_W | PTE_U).unwrap();
+            let words = [0x00a43023u32, 0x18a4332f, 0x00043283, 0x0004b303]; // sd; sc.d; ld; fault
+            mem.write_bytes(
+                mem.page_offset_of(code).unwrap(),
+                &words
+                    .iter()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect::<Vec<_>>(),
+            );
+            let l1 = Pte(mem.read_u64(mem.page_offset_of(root).unwrap())).ppn();
+            let l0 = Pte(mem.read_u64(mem.page_offset_of(l1).unwrap())).ppn();
+            let leaf = mem.page_offset_of(l0).unwrap() + 8 * 8;
+            let mut cpu = Cpu::new(mem.clone());
+            cpu.set_mode(Mode::S);
+            cpu.set_satp(satp);
+            if !backend.is_empty() {
+                cpu.enable_jit(1, 0).unwrap();
+                cpu.set_jit_backend(backend).unwrap();
+                cpu.set_jit_optimize(opt);
+            }
+            for phase in 0..7 {
+                let mut status = cpu.mstatus();
+                status.set_sum(phase != 3);
+                cpu.set_mstatus(status);
+                if phase == 1 || phase == 2 {
+                    let flags = PTE_R | PTE_U | PTE_A | PTE_V | if phase == 2 { PTE_W } else { 0 };
+                    mem.write_u64(leaf, Pte::make(data, flags).0);
+                    cpu.flush_tlb_page(0x8000);
+                }
+                cpu.pc = 0x4000;
+                cpu.x[8] = match phase {
+                    4 => 1 << 48,
+                    5 => 0x8ffc,
+                    _ => 0x8000,
+                };
+                cpu.x[9] = 0x9000;
+                cpu.x[10] = 83 + phase;
+                cpu.reservation = 0x8000;
+                cpu.reservation_valid = true;
+                let denied = matches!(phase, 1 | 3 | 4 | 5);
+                let address = if phase == 5 {
+                    0x9003
+                } else if denied {
+                    cpu.x[8]
+                } else {
+                    0x9000
+                };
+                cpu.trap_handler = Some(Box::new(move |_, trap| {
+                    assert_eq!(
+                        trap.cause,
+                        if denied {
+                            isa::CAUSE_STORE_PAGE_FAULT
+                        } else {
+                            isa::CAUSE_LOAD_PAGE_FAULT
+                        }
+                    );
+                    assert_eq!(trap.pc, if denied { 0x4000 } else { 0x400c });
+                    assert_eq!(trap.tval, address);
+                    Err("expected fault".into())
+                }));
+                let old = mem.read_u64(mem.page_offset_of(data).unwrap());
+                let before = cpu.instret;
+                assert_eq!(cpu.run().unwrap_err(), "expected fault");
+                assert_eq!(cpu.instret - before, if denied { 1 } else { 4 });
+                assert_eq!(
+                    mem.read_u64(mem.page_offset_of(data).unwrap()),
+                    if denied { old } else { 83 + phase }
+                );
+                if !denied {
+                    assert_eq!(cpu.x[6], 1, "store must invalidate LR/SC reservation");
+                    assert_eq!(cpu.x[5], 83 + phase);
+                    assert_ne!(mem.read_u64(leaf) & PTE_D as u64, 0);
+                }
+                // A rejected cross-page store must not write its first bytes.
+                assert_eq!(mem.read_u32(mem.page_offset_of(data).unwrap() + 4092), 0);
+            }
+        }
+    }
+}
+
+#[cfg(feature = "jit")]
+#[test]
+fn direct_mmap_stores_invalidate_code_through_evicted_aliases() {
+    use riscv::mmu::{self, Satp, PTE_R, PTE_W, PTE_X, SATP_MODE_SV39};
+    for backend in ["direct", "direct-mmap"] {
+        for opt in [false, true] {
+            let mem = backend_ram(backend, 0x10000);
+            let root = mem.alloc_page().unwrap();
+            let writer = mem.alloc_page().unwrap();
+            let target = mem.alloc_page().unwrap();
+            let satp = Satp::new(SATP_MODE_SV39, root);
+            mmu::set_map_sv39(&mem, satp, 4, writer, PTE_R | PTE_X).unwrap();
+            for vpn in [8, 0x1008] {
+                mmu::set_map_sv39(&mem, satp, vpn, target, PTE_R | PTE_W | PTE_X).unwrap();
+            }
+            let old = 0x0004b303_01100293u64; // addi x5,zero,17; unmapped ld
+            let new = 0x0004b303_02700293u64; // addi x5,zero,39; unmapped ld
+            mem.write_bytes(
+                mem.page_offset_of(writer).unwrap(),
+                &0x0004b303_00a43023u64.to_le_bytes(),
+            ); // sd x10,0(x8); unmapped ld
+            let mut cpu = Cpu::new(mem.clone());
+            cpu.set_mode(Mode::S);
+            cpu.set_satp(satp);
+            cpu.enable_jit(1, 0).unwrap();
+            cpu.set_jit_backend(backend).unwrap();
+            cpu.set_jit_optimize(opt);
+            cpu.store64(0x1008000, old).unwrap();
+            cpu.store64(0x8000, old).unwrap(); // evicts the first alias's software tag
+            cpu.x[8] = 0x1008000;
+            cpu.x[9] = 0x9000;
+            cpu.x[10] = new;
+            cpu.trap_handler = Some(Box::new(|_, trap| {
+                assert_eq!(trap.cause, isa::CAUSE_LOAD_PAGE_FAULT);
+                assert_eq!(trap.tval, 0x9000);
+                Err("expected fault".into())
+            }));
+            for (pc, expected) in [(0x8000, 17), (0x4000, 17), (0x8000, 39)] {
+                cpu.pc = pc;
+                assert_eq!(cpu.run().unwrap_err(), "expected fault");
+                assert_eq!(cpu.x[5], expected, "{backend}, opt={opt}");
+            }
+            assert!(cpu.jit_stats().unwrap().compiled > 0);
+        }
+    }
 }
 
 #[cfg(feature = "jit")]
@@ -321,9 +595,9 @@ fn direct_memory_fast_and_slow_paths() {
         0x00a41023, 0x00b42223, 0x00c43423, 0x00041683, 0x00442703, 0x00843783, 0x00a410a3,
         0x00b422a3, 0x00c437a3, 0x00141803, 0x00542883, 0x00f43903, 0x0004b983,
     ];
-    for backend in ["", "cranelift", "direct"] {
+    for backend in ["", "cranelift", "direct", "direct-mmap"] {
         for opt in [false, true] {
-            let mem = Arc::new(Memory::new(RAM_BASE, 0x4000));
+            let mem = backend_ram(backend, 0x4000);
             let bytes: Vec<u8> = words.iter().flat_map(|v| v.to_le_bytes()).collect();
             mem.write_bytes(0, &bytes);
             let mut cpu = Cpu::new(mem.clone());
@@ -380,10 +654,10 @@ fn direct_grouped_reads_preserve_fault_order() {
         0x00043283, 0x00138393, 0x01043303, 0xfff50513, 0xfe0518e3, 0x00048413, 0x00043283,
         0x00138393, 0x01043303, 0x00093e03,
     ];
-    for backend in ["", "cranelift", "direct"] {
+    for backend in ["", "cranelift", "direct", "direct-mmap"] {
         for opt in [false, true] {
             for crosses in [false, true] {
-                let mem = Arc::new(Memory::new(RAM_BASE, 0x3000));
+                let mem = backend_ram(backend, 0x3000);
                 let bytes: Vec<u8> = words.iter().flat_map(|v| v.to_le_bytes()).collect();
                 mem.write_bytes(0, &bytes);
                 for (offset, value) in [(0x2000, 17u64), (0x2010, 39), (0x2fe0, 83), (0x2ff0, 107)]
@@ -430,10 +704,10 @@ fn direct_profiled_loads_follow_changed_addresses() {
         0x00043283, 0x00530333, 0xfff50513, 0x0000000f, 0xfe0518e3, 0x00048413, 0x01000513,
         0xfff58593, 0xfe0590e3, 0x00093383,
     ];
-    for backend in ["", "cranelift", "direct"] {
+    for backend in ["", "cranelift", "direct", "direct-mmap"] {
         for opt in [false, true] {
             for moved in [0x3000, 0x1002000, 0x1004000] {
-                let mem = Arc::new(Memory::new(RAM_BASE, 0x1004000));
+                let mem = backend_ram(backend, 0x1004000);
                 let bytes: Vec<u8> = words.iter().flat_map(|v| v.to_le_bytes()).collect();
                 mem.write_bytes(0, &bytes);
                 mem.write_bytes(0x2000, &17u64.to_le_bytes());
@@ -484,9 +758,9 @@ fn direct_profiled_read_group_checks_both_pages() {
         0x01043283, 0x00043303, 0xfff50513, 0xfe051ae3, 0x00048413, 0x01000513, 0xfff58593,
         0xfe0592e3, 0x00093383,
     ];
-    for backend in ["", "cranelift", "direct"] {
+    for backend in ["", "cranelift", "direct", "direct-mmap"] {
         for opt in [false, true] {
-            let mem = Arc::new(Memory::new(RAM_BASE, 0x3000));
+            let mem = backend_ram(backend, 0x3000);
             let bytes: Vec<u8> = words.iter().flat_map(|v| v.to_le_bytes()).collect();
             mem.write_bytes(0x1000, &bytes);
             mem.write_bytes(8, &39u64.to_le_bytes());
@@ -536,7 +810,7 @@ fn direct_loop_reads_revalidate_on_reentry() {
         0xfc059ce3, // bne x11,x0,-40
         0x00093a03, // ld x20,0(x18): final fault
     ];
-    for backend in ["", "cranelift", "direct"] {
+    for backend in ["", "cranelift", "direct", "direct-mmap"] {
         for opt in [false, true] {
             for (crosses, skip, inner_entry) in [
                 (false, false, false),
@@ -545,7 +819,7 @@ fn direct_loop_reads_revalidate_on_reentry() {
                 (true, true, false),
                 (false, false, true),
             ] {
-                let mem = Arc::new(Memory::new(RAM_BASE, 0x3000));
+                let mem = backend_ram(backend, 0x3000);
                 let mut program = Vec::new();
                 if inner_entry {
                     // An external edge into the first read must not bypass

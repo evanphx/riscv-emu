@@ -64,6 +64,9 @@ pub enum Backing {
     /// that were never written hold the file contents. The device and
     /// inode numbers identify the file.
     File { dev: u64, ino: u64 },
+    /// Shared memfd RAM. Snapshot saving must use its allocated extents:
+    /// canonical-VA private-COW pagemap tests do not describe these pages.
+    Shared,
 }
 
 /// Guest physical RAM.
@@ -71,6 +74,7 @@ pub struct Memory {
     ptr: *mut u8,
     len: usize,
     backing: Backing,
+    shared: Option<std::fs::File>,
     pub ram_base: u64,
     pub ram_end: u64,
     num_pages: usize,
@@ -101,7 +105,103 @@ impl Drop for Memory {
 impl Memory {
     /// Creates a new RAM of size bytes at the physical address base.
     pub fn new(base: u64, size: u64) -> Memory {
-        Self::map(base, size, None).expect("failed to allocate guest RAM")
+        Self::map(base, size, None, false).expect("failed to allocate guest RAM")
+    }
+
+    /// Coherent backing for experimental host virtual-address aliases.
+    pub fn new_shared(base: u64, size: u64) -> std::io::Result<Memory> {
+        use std::os::fd::FromRawFd;
+        // SAFETY: constant NUL-terminated name; ownership is transferred
+        // to File immediately and retained by the resulting Memory.
+        let fd = unsafe { libc::memfd_create(c"rsemu-ram".as_ptr(), libc::MFD_CLOEXEC) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let file = unsafe { std::fs::File::from_raw_fd(fd) };
+        file.set_len(size)?;
+        Self::map(base, size, Some((&file, 0)), true)
+    }
+
+    /// Copy snapshot data extents into private-to-this-VM shared RAM.
+    /// Separate MAP_PRIVATE mappings would cease to be coherent on COW.
+    pub fn from_file_shared(
+        base: u64,
+        size: u64,
+        file: &std::fs::File,
+        offset: u64,
+    ) -> std::io::Result<Memory> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::FileExt;
+        let mem = Self::new_shared(base, size)?;
+        let out = mem.shared.as_ref().unwrap();
+        let mut pos = offset;
+        let end = offset + size;
+        let mut buf = vec![0u8; 65536];
+        while pos < end {
+            // SAFETY: seek within an open snapshot file. All actual I/O
+            // uses explicit offsets, independent of the file cursor.
+            let data = unsafe { libc::lseek(file.as_raw_fd(), pos as i64, libc::SEEK_DATA) };
+            if data < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ENXIO) {
+                break;
+            }
+            let (start, stop) = if data < 0 {
+                // Filesystems without sparse-seek support: copy all RAM.
+                (pos, end)
+            } else {
+                let hole = unsafe { libc::lseek(file.as_raw_fd(), data, libc::SEEK_HOLE) };
+                (
+                    data as u64,
+                    if hole < 0 {
+                        end
+                    } else {
+                        (hole as u64).min(end)
+                    },
+                )
+            };
+            pos = start.min(end);
+            while pos < stop {
+                let n = (stop - pos).min(buf.len() as u64) as usize;
+                file.read_exact_at(&mut buf[..n], pos)?;
+                out.write_all_at(&buf[..n], pos - offset)?;
+                pos += n as u64;
+            }
+        }
+        Ok(mem)
+    }
+
+    pub(crate) fn shared_fd(&self) -> Option<std::os::fd::RawFd> {
+        use std::os::fd::AsRawFd;
+        self.shared.as_ref().map(|f| f.as_raw_fd())
+    }
+
+    /// Allocated memfd pages, including data not faulted into the
+    /// canonical VA after restore. Do not scan holes through a shared
+    /// mmap: that would instantiate zero pages across the entire RAM.
+    pub(crate) fn shared_pages(&self) -> std::io::Result<Vec<bool>> {
+        let fd = self.shared_fd().unwrap();
+        let mut pages = vec![false; self.num_pages];
+        let mut offset = 0;
+        while offset < self.len as i64 {
+            // SAFETY: seeks on the owned memfd; all other I/O is positional.
+            let data = unsafe { libc::lseek(fd, offset, libc::SEEK_DATA) };
+            if data < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::ENXIO) {
+                    break;
+                }
+                return Err(err);
+            }
+            let hole = unsafe { libc::lseek(fd, data, libc::SEEK_HOLE) };
+            if hole < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let end = (hole as usize)
+                .div_ceil(PAGE_SIZE as usize)
+                .min(pages.len());
+            pages[data as usize / PAGE_SIZE as usize..end].fill(true);
+            offset = hole;
+        }
+        Ok(pages)
     }
 
     /// Creates a RAM of size bytes at the physical address base from
@@ -115,10 +215,15 @@ impl Memory {
         file: &std::fs::File,
         offset: u64,
     ) -> std::io::Result<Memory> {
-        Self::map(base, size, Some((file, offset)))
+        Self::map(base, size, Some((file, offset)), false)
     }
 
-    fn map(base: u64, size: u64, file: Option<(&std::fs::File, u64)>) -> std::io::Result<Memory> {
+    fn map(
+        base: u64,
+        size: u64,
+        file: Option<(&std::fs::File, u64)>,
+        shared: bool,
+    ) -> std::io::Result<Memory> {
         use std::os::unix::fs::MetadataExt;
         use std::os::unix::io::AsRawFd;
         assert!(
@@ -127,10 +232,19 @@ impl Memory {
         );
         let len = size as usize;
         let mut ptr = std::ptr::NonNull::<u8>::dangling().as_ptr();
+        let shared_file = if shared {
+            Some(file.unwrap().0.try_clone()?)
+        } else {
+            None
+        };
         let mut backing = Backing::Anonymous;
         if len > 0 {
             let prot = libc::PROT_READ | libc::PROT_WRITE;
-            let flags = libc::MAP_PRIVATE | libc::MAP_NORESERVE;
+            let flags = if shared {
+                libc::MAP_SHARED
+            } else {
+                libc::MAP_PRIVATE
+            } | libc::MAP_NORESERVE;
             // SAFETY: a new mapping that no other object refers to.
             let p = unsafe {
                 match file {
@@ -158,9 +272,13 @@ impl Memory {
             ptr = p as *mut u8;
             if let Some((f, _)) = file {
                 let md = f.metadata()?;
-                backing = Backing::File {
-                    dev: md.dev(),
-                    ino: md.ino(),
+                backing = if shared {
+                    Backing::Shared
+                } else {
+                    Backing::File {
+                        dev: md.dev(),
+                        ino: md.ino(),
+                    }
                 };
             }
         }
@@ -168,6 +286,7 @@ impl Memory {
             ptr,
             len,
             backing,
+            shared: shared_file,
             ram_base: base,
             ram_end: base + size,
             num_pages: (size / PAGE_SIZE) as usize,
